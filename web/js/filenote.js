@@ -43,6 +43,43 @@ export function fileBodyToFile(body) {
   return new File([fileBodyToBlob(body)], name, { type: mime });
 }
 
+// Types the in-app viewer shows itself (as a table or plain text) — from a
+// blob tab the browser would just download these instead of rendering them.
+// PDFs and images stay on the new-tab path, which browsers render natively.
+const TEXT_VIEW_EXTS = new Set(["CSV", "TXT", "LOG", "MD", "JSON", "XML",
+  "YAML", "YML", "INI", "TSV", "HTML", "CSS", "JS", "TS", "PY"]);
+
+export function isViewableText(meta) {
+  return TEXT_VIEW_EXTS.has(meta.ext) || (meta.mime || "").startsWith("text/");
+}
+
+export function fileBodyToText(body) {
+  const bin = atob(body.slice(body.indexOf(",") + 1));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+// Small quote-aware CSV parser -> array of rows (arrays of cells).
+export function parseCsv(text, maxRows = 1000) {
+  const rows = [];
+  let row = [], cell = "", q = false;
+  const push = () => { row.push(cell.replace(/\r$/, "")); cell = ""; };
+  for (let i = 0; i < text.length && rows.length < maxRows; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { cell += '"'; i++; } else q = false;
+      } else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") push();
+    else if (c === "\n") { push(); rows.push(row); row = []; }
+    else cell += c;
+  }
+  if (cell !== "" || row.length) { push(); rows.push(row); }
+  return rows.filter(r => r.some(c => c !== ""));
+}
+
 const blobToDataUrl = blob => new Promise((resolve, reject) => {
   const r = new FileReader();
   r.onload = () => resolve(r.result);

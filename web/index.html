@@ -158,6 +158,16 @@ if (location.protocol === "file:") {
   </div>
 </div>
 
+<!-- in-app file viewer (CSVs as a table, text files as text) -->
+<div class="file-viewer" id="fileViewer" hidden>
+  <div class="file-viewer-bar">
+    <span class="file-badge" id="viewerBadge">FILE</span>
+    <span class="file-viewer-name" id="viewerName"></span>
+    <button class="capsule ghost" id="viewerCloseBtn" aria-label="Close viewer">Close</button>
+  </div>
+  <div class="file-viewer-body" id="viewerBody"></div>
+</div>
+
 <div class="toast mono" id="toast" role="status"></div>
 
 <script type="module" src="js/main.js"></script>

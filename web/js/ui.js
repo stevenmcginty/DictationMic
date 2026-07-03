@@ -8,6 +8,7 @@ import {
 } from "./imgnote.js";
 import {
   isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody,
+  isViewableText, fileBodyToText, parseCsv,
 } from "./filenote.js";
 
 const $ = id => document.getElementById(id);
@@ -286,6 +287,52 @@ export class App {
     this._renderMeta(n);
   }
 
+  _openFileViewer(n) {
+    const f = fileMeta(n.body);
+    let text;
+    try { text = fileBodyToText(n.body); }
+    catch { this.toast("Couldn't read that file"); return; }
+    $("viewerBadge").textContent = f.ext || "FILE";
+    $("viewerName").textContent = f.name;
+    const box = $("viewerBody");
+    box.textContent = "";
+    if (f.ext === "CSV" || f.ext === "TSV") {
+      const rows = f.ext === "TSV"
+        ? text.split("\n").map(r => r.replace(/\r$/, "").split("\t"))
+              .filter(r => r.some(c => c !== "")).slice(0, 1000)
+        : parseCsv(text);
+      const table = document.createElement("table");
+      table.className = "viewer-table mono";
+      rows.forEach((r, i) => {
+        const tr = document.createElement("tr");
+        for (const cell of r) {
+          const td = document.createElement(i === 0 ? "th" : "td");
+          td.textContent = cell;
+          tr.append(td);
+        }
+        table.append(tr);
+      });
+      box.append(table);
+      if (rows.length >= 1000) {
+        const more = document.createElement("p");
+        more.className = "viewer-more mono";
+        more.textContent = "Showing the first 1000 rows — Share the file to see it all";
+        box.append(more);
+      }
+    } else {
+      const pre = document.createElement("pre");
+      pre.className = "viewer-pre mono";
+      pre.textContent = text;
+      box.append(pre);
+    }
+    $("fileViewer").hidden = false;
+  }
+
+  _closeFileViewer() {
+    $("fileViewer").hidden = true;
+    $("viewerBody").textContent = "";   // drop the big DOM
+  }
+
   _renderMeta(n) {
     const created = n.createdAt ? new Date(n.createdAt).toLocaleDateString(
       undefined, { day: "numeric", month: "short", year: "numeric" }) : "";
@@ -527,14 +574,20 @@ export class App {
       }
     });
 
-    // file notes: Open = view in a new tab (PDFs etc. render right there)
+    // file notes: Open = in-app viewer for CSVs/text (a blob tab would just
+    // download those), new tab for PDFs & images (browsers render them)
     $("fileOpenBtn").addEventListener("click", () => {
       const n = this.notes.find(x => x.id === this.activeId);
       if (!n || !isFileBody(n.body)) return;
+      if (isViewableText(fileMeta(n.body))) { this._openFileViewer(n); return; }
       const url = URL.createObjectURL(fileBodyToFile(n.body));
       const win = open(url, "_blank");
       if (!win) this.toast("Pop-up blocked — use Share instead");
       setTimeout(() => URL.revokeObjectURL(url), 60000);
+    });
+    $("viewerCloseBtn").addEventListener("click", () => this._closeFileViewer());
+    addEventListener("keydown", e => {
+      if (e.key === "Escape" && !$("fileViewer").hidden) this._closeFileViewer();
     });
 
     $("deleteBtn").addEventListener("click", () => {
