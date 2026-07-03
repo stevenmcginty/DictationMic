@@ -754,7 +754,9 @@ class DictationApp:
             # a "paste into the pill" gesture can exist.
             if (e.event_type == "down" and name in ("v", "V")
                     and now - self._paste_t > 0.8
-                    and keyboard.is_pressed("ctrl")
+                    # VK_CONTROL via Win32 — keyboard.is_pressed misses odd
+                    # scan codes (this laptop's ctrl reports several)
+                    and ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000
                     and self._pointer_over_pill()):
                 self._paste_t = now
                 if self._mod_down:
