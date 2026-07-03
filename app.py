@@ -634,6 +634,7 @@ class DictationApp:
         self.label.bind("<ButtonPress-1>", self.on_press)
         self.label.bind("<B1-Motion>", self.on_motion)
         self.label.bind("<ButtonRelease-1>", self.on_release)
+        self.label.bind("<ButtonRelease-2>", lambda e: self.save_clipboard_note())
         self.label.bind("<ButtonRelease-3>", self.on_right_click)
         self.label.bind("<Enter>", self.on_enter)
         self.label.bind("<Leave>", self.on_leave)
@@ -838,6 +839,9 @@ class DictationApp:
         self.menu.add_checkbutton(label="Keep a copy of each dictation",
                                   variable=self.save_notes_var,
                                   command=self.on_save_notes_toggle)
+        self.menu.add_command(label="Save clipboard as a note  (or middle-click me)",
+                              image=blue, compound="left",
+                              command=self.save_clipboard_note)
         self.menu.add_separator()
         if self.settings.get("sync_enabled") and self.cloud is not None:
             state = self.cloud.status()["sync"]
@@ -1128,6 +1132,24 @@ class DictationApp:
         self.show_toast("Words will be typed where your cursor is"
                         if self.settings["mode"] == "type"
                         else "Words will be copied to the clipboard", 2200)
+
+    def save_clipboard_note(self):
+        """Copied text anywhere -> middle-click the pill (or use the menu)
+        and it lands in notes as its own entry, synced like a dictation."""
+        try:
+            text = (pyperclip.paste() or "").strip()
+        except Exception:
+            text = ""
+        if not text:
+            self.show_toast("Nothing on the clipboard to save", 2500)
+            return
+        try:
+            save_note(text)
+            trimmed = " ".join(text.split())
+            preview = trimmed[:44] + ("…" if len(trimmed) > 44 else "")
+            self.show_toast(f"Saved to notes: {preview}", 2500)
+        except Exception as ex:
+            self.show_toast(f"Couldn't save that — {ex}", 3000)
 
     def on_save_notes_toggle(self):
         self.settings["save_notes"] = bool(self.save_notes_var.get())

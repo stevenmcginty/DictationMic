@@ -43,7 +43,10 @@ if (location.protocol === "file:") {
   <section class="pane pane-list" id="listPane" aria-label="Notes">
     <div class="list-head">
       <span class="eyebrow">Notes</span>
-      <span class="count mono" id="noteCount"></span>
+      <span class="head-tools">
+        <span class="count mono" id="noteCount"></span>
+        <button class="capsule small" id="newNoteBtn" aria-label="New note">+ New</button>
+      </span>
     </div>
     <div class="list-search">
       <input id="searchMobile" type="search" placeholder="Search your notes…"

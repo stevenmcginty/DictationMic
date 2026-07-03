@@ -27,12 +27,12 @@ Every dictation is kept automatically as a note you can search later.
    creates itself the first time.
 3. Android: tap ⋮ → **Add to Home screen**. iPhone: tap Share →
    **Add to Home Screen**. Now it opens like a normal app.
-4. Tap the mic button and talk — it records silently (no beeps). When you
-   stop, the note saves, and your computer writes it into text within
-   seconds of seeing it (it queues patiently if the computer's off).
-   The very first phone note makes the computer fetch a bigger, more
-   accurate speech model (about 1.5 GB, one time) — notes wait in the
-   queue until it's in.
+4. Tap the mic button and talk — your words appear on screen as you
+   speak. Tap again to finish, then **Save note**. (Android's speech
+   service may chime softly now and then while it listens — that's
+   normal.)
+5. Prefer typing or pasting? Tap **+ New** at the top of your notes and
+   type straight in — it saves as you go.
 
 ## Linking computer and phone
 

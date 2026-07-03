@@ -124,6 +124,17 @@ export class App {
 
   // ---------------- editor ----------------
 
+  // a blank note for typing or pasting — same note flow as everything else
+  async newNote() {
+    try {
+      const n = await this.adapter.create({ title: "New note", body: "" });
+      this._cache(n);
+      this.renderList();
+      location.hash = `#/note/${n.id}`;
+      setTimeout(() => $("noteBody").focus(), 80);  // after the router opens it
+    } catch (e) { this.toast(e.message || "Couldn't create a note"); }
+  }
+
   openNote(id) {
     const n = this.notes.find(n => n.id === id);
     if (!n) { location.hash = "#/"; return; }
@@ -318,6 +329,7 @@ export class App {
     });
 
     $("micFab").addEventListener("click", () => { location.hash = "#/mic"; });
+    $("newNoteBtn").addEventListener("click", () => this.newNote());
 
     // flush pending edits when leaving
     addEventListener("pagehide", () => this._saveBody.flush());
