@@ -45,8 +45,10 @@ if (location.protocol === "file:") {
       <span class="eyebrow">Notes</span>
       <span class="head-tools">
         <span class="count mono" id="noteCount"></span>
+        <button class="capsule small" id="addImageBtn" aria-label="Add an image">+ Image</button>
         <button class="capsule small" id="newNoteBtn" aria-label="New note">+ New</button>
       </span>
+      <input id="imageInput" type="file" accept="image/*" multiple hidden>
     </div>
     <div class="list-search">
       <input id="searchMobile" type="search" placeholder="Search your notes…"
@@ -65,6 +67,7 @@ if (location.protocol === "file:") {
       <div class="note-toolbar">
         <button class="capsule ghost back" id="backBtn" aria-label="Back to notes">‹ Notes</button>
         <div class="note-actions">
+          <button class="capsule" id="shareBtn" hidden>Share</button>
           <button class="capsule" id="copyBtn">Copy</button>
           <button class="capsule danger" id="deleteBtn">Delete</button>
         </div>
@@ -74,6 +77,9 @@ if (location.protocol === "file:") {
       <div class="note-meta mono" id="noteMeta"></div>
       <textarea class="note-body" id="noteBody" spellcheck="false"
                 aria-label="Note text" placeholder="Say something…"></textarea>
+      <div class="note-image-wrap" id="noteImageWrap" hidden>
+        <img id="noteImage" alt="Image note">
+      </div>
     </div>
     <div class="note-blank" id="noteBlank">
       <span class="sleep-dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -123,6 +129,13 @@ if (location.protocol === "file:") {
     <path fill="currentColor" d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-6a3.5 3.5 0 1 0-7 0v6A3.5 3.5 0 0 0 12 15Zm6-3.5a6 6 0 0 1-12 0H4.5a7.5 7.5 0 0 0 6.75 7.46V22h1.5v-3.04A7.5 7.5 0 0 0 19.5 11.5H18Z"/>
   </svg>
 </button>
+
+<div class="drop-hint" id="dropHint" hidden aria-hidden="true">
+  <div class="drop-hint-card">
+    <strong>Drop to save</strong>
+    <span>images &amp; text become new notes</span>
+  </div>
+</div>
 
 <div class="toast mono" id="toast" role="status"></div>
 

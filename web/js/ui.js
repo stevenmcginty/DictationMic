@@ -1,7 +1,11 @@
 // All DOM logic for the notes app. Views: list / note / mic (routes via
 // location.hash, panes toggled with body classes — see styles.css).
 
-import { relTime, debounce } from "./util.js";
+import { relTime, debounce, noteTitleFrom } from "./util.js";
+import {
+  isImageBody, imageKb, fileToImageBody, imageBodyToPngBlob,
+  imageBodyToFile, photoTitle,
+} from "./imgnote.js";
 
 const $ = id => document.getElementById(id);
 
@@ -56,7 +60,9 @@ export class App {
     const list = $("noteList");
     const q = this.filter.trim().toLowerCase();
     const shown = q
-      ? this.notes.filter(n => (n.title + "\n" + n.body).toLowerCase().includes(q))
+      ? this.notes.filter(n => (isImageBody(n.body)
+          ? n.title + "\nimage photo"                 // don't grep base64 soup
+          : n.title + "\n" + n.body).toLowerCase().includes(q))
       : this.notes;
     const pending = this.adapter.pendingIds();
 
@@ -79,8 +85,18 @@ export class App {
       top.append(title, time);
 
       const snippet = document.createElement("div");
-      snippet.className = "note-row-snippet";
-      snippet.textContent = n.body.slice(0, 220);
+      snippet.className = "note-row-snippet" + (isImageBody(n.body) ? " has-thumb" : "");
+      if (isImageBody(n.body)) {
+        const img = document.createElement("img");
+        img.className = "note-thumb";
+        img.src = n.body;
+        img.alt = "";
+        img.loading = "lazy";
+        img.decoding = "async";
+        snippet.append(img);
+      } else {
+        snippet.textContent = n.body.slice(0, 220);
+      }
 
       li.append(top, snippet);
       if (pending.has(n.id)) {
@@ -135,6 +151,60 @@ export class App {
     } catch (e) { this.toast(e.message || "Couldn't create a note"); }
   }
 
+  // ---------------- clipboard drops: images & text become notes ----------------
+
+  async saveImageFiles(files) {
+    const images = [...files].filter(f => f.type.startsWith("image/")).slice(0, 6);
+    let saved = 0;
+    for (const f of images) {
+      try {
+        const body = await fileToImageBody(f);
+        const stem = (f.name || "").replace(/\.[^.]+$/, "").trim();
+        const title = stem && !/^(image|img|download|unnamed)$/i.test(stem)
+          ? stem.slice(0, 60) : photoTitle();
+        this._cache(await this.adapter.create({ title, body }));
+        saved++;
+      } catch (e) { this.toast(e.message || "Couldn't save that image"); }
+    }
+    if (saved) {
+      this.renderList();
+      this.toast(saved === 1 ? "Image saved to notes" : `${saved} images saved`);
+    }
+    return saved;
+  }
+
+  async saveTextClip(text) {
+    text = (text || "").replace(/\r\n/g, "\n").trim();
+    if (!text) return;
+    try {
+      this._cache(await this.adapter.create({ title: noteTitleFrom(text), body: text }));
+      this.renderList();
+      this.toast("Saved to notes");
+    } catch (e) { this.toast(e.message || "Couldn't save"); }
+  }
+
+  async saveDroppedTextFile(f) {
+    const texty = f.type.startsWith("text/") || /\.(txt|md|markdown|csv|log|json|xml|ya?ml|ini|py|js|ts|html|css)$/i.test(f.name || "");
+    if (!texty) {
+      this.toast(`Can't save ${f.name || "that file"} — images and text only`);
+      return;
+    }
+    if (f.size > 200 * 1024) {
+      this.toast(`${f.name} is too big for a note`);
+      return;
+    }
+    const text = await f.text();
+    if (!text.trim()) return;
+    const stem = (f.name || "").replace(/\.[^.]+$/, "").trim();
+    try {
+      this._cache(await this.adapter.create({
+        title: stem.slice(0, 60) || noteTitleFrom(text), body: text,
+      }));
+      this.renderList();
+      this.toast("Saved to notes");
+    } catch (e) { this.toast(e.message || "Couldn't save"); }
+  }
+
   openNote(id) {
     const n = this.notes.find(n => n.id === id);
     if (!n) { location.hash = "#/"; return; }
@@ -149,18 +219,27 @@ export class App {
   }
 
   _fillEditor(n) {
+    const image = isImageBody(n.body);
     $("noteTitle").value = n.title;
-    $("noteBody").value = n.body;
+    $("noteBody").value = image ? "" : n.body;
+    $("noteBody").hidden = image;
+    $("noteImageWrap").hidden = !image;
+    $("noteImage").src = image ? n.body : "";
+    $("shareBtn").hidden = !image;
     this._renderMeta(n);
   }
 
   _renderMeta(n) {
-    const words = n.body.trim() ? n.body.trim().split(/\s+/).length : 0;
     const created = n.createdAt ? new Date(n.createdAt).toLocaleDateString(
       undefined, { day: "numeric", month: "short", year: "numeric" }) : "";
     const bits = [];
     if (created) bits.push(`created ${created}`);
-    bits.push(`${words} word${words === 1 ? "" : "s"}`);
+    if (isImageBody(n.body)) {
+      bits.push(`image · ${imageKb(n.body)} kB`);
+    } else {
+      const words = n.body.trim() ? n.body.trim().split(/\s+/).length : 0;
+      bits.push(`${words} word${words === 1 ? "" : "s"}`);
+    }
     if (this.adapter.pendingIds().has(n.id)) bits.push("<b>queued</b>");
     $("noteMeta").innerHTML = bits.join(" · ");
   }
@@ -174,6 +253,8 @@ export class App {
   async _commitBody() {
     const id = this.activeId;
     if (!id) return;
+    const current = this.notes.find(n => n.id === id);
+    if (current && isImageBody(current.body)) return;   // images aren't edited
     try {
       const updated = await this.adapter.update(id, $("noteBody").value);
       if (updated) {
@@ -307,13 +388,39 @@ export class App {
     $("micBackBtn").addEventListener("click", () => { location.hash = "#/"; });
 
     $("copyBtn").addEventListener("click", async () => {
+      const n = this.notes.find(x => x.id === this.activeId);
+      const image = n && isImageBody(n.body);
       try {
-        await navigator.clipboard.writeText($("noteBody").value);
+        if (image) {
+          // promise-valued ClipboardItem keeps the user gesture alive
+          await navigator.clipboard.write([
+            new ClipboardItem({ "image/png": imageBodyToPngBlob(n.body) })]);
+        } else {
+          await navigator.clipboard.writeText($("noteBody").value);
+        }
         const btn = $("copyBtn");
         btn.classList.add("flash");
         btn.textContent = "Copied";
         setTimeout(() => { btn.classList.remove("flash"); btn.textContent = "Copy"; }, 1400);
-      } catch { this.toast("Couldn't reach the clipboard"); }
+      } catch {
+        this.toast(image ? "Couldn't copy — long-press the image instead"
+                         : "Couldn't reach the clipboard");
+      }
+    });
+
+    $("shareBtn").addEventListener("click", async () => {
+      const n = this.notes.find(x => x.id === this.activeId);
+      if (!n || !isImageBody(n.body)) return;
+      const file = imageBodyToFile(n.body, n.title);
+      if (navigator.canShare?.({ files: [file] })) {
+        try { await navigator.share({ files: [file], title: n.title }); }
+        catch { /* user closed the share sheet */ }
+      } else {
+        const a = document.createElement("a");     // desktop: download instead
+        a.href = n.body;
+        a.download = file.name;
+        a.click();
+      }
     });
 
     $("deleteBtn").addEventListener("click", () => {
@@ -330,6 +437,65 @@ export class App {
 
     $("micFab").addEventListener("click", () => { location.hash = "#/mic"; });
     $("newNoteBtn").addEventListener("click", () => this.newNote());
+
+    // add an image: camera or gallery on the phone, file picker on desktop
+    $("addImageBtn").addEventListener("click", () => $("imageInput").click());
+    $("imageInput").addEventListener("change", async e => {
+      await this.saveImageFiles(e.target.files);
+      e.target.value = "";
+    });
+
+    // paste anywhere: an image always becomes a new note; text becomes one
+    // too unless you're typing in a box (that stays a normal paste)
+    document.addEventListener("paste", e => {
+      const files = [...(e.clipboardData?.files || [])]
+        .filter(f => f.type.startsWith("image/"));
+      if (files.length) {
+        e.preventDefault();
+        this.saveImageFiles(files);
+        return;
+      }
+      const tag = document.activeElement?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      const text = e.clipboardData?.getData("text/plain");
+      if (text?.trim()) {
+        e.preventDefault();
+        this.saveTextClip(text);
+      }
+    });
+
+    // drag anything onto the window (desktop browsers): same rules
+    this._dragDepth = 0;
+    const hint = show => { $("dropHint").hidden = !show; };
+    addEventListener("dragenter", e => {
+      const types = e.dataTransfer ? [...e.dataTransfer.types] : [];
+      if (types.includes("Files") || types.includes("text/plain")) {
+        e.preventDefault();
+        this._dragDepth++;
+        hint(true);
+      }
+    });
+    addEventListener("dragover", e => e.preventDefault());
+    addEventListener("dragleave", () => {
+      if (--this._dragDepth <= 0) { this._dragDepth = 0; hint(false); }
+    });
+    addEventListener("drop", async e => {
+      e.preventDefault();
+      this._dragDepth = 0;
+      hint(false);
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const files = [...dt.files];
+      if (files.length) {
+        await this.saveImageFiles(files.filter(f => f.type.startsWith("image/")));
+        for (const f of files.filter(f => !f.type.startsWith("image/")).slice(0, 4)) {
+          await this.saveDroppedTextFile(f);
+        }
+        return;
+      }
+      const text = dt.getData("text/plain");
+      if (text?.trim()) this.saveTextClip(text);
+    });
 
     // flush pending edits when leaving
     addEventListener("pagehide", () => this._saveBody.flush());

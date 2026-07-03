@@ -3,7 +3,7 @@
 
 import { FIREBASE } from "../config.js";
 import { notesDb, outboxDb, metaDb } from "./db.js";
-import { idToken, uid } from "./auth.js";
+import { idToken, uid, signedIn } from "./auth.js";
 
 let state = "starting";       // ok | offline | needs-signin | error
 let lastSync = 0;
@@ -38,7 +38,11 @@ export async function flush() {
   flushing = true;
   try {
     const entries = await outboxDb.all();          // key order = queue order
-    if (!entries.length) { setState("ok"); return; }
+    if (!entries.length) {
+      // an empty outbox is only "synced" if we can actually sync
+      setState(signedIn() ? "ok" : "needs-signin");
+      return;
+    }
     let token;
     try { token = await idToken(); }
     catch { setState("needs-signin"); return; }
