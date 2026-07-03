@@ -12,6 +12,14 @@ let esBackoff = 1000;
 let flushing = false;
 let onRemote = () => {};      // adapter refreshes the UI through this
 let onState = () => {};
+let retryTimer = null;        // failed flush → quick retry, backing off
+let retryMs = 5000;
+
+function scheduleRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => { retryTimer = null; flush(); }, retryMs);
+  retryMs = Math.min(retryMs * 2, 60000);
+}
 
 const notesUrl = (id, token) =>
   `${FIREBASE.databaseURL}/users/${uid()}/notes${id ? "/" + id : ""}.json?auth=${token}`;
@@ -34,7 +42,8 @@ export async function pendingIds() {
 // ---------------------------------------------------------------------------
 
 export async function flush() {
-  if (flushing || !navigator.onLine) return;
+  if (flushing) return;
+  if (!navigator.onLine) { scheduleRetry(); return; }
   flushing = true;
   try {
     const entries = await outboxDb.all();          // key order = queue order
@@ -45,7 +54,7 @@ export async function flush() {
     }
     let token;
     try { token = await idToken(); }
-    catch { setState("needs-signin"); return; }
+    catch { setState("needs-signin"); scheduleRetry(); return; }
     for (const e of entries) {
       const payload = e.op === "delete"
         ? { deleted: true, body: null, origin: "phone",
@@ -57,12 +66,13 @@ export async function flush() {
         res = await fetch(notesUrl(e.id, token), {
           method: "PATCH", body: JSON.stringify(payload),
         });
-      } catch { setState("offline"); return; }     // retry on next trigger
+      } catch { setState("offline"); scheduleRetry(); return; }
       if (res.status === 401) {
-        try { token = await idToken(); } catch { setState("needs-signin"); return; }
+        try { token = await idToken(); }
+        catch { setState("needs-signin"); scheduleRetry(); return; }
         continue;                                   // entry retried next flush
       }
-      if (!res.ok) { setState("error"); return; }
+      if (!res.ok) { setState("error"); scheduleRetry(); return; }
       const saved = await res.json();
       const rev = Number(saved.updatedAt) || Date.now();
       if (e.op === "delete") {
@@ -76,6 +86,7 @@ export async function flush() {
       await outboxDb.del(e.key);
       lastSync = Date.now();
     }
+    retryMs = 5000;                                 // healthy again
     setState("ok");
     onRemote();                                     // pending dots vanish
   } finally {

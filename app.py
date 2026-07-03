@@ -14,6 +14,7 @@ fully offline.
 
 import base64
 import ctypes
+import ctypes.wintypes
 import io
 import json
 import math
@@ -660,6 +661,11 @@ class DictationApp:
 
         self.root.update_idletasks()
         make_non_activating(self.root)
+        # real top-level HWND, cached so the keyboard-hook thread can hit-test
+        # the pointer against the pill without touching Tk (not thread-safe)
+        self._hwnd = (ctypes.windll.user32.GetParent(self.root.winfo_id())
+                      or self.root.winfo_id())
+        self._paste_t = 0.0
 
         if model_ready(self.settings):
             self.state = LOADING
@@ -742,6 +748,19 @@ class DictationApp:
                                      {"name": e.name or "", "sc": e.scan_code or 0}))
                 return
             name, sc, now = e.name, e.scan_code, time.time()
+            # Ctrl+V while the mouse is over the pill = paste the clipboard
+            # straight in as a note (same as middle-click). The pill never
+            # has keyboard focus (WS_EX_NOACTIVATE), so this is the only way
+            # a "paste into the pill" gesture can exist.
+            if (e.event_type == "down" and name in ("v", "V")
+                    and now - self._paste_t > 0.8
+                    and keyboard.is_pressed("ctrl")
+                    and self._pointer_over_pill()):
+                self._paste_t = now
+                if self._mod_down:
+                    self._mod_other = True   # it was a combo — no toggle
+                self.save_clipboard_note()
+                return
             is_mod = (name in self._mod_names) or (sc in self._mod_sc)
             is_direct = (not is_mod) and ((name in self._direct_names)
                                           or (sc in self._direct_sc))
@@ -850,7 +869,8 @@ class DictationApp:
                                   variable=self.save_notes_var,
                                   command=self.on_save_notes_toggle)
         self.menu.add_command(label="Save clipboard as a note — text, screenshot "
-                                    "or copied file  (middle-click me)",
+                                    "or copied file  (middle-click, or hover "
+                                    "me + Ctrl+V)",
                               image=blue, compound="left",
                               command=self.save_clipboard_note)
         self.menu.add_command(label="My files — every PDF, doc & photo as the "
@@ -1235,6 +1255,20 @@ class DictationApp:
         except Exception:
             self.events.put(("toast", "Couldn't save that"))
 
+    def _pointer_over_pill(self):
+        """Win32-only hit test (safe from the keyboard-hook thread)."""
+        try:
+            pt = ctypes.wintypes.POINT()
+            rect = ctypes.wintypes.RECT()
+            if not (ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                    and ctypes.windll.user32.GetWindowRect(
+                        self._hwnd, ctypes.byref(rect))):
+                return False
+            return (rect.left <= pt.x < rect.right
+                    and rect.top <= pt.y < rect.bottom)
+        except Exception:
+            return False
+
     def save_clipboard_note(self):
         """Whatever is on the clipboard -> middle-click the pill (or the
         menu) and it lands in notes: a screenshot (Win+Shift+S), files
@@ -1547,6 +1581,7 @@ class DictationApp:
             "Hold the key — push-to-talk\n"
             "Hold + drag — move me\n"
             "Drop files, text or images on me — synced as notes\n"
+            "Ctrl+V over me (or middle-click) — save the clipboard\n"
             "Right-click — options", ("Segoe UI", 9))
 
     def hide_tooltip(self):

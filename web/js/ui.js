@@ -300,7 +300,7 @@ export class App {
       const words = n.body.trim() ? n.body.trim().split(/\s+/).length : 0;
       bits.push(`${words} word${words === 1 ? "" : "s"}`);
     }
-    if (this.adapter.pendingIds().has(n.id)) bits.push("<b>queued</b>");
+    if (this.adapter.pendingIds().has(n.id)) bits.push("<b>saved · syncing…</b>");
     $("noteMeta").innerHTML = bits.join(" · ");
   }
 
@@ -372,8 +372,13 @@ export class App {
     const pending = this.adapter.pendingIds().size;
     dot.className = "status-dot";
     if (pending) {
+      // everything pending IS saved on this device — say so, plus why
+      // it hasn't reached the cloud yet
       dot.classList.add("pending");
-      text.textContent = `${pending} queued`;
+      text.textContent = s.sync === "offline" ? "saved · offline"
+        : s.sync === "needs-signin" ? "saved · sign in to sync"
+        : s.sync === "error" ? "saved · retrying"
+        : "saved · sending…";
     } else if (s.sync === "ok") {
       dot.classList.add("ok");
       text.textContent = "synced";
@@ -461,7 +466,14 @@ export class App {
       }
     });
 
-    // editor
+    // editor — saves as you type; Ctrl+S just reassures
+    addEventListener("keydown", e => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        this._saveBody.flush();
+        this.toast("Saved — notes save themselves as you type");
+      }
+    });
     $("noteBody").addEventListener("input", () => this._saveBody());
     $("noteTitle").addEventListener("blur", () => this._commitTitle());
     $("renameBtn").addEventListener("click", () => {
