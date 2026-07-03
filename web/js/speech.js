@@ -1,35 +1,47 @@
-// Voice recorder for the phone. No Web Speech API here any more: Chrome's
-// recognition opens and closes the mic for every phrase (chiming each
-// time) and its continuous mode is broken on Android (crbug 40324711).
-// So the phone doesn't transcribe at all — it records one unbroken,
-// silent audio track. The note syncs with the audio attached and the
-// computer's Whisper (the same engine as desktop dictation) turns it into
-// text, replacing the placeholder note as soon as a laptop sees it.
+// Web Speech dictation for the phone.
+//
+// Chrome on Android officially breaks continuous mode (crbug 40324711):
+// results arrive as ever-growing concatenations of the whole session, runs
+// end after nearly every phrase, and old text is re-delivered after silent
+// restarts. iOS Safari has its own version of the same rot. So:
+// - continuous mode is never used — every utterance is its own one-shot
+//   recognition run, restarted while dictation is live
+// - a run's text is rebuilt from scratch on every event and folded
+//   (grow / replace / skip — never blind-append), shown as a scratch line
+// - an utterance is committed to the note only when its run ends; a ~750ms
+//   no-new-words timer ends the run rather than trusting isFinal
+// - "no-speech" errors are routine — the restart loop absorbs them
 
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const $ = id => document.getElementById(id);
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-const AUTO_STOP_MS = 60000;          // this much silence ends the recording
-const MAX_SESSION_MS = 10 * 60000;   // hard cap per voice note
+const COMMIT_MS = 750;         // silence that ends an utterance
+const AUTO_STOP_MS = 60000;    // silence that ends the session
 const METER_BARS = 24;
 
 let app = null;
+let rec = null;
+let active = false;          // user wants to be dictating
+let committed = "";          // finished utterances
+let utterance = "";          // best hypothesis of the current run
 let bound = false;
-let recorder = null;
-let chunks = [];
-let recording = false;
-let startedAt = 0;
-let lastLoud = 0;
 let meterTimer = null;
+let commitTimer = null;
+let idleTimer = null;
 let wakeLock = null;
+let restartCount = 0;
+let lastRestart = 0;
+// our own mic stream, held open for the whole session: Chrome then treats
+// it as one continuous capture and (on most phones) stops playing its
+// start/stop chime at every recognition restart — and it feeds a real
+// level meter instead of a fake animation
 let micStream = null;
 let audioCtx = null;
 let analyser = null;
 let meterData = null;
 
-export function micAvailable() {
-  return !!(navigator.mediaDevices?.getUserMedia && window.MediaRecorder);
-}
+export function micAvailable() { return !!SR; }
 
 export function openMic(appInstance) {
   app = appInstance;
@@ -43,122 +55,209 @@ function bind() {
   const meter = $("micMeter");
   for (let i = 0; i < METER_BARS; i++) meter.append(document.createElement("i"));
 
-  $("micMainBtn").addEventListener("click", () => recording ? stop() : start());
+  $("micMainBtn").addEventListener("click", () => active ? stop() : start());
+  $("micSaveBtn").addEventListener("click", save);
+  $("micDiscardBtn").addEventListener("click", () => { reset(); render(); });
 
   addEventListener("hashchange", () => {
-    if (location.hash !== "#/mic" && recording) stop();   // saves, not discards
+    if (location.hash !== "#/mic" && active) stop();
   });
   document.addEventListener("visibilitychange", async () => {
-    if (!document.hidden && recording && wakeLock === null) acquireWake();
+    if (!document.hidden && active && wakeLock === null) acquireWake();
   });
-}
-
-function pickMime() {
-  for (const m of ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]) {
-    if (MediaRecorder.isTypeSupported(m)) return m;
-  }
-  return "";
 }
 
 async function start() {
+  if (!SR) return;
+  active = true;
+  restartCount = 0;
+  await acquireMicStream();   // before the first run, so no chime plays
+  startRun();
+  acquireWake();
+  startMeter();
+  armIdleTimer();
+  render();
+}
+
+async function acquireMicStream() {
+  if (micStream) return;
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch {
-    app?.toast("Microphone blocked — allow it in your browser settings", 3500);
-    return;
-  }
-  try {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const src = audioCtx.createMediaStreamSource(micStream);
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     src.connect(analyser);
     meterData = new Uint8Array(analyser.frequencyBinCount);
-  } catch { analyser = null; }
+  } catch {
+    micStream = null;          // denied/unavailable: meter falls back to fake
+  }
+}
 
-  const mime = pickMime();
-  const opts = { audioBitsPerSecond: 32000 };
-  if (mime) opts.mimeType = mime;
-  recorder = new MediaRecorder(micStream, opts);
-  chunks = [];
-  recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
-  recorder.onstop = onRecorded;
-  recorder.start(1000);                 // chunk every second: nothing is lost
-  recording = true;                     // even if the tab dies mid-recording
-  startedAt = lastLoud = Date.now();
-  acquireWake();
-  startMeter();
-  render();
+function releaseMicStream() {
+  try { micStream?.getTracks().forEach(t => t.stop()); } catch { }
+  try { audioCtx?.close(); } catch { }
+  micStream = audioCtx = analyser = meterData = null;
+}
+
+// Merge a new hypothesis into what we already have. Handles every observed
+// misbehaviour: cumulative re-delivery ("so", "so if", "so if I"…) grows in
+// place, duplicated tails are skipped, genuinely new text is appended.
+const norm = s => s.toLowerCase().replace(/\s+/g, " ").trim();
+
+function fold(acc, t) {
+  if (!t) return acc;
+  const a = norm(acc), b = norm(t);
+  if (!a) return t + " ";
+  if (b.startsWith(a)) return t + " ";     // cumulative: new text extends old
+  if (a.endsWith(b)) return acc;           // duplicate re-delivery of the tail
+  return acc.trimEnd() + " " + t + " ";
+}
+
+function startRun() {
+  rec = new SR();
+  rec.continuous = false;                  // the only mode Android honours
+  rec.interimResults = true;
+  rec.lang = "en-GB";
+
+  rec.onresult = e => {
+    let text = "";
+    for (let i = 0; i < e.results.length; i++) {
+      text = fold(text, e.results[i][0].transcript.trim());
+    }
+    text = text.trim();
+    if (text && text !== utterance) {      // only real growth rearms timers
+      utterance = text;
+      armCommitTimer();
+      armIdleTimer();
+      paint();
+    }
+  };
+
+  rec.onerror = e => {
+    if (e.error === "audio-capture" && micStream) {
+      // rare devices won't share the mic with our keep-alive stream —
+      // give it up (beeps return, dictation keeps working)
+      releaseMicStream();
+      return;
+    }
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      active = false;
+      app?.toast("Microphone blocked — allow it in Chrome's site settings", 3500);
+      finishRun();
+      render();
+    }
+    // "no-speech"/"aborted"/"network" fall through to onend's restart
+  };
+
+  rec.onend = () => {
+    commitUtterance();
+    if (!active) { render(); return; }
+    // still live: restart for the next utterance, but not in a tight loop
+    const now = Date.now();
+    restartCount = now - lastRestart < 700 ? restartCount + 1 : 0;
+    lastRestart = now;
+    if (restartCount > 8) {
+      active = false;
+      app?.toast("Speech recognition keeps stopping — try again", 3000);
+      finishRun();
+      render();
+      return;
+    }
+    setTimeout(() => { if (active) { try { startRun(); } catch { } } }, 120);
+  };
+
+  rec.start();
+}
+
+function commitUtterance() {
+  clearTimeout(commitTimer);
+  if (utterance) {
+    committed = fold(committed, utterance);
+    utterance = "";
+    paint();
+  }
+}
+
+function armCommitTimer() {
+  clearTimeout(commitTimer);
+  // no new words for COMMIT_MS: end the run — onend commits and restarts
+  commitTimer = setTimeout(() => { try { rec?.stop(); } catch { } }, COMMIT_MS);
 }
 
 function stop() {
-  if (!recording) return;
-  recording = false;
-  try { recorder?.stop(); } catch { onRecorded(); }
+  active = false;
+  clearTimeout(commitTimer);
+  try { rec?.stop(); } catch { }           // onend commits the last utterance
+  finishRun();
   render();
 }
 
-async function onRecorded() {
-  const mime = (recorder && recorder.mimeType) || "audio/webm";
+function finishRun() {
+  clearTimeout(commitTimer);
+  clearTimeout(idleTimer);
   stopMeter();
-  releaseMic();
+  releaseMicStream();
   releaseWake();
-  const blob = new Blob(chunks, { type: mime });
-  chunks = [];
-  render();
-  if (blob.size < 2000) {
-    app?.toast("Too short — nothing saved", 2000);
-    return;
-  }
+  app?.setBrandLive(false);
+}
+
+function reset() {
+  committed = "";
+  utterance = "";
+  clearTimeout(commitTimer);
+  paint();
+}
+
+async function save() {
+  commitUtterance();
+  const text = committed.replace(/\s+/g, " ").trim();
+  if (!text) { reset(); render(); return; }
   try {
-    const audio = await blobB64(blob);
-    await app.adapter.createVoice({ audio, audioMime: mime });
+    await app.adapter.create({ body: text });
+    reset();
     app.notes = await app.adapter.list();
     app.renderList();
-    app.toast("Saved — your computer will turn it into text");
+    app.toast("Saved — it'll appear on your computer");
     location.hash = "#/";
   } catch (e) {
-    app?.toast((e && e.message) || "Couldn't save the recording", 3000);
+    app.toast(e.message || "Couldn't save");
   }
-}
-
-function blobB64(blob) {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(String(r.result).split(",")[1] || "");
-    r.onerror = () => reject(new Error("Couldn't read the recording"));
-    r.readAsDataURL(blob);
-  });
 }
 
 // ---------------------------------------------------------------------------
 
-function fmtElapsed() {
-  const s = Math.floor((Date.now() - startedAt) / 1000);
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+function paint() {
+  const done = committed.replace(/\s+/g, " ").trim();
+  $("micFinal").textContent = done ? done + " " : "";
+  $("micInterim").textContent = utterance || "";
+  const t = $("micTranscript");
+  t.scrollTop = t.scrollHeight;
 }
 
 function render() {
-  $("micState").textContent = recording ? `Recording ${fmtElapsed()}` : "Ready";
-  $("micMainBtn").classList.toggle("live", recording);
-  $("micMeter").classList.toggle("live", recording);
-  $("micSaveBtn").hidden = true;        // stopping saves automatically
-  $("micDiscardBtn").hidden = true;
-  $("micFinal").textContent = "";
-  $("micInterim").textContent = recording
-    ? "Recording — tap the button to finish. The text appears once your computer has written it up."
-    : "Tap the mic and talk. It records silently — no beeps — and your computer turns it into text.";
-  app?.setBrandLive(recording);
+  const hasText = !!(committed + utterance).trim();
+  $("micState").textContent = active ? "Listening…" : (hasText ? "Paused" : "Ready");
+  $("micMainBtn").classList.toggle("live", active);
+  $("micMeter").classList.toggle("live", active);
+  $("micSaveBtn").hidden = active || !hasText;
+  $("micDiscardBtn").hidden = active || !hasText;
+  app?.setBrandLive(active);
+  paint();
 }
 
-// the meter drives three things: the bars, the silence auto-stop and the
-// on-screen timer — so it always runs while recording, even reduced-motion
+function armIdleTimer() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => { if (active) stop(); }, AUTO_STOP_MS);
+}
+
 function startMeter() {
+  if (reducedMotion) return;
   const bars = $("micMeter").children;
   let phase = 0;
   meterTimer = setInterval(() => {
-    const now = Date.now();
-    let level = 0;
+    phase += 0.6;
+    let level = null;                       // real mic level, 0..1
     if (analyser) {
       analyser.getByteTimeDomainData(meterData);
       let sum = 0;
@@ -167,23 +266,17 @@ function startMeter() {
         sum += v * v;
       }
       level = Math.min(1, Math.sqrt(sum / meterData.length) * 4);
-      if (level > 0.06) lastLoud = now;
-    } else {
-      lastLoud = now;                   // no analyser: never auto-stop
     }
-    if (recording) {
-      $("micState").textContent = `Recording ${fmtElapsed()}`;
-      if (now - lastLoud > AUTO_STOP_MS || now - startedAt > MAX_SESSION_MS) {
-        stop();
-        return;
-      }
-    }
-    if (!reducedMotion) {
-      phase += 0.6;
-      for (let i = 0; i < bars.length; i++) {
+    for (let i = 0; i < bars.length; i++) {
+      let h;
+      if (level !== null) {
         const wave = Math.abs(Math.sin(phase * 0.9 + i * 0.7));
-        bars[i].style.height = `${4 + level * (14 + wave * 26)}px`;
+        h = 4 + level * (14 + wave * 26);
+      } else {
+        const wave = Math.sin(phase + i * 0.55) * Math.sin(phase * 0.33 + i);
+        h = 5 + Math.abs(wave) * 30 + Math.random() * 6;
       }
+      bars[i].style.height = `${h}px`;
     }
   }, 100);
 }
@@ -192,12 +285,6 @@ function stopMeter() {
   clearInterval(meterTimer);
   meterTimer = null;
   for (const b of $("micMeter").children) b.style.height = "";
-}
-
-function releaseMic() {
-  try { micStream?.getTracks().forEach(t => t.stop()); } catch { }
-  try { audioCtx?.close(); } catch { }
-  micStream = audioCtx = analyser = meterData = null;
 }
 
 async function acquireWake() {
