@@ -8,16 +8,20 @@
 //   recognition run, restarted while dictation is live
 // - a run's text is rebuilt from scratch on every event and folded
 //   (grow / replace / skip — never blind-append), shown as a scratch line
-// - an utterance is committed to the note only when its run ends; a ~750ms
-//   no-new-words timer ends the run rather than trusting isFinal
+// - an utterance is committed to the note when its run ends; Android is
+//   left to end runs itself (each forced end costs a system chime), with a
+//   long watchdog for runs that hang open silently
 // - "no-speech" errors are routine — the restart loop absorbs them
+// - dictation NEVER gives up while it's switched on: empty runs restart
+//   with growing spacing (fewer chimes in silence), speech snaps it back
+//   to fast restarts, and only real mic errors or the user end the session
 
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const $ = id => document.getElementById(id);
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-const COMMIT_MS = 750;         // silence that ends an utterance
-const AUTO_STOP_MS = 60000;    // silence that ends the session
+const RUN_WATCHDOG_MS = 15000; // a run silent this long is hung — recycle it
+const AUTO_STOP_MS = 120000;   // silence that ends the session
 const METER_BARS = 24;
 
 let app = null;
@@ -27,11 +31,12 @@ let committed = "";          // finished utterances
 let utterance = "";          // best hypothesis of the current run
 let bound = false;
 let meterTimer = null;
-let commitTimer = null;
+let watchdogTimer = null;
+let restartTimer = null;
 let idleTimer = null;
 let wakeLock = null;
-let restartCount = 0;
-let lastRestart = 0;
+let silentRuns = 0;          // consecutive runs that heard nothing
+let runHadText = false;
 // NOTE: no page-held getUserMedia keep-alive stream here. Holding the mic
 // used to silence Chrome's per-run chime, but Android Chrome now refuses to
 // feed SpeechRecognition while the page owns the mic — runs hear nothing,
@@ -67,7 +72,7 @@ function bind() {
 function start() {
   if (!SR) return;
   active = true;
-  restartCount = 0;
+  silentRuns = 0;
   startRun();
   acquireWake();
   startMeter();
@@ -94,6 +99,8 @@ function startRun() {
   rec.continuous = false;                  // the only mode Android honours
   rec.interimResults = true;
   rec.lang = "en-GB";
+  runHadText = false;
+  armRunWatchdog();
 
   rec.onresult = e => {
     let text = "";
@@ -103,7 +110,9 @@ function startRun() {
     text = text.trim();
     if (text && text !== utterance) {      // only real growth rearms timers
       utterance = text;
-      armCommitTimer();
+      runHadText = true;
+      silentRuns = 0;
+      armRunWatchdog();
       armIdleTimer();
       paint();
     }
@@ -127,27 +136,37 @@ function startRun() {
   };
 
   rec.onend = () => {
+    clearTimeout(watchdogTimer);
     commitUtterance();
     if (!active) { render(); return; }
-    // still live: restart for the next utterance, but not in a tight loop
-    const now = Date.now();
-    restartCount = now - lastRestart < 700 ? restartCount + 1 : 0;
-    lastRestart = now;
-    if (restartCount > 8) {
-      active = false;
-      app?.toast("Speech recognition keeps stopping — try again", 3000);
-      finishRun();
-      render();
-      return;
-    }
-    setTimeout(() => { if (active) { try { startRun(); } catch { } } }, 120);
+    // Still live: ALWAYS come back for the next utterance. Runs that heard
+    // something restart at once; empty ones space out (each restart is a
+    // chime on Android, and silence doesn't need a fast loop).
+    silentRuns = runHadText ? 0 : silentRuns + 1;
+    scheduleRestart(runHadText ? 150 : Math.min(8000, 300 * 2 ** silentRuns));
   };
 
   rec.start();
 }
 
+function scheduleRestart(delay) {
+  clearTimeout(restartTimer);
+  restartTimer = setTimeout(() => {
+    if (!active) return;
+    try { startRun(); }
+    catch { scheduleRestart(600); }        // engine still busy — retry, never die
+  }, delay);
+}
+
+function armRunWatchdog() {
+  // Android sometimes leaves a run open that will never hear anything —
+  // recycle it so the session can't wedge. Normal runs end themselves first.
+  clearTimeout(watchdogTimer);
+  watchdogTimer = setTimeout(() => { try { rec?.stop(); } catch { } },
+                             RUN_WATCHDOG_MS);
+}
+
 function commitUtterance() {
-  clearTimeout(commitTimer);
   if (utterance) {
     committed = fold(committed, utterance);
     utterance = "";
@@ -155,22 +174,16 @@ function commitUtterance() {
   }
 }
 
-function armCommitTimer() {
-  clearTimeout(commitTimer);
-  // no new words for COMMIT_MS: end the run — onend commits and restarts
-  commitTimer = setTimeout(() => { try { rec?.stop(); } catch { } }, COMMIT_MS);
-}
-
 function stop() {
   active = false;
-  clearTimeout(commitTimer);
   try { rec?.stop(); } catch { }           // onend commits the last utterance
   finishRun();
   render();
 }
 
 function finishRun() {
-  clearTimeout(commitTimer);
+  clearTimeout(watchdogTimer);
+  clearTimeout(restartTimer);
   clearTimeout(idleTimer);
   stopMeter();
   releaseWake();
@@ -180,7 +193,6 @@ function finishRun() {
 function reset() {
   committed = "";
   utterance = "";
-  clearTimeout(commitTimer);
   paint();
 }
 

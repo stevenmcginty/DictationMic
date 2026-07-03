@@ -137,13 +137,23 @@ if (location.protocol === "file:") {
   <div class="auth-card">
     <span class="brand-pill big" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
     <h1>Dictation<b>Mic</b></h1>
-    <p class="auth-sub">Sign in once — your notes stay in sync with your computer.</p>
+    <p class="auth-sub">Your own account — your notes stay private to it,
+      in sync between your phone and computer.</p>
     <input id="authEmail" type="email" placeholder="Email" autocomplete="username">
     <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password">
     <button class="capsule solid" id="authBtn">Sign in</button>
+    <p class="auth-hint">First time here? Signing in creates your account.</p>
+    <button class="auth-link" id="authForgot" type="button">Forgot password?</button>
     <p class="auth-error mono" id="authError"></p>
   </div>
 </section>
+
+<!-- tap the sync capsule when signed in: who you are + sign out -->
+<div class="account-pop" id="accountPop" hidden>
+  <span class="account-label">Signed in as</span>
+  <span class="account-email mono" id="accountEmail"></span>
+  <button class="capsule small" id="signOutBtn">Sign out</button>
+</div>
 
 <button class="mic-fab" id="micFab" hidden aria-label="Dictate a note">
   <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">

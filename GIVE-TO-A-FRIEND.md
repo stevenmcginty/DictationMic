@@ -44,6 +44,10 @@ deletes too. No signal? Notes queue up and sync when you're back online.
 Your notes are private to your account — nobody else (including Steve)
 can read them.
 
+Forgot your password? Tap **Forgot password?** on the phone's sign-in
+screen, or right-click the pill → **Email me a password-reset link**,
+and follow the email that arrives.
+
 ## Mac
 
 Coming soon — ask Steve.

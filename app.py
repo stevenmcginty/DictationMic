@@ -68,11 +68,34 @@ NOTES_DIR = os.path.join(APP_DIR, "notes")
 
 _DEBUG = bool(os.environ.get("DICTMIC_DEBUG"))
 
+# Debug lines go through a queue to a writer thread. dbg() used to open and
+# append the file inline — called from the keyboard-hook callback that means
+# disk I/O on every keystroke system-wide, and Windows silently removes
+# low-level hooks whose callbacks dawdle (the hotkey then dies with no error).
+_dbg_q = queue.Queue(maxsize=4000)
+
+def _dbg_writer():
+    path = os.path.join(APP_DIR, "debug.log")
+    while True:
+        lines = [_dbg_q.get()]
+        try:
+            while len(lines) < 200:
+                lines.append(_dbg_q.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.writelines(lines)
+        except Exception:
+            pass
+
+if _DEBUG:
+    threading.Thread(target=_dbg_writer, daemon=True).start()
+
 def dbg(msg):
     if _DEBUG:
         try:
-            with open(os.path.join(APP_DIR, "debug.log"), "a", encoding="utf-8") as f:
-                f.write(f"{time.time():.3f} {msg}\n")
+            _dbg_q.put_nowait(f"{time.time():.3f} {msg}\n")
         except Exception:
             pass
 
@@ -609,11 +632,175 @@ class PillRenderer:
 
 
 # ----------------------------------------------------------------------------
+# Right-click menu — a dark, rounded popup that matches the pill.
+# (tk.Menu draws like Windows 95 and can't be styled on Windows.)
+# ----------------------------------------------------------------------------
+
+MENU_BG = "#17181C"
+MENU_EDGE = "#31343C"
+MENU_HOVER = "#242833"
+MENU_FG = "#E8EAEE"
+MENU_SUB = "#9AA1AC"
+MENU_DIM = "#6B7280"
+MENU_LIME = "#B6EE3F"
+MENU_RED = "#FF5C48"
+MENU_GREEN = "#3FD68C"
+
+
+class PopupMenu:
+    """items is a list of dicts:
+      {"kind": "header", "text": ...}                       section label
+      {"kind": "sep"}                                       hairline
+      {"kind": "status", "text": ..., "bullet": "#hex",
+       "hint": ...}                                         non-clickable info
+      {"kind": "item", "text": ..., "command": fn,
+       "hint": ..., "radio": bool|None, "check": bool|None,
+       "bullet": "#hex"|None, "danger": bool}               clickable row
+    """
+
+    PAD_X = 16
+
+    def __init__(self, parent, items, on_close=None):
+        self._root = parent
+        self.on_close = on_close
+        self.closed = False
+        self.win = tk.Toplevel(parent, bg=MENU_BG)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(highlightthickness=1,
+                           highlightbackground=MENU_EDGE,
+                           highlightcolor=MENU_EDGE)
+        self._prev_buttons = True     # swallow the click that opened us
+        body = tk.Frame(self.win, bg=MENU_BG)
+        body.pack(fill="both", expand=True, pady=7)
+        for it in items:
+            self._add(body, it)
+        self.win.bind("<Escape>", lambda e: self.close())
+        self.win.bind("<FocusOut>", lambda e: self.close())
+
+    def _add(self, body, it):
+        kind = it.get("kind", "item")
+        if kind == "sep":
+            tk.Frame(body, bg=MENU_EDGE, height=1).pack(
+                fill="x", padx=10, pady=6)
+            return
+        if kind == "header":
+            tk.Label(body, text=it["text"].upper(), bg=MENU_BG, fg=MENU_DIM,
+                     font=("Segoe UI Semibold", 8), anchor="w"
+                     ).pack(fill="x", padx=self.PAD_X, pady=(5, 1))
+            return
+        row = tk.Frame(body, bg=MENU_BG)
+        row.pack(fill="x")
+        lead_txt, lead_fg = "", MENU_DIM
+        if it.get("radio") is not None:
+            lead_txt = "●" if it["radio"] else "○"
+            lead_fg = MENU_LIME if it["radio"] else MENU_DIM
+        elif it.get("check") is not None:
+            lead_txt = "✓" if it["check"] else ""
+            lead_fg = MENU_LIME
+        elif it.get("bullet"):
+            lead_txt, lead_fg = "●", it["bullet"]
+        widgets = [row]
+        lead = tk.Label(row, text=lead_txt, width=2, bg=MENU_BG, fg=lead_fg,
+                        font=("Segoe UI", 10), anchor="w")
+        lead.pack(side="left", padx=(self.PAD_X - 6, 0), pady=4)
+        widgets.append(lead)
+        fg = (MENU_RED if it.get("danger")
+              else MENU_SUB if kind == "status" else MENU_FG)
+        lab = tk.Label(row, text=it["text"], bg=MENU_BG, fg=fg,
+                       font=("Segoe UI", 10), anchor="w")
+        lab.pack(side="left", pady=4)
+        widgets.append(lab)
+        tail = tk.Label(row, text=it.get("hint", ""), bg=MENU_BG, fg=MENU_DIM,
+                        font=("Segoe UI", 8), anchor="e")
+        tail.pack(side="right", padx=(24, self.PAD_X), pady=4)
+        widgets.append(tail)
+        cmd = it.get("command") if kind == "item" else None
+        if cmd is not None:
+            def set_bg(color, ws=widgets):
+                for w in ws:
+                    w.configure(bg=color)
+            for w in widgets:
+                w.configure(cursor="hand2")
+                w.bind("<Enter>", lambda e: set_bg(MENU_HOVER))
+                w.bind("<Leave>", lambda e: set_bg(MENU_BG))
+                w.bind("<ButtonRelease-1>", lambda e, c=cmd: self._invoke(c))
+
+    def _invoke(self, cmd):
+        root = self._root
+        self.close()
+        root.after(10, cmd)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        if self.on_close:
+            self.on_close()
+
+    def show(self, x, y):
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        if y - h > 8:                 # pill lives near the bottom: open upward
+            y = y - h
+        x = max(8, min(x, sw - w - 8))
+        y = max(8, min(y, sh - h - 8))
+        self.win.geometry(f"+{x}+{y}")
+        self._round_corners()
+        self.win.lift()
+        try:
+            self.win.focus_force()
+        except Exception:
+            pass
+        self._watch_outside_click()
+
+    def _round_corners(self):
+        try:
+            self.win.update_idletasks()
+            hwnd = (ctypes.windll.user32.GetParent(self.win.winfo_id())
+                    or self.win.winfo_id())
+            pref = ctypes.c_int(2)    # DWMWCP_ROUND
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(pref), 4)
+        except Exception:
+            pass
+
+    def _watch_outside_click(self):
+        """Win32 backstop: a fresh mouse press outside the menu closes it —
+        FocusOut alone can't be trusted around a WS_EX_NOACTIVATE owner."""
+        if self.closed:
+            return
+        try:
+            down = any(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                       for vk in (0x01, 0x02, 0x04))
+            if down and not self._prev_buttons:
+                pt = ctypes.wintypes.POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                x0, y0 = self.win.winfo_rootx(), self.win.winfo_rooty()
+                if not (x0 <= pt.x < x0 + self.win.winfo_width()
+                        and y0 <= pt.y < y0 + self.win.winfo_height()):
+                    self.close()
+                    return
+            self._prev_buttons = down
+        except Exception:
+            pass
+        try:
+            self.win.after(80, self._watch_outside_click)
+        except tk.TclError:
+            pass                  # window already gone (app exiting)
+
+
+# ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
 
-IDLE, LOADING, LISTENING, FINISHING, DOWNLOADING = (
-    "idle", "loading", "listening", "finishing", "downloading")
+IDLE, LOADING, STARTING, LISTENING, FINISHING, DOWNLOADING = (
+    "idle", "loading", "starting", "listening", "finishing", "downloading")
 TRANSPARENT_HEX = "#010203"
 
 
@@ -671,6 +858,7 @@ class DictationApp:
         self.tooltip = None
         self._tooltip_job = None
         self._capturing = False
+        self._stop_when_ready = False
 
         self.label.bind("<ButtonPress-1>", self.on_press)
         self.label.bind("<B1-Motion>", self.on_motion)
@@ -681,13 +869,9 @@ class DictationApp:
         self.label.bind("<Leave>", self.on_leave)
         self._install_drop_targets()
 
-        self.mode_var = tk.StringVar(value=self.settings["mode"])
-        self.save_notes_var = tk.BooleanVar(
-            value=bool(self.settings.get("save_notes", True)))
         self.local_server = None
         self.cloud = None
-        self.menu = None
-        self.build_menu()
+        self._menu = None
         self._start_cloud_sync()
 
         self.root.update_idletasks()
@@ -768,10 +952,10 @@ class DictationApp:
                         pass
 
     def _global_kb(self, e):
-        """Single always-on hook: hotkey gestures AND 'press any key' capture."""
+        """Single always-on hook: hotkey gestures AND 'press any key' capture.
+        Runs on the keyboard library's thread — it must stay fast (Windows
+        drops hooks that stall) and never touch Tk directly."""
         try:
-            dbg(f"hook {e.event_type} name={e.name!r} sc={e.scan_code} "
-                f"cap={self._capturing}")
             if self._capturing:
                 if e.event_type == "down" and (e.name or e.scan_code):
                     self._capturing = False
@@ -797,6 +981,8 @@ class DictationApp:
             is_mod = (name in self._mod_names) or (sc in self._mod_sc)
             is_direct = (not is_mod) and ((name in self._direct_names)
                                           or (sc in self._direct_sc))
+            if is_mod or is_direct:
+                dbg(f"hook {e.event_type} name={name!r} sc={sc}")
             if e.event_type == "down":
                 if is_mod:
                     if not self._mod_down:
@@ -839,15 +1025,6 @@ class DictationApp:
             dbg(f"keyboard.hook FAILED: {ex!r}")
             self.events.put(("toast", "Couldn't attach the keyboard hook — "
                                       "hotkeys won't work, but clicking will"))
-        if _DEBUG:
-            try:
-                keyboard.on_press_key("f7", lambda e: dbg(
-                    f"on_press_key f7 fired name={e.name!r} sc={e.scan_code}"))
-                keyboard.on_press(lambda e: dbg(
-                    f"on_press(generic) fired name={e.name!r} sc={e.scan_code}"))
-                dbg("debug probes installed")
-            except Exception as ex:
-                dbg(f"debug probes FAILED: {ex!r}")
 
     def start_capture(self):
         if self._capturing:
@@ -865,84 +1042,96 @@ class DictationApp:
 
     # ---------------- menu ----------------
 
-    def _menu_dot(self, color):
-        if not hasattr(self, "_dot_cache"):
-            self._dot_cache = {}
-        if color not in self._dot_cache:
-            img = Image.new("RGBA", (14, 14), (0, 0, 0, 0))
-            d = ImageDraw.Draw(img)
-            d.ellipse([2, 2, 12, 12], fill=color)
-            self._dot_cache[color] = tk_photo(img)
-        return self._dot_cache[color]
-
-    def build_menu(self):
-        if self.menu is None:
-            self.menu = tk.Menu(self.root, tearoff=0, font=("Segoe UI", 10))
-        else:
-            self.menu.delete(0, "end")
-        blue = self._menu_dot((0, 150, 255, 255))
-        green = self._menu_dot((0, 205, 110, 255))
-        purple = self._menu_dot((168, 110, 255, 255))
-        grey = self._menu_dot((150, 156, 166, 255))
-        red = self._menu_dot((236, 80, 90, 255))
-        self.menu.add_radiobutton(label="Write into the box I'm typing in",
-                                  image=blue, compound="left",
-                                  variable=self.mode_var, value="type",
-                                  command=self.on_mode_change)
-        self.menu.add_radiobutton(label="Copy to clipboard instead",
-                                  image=green, compound="left",
-                                  variable=self.mode_var, value="clipboard",
-                                  command=self.on_mode_change)
-        self.menu.add_separator()
-        lime = self._menu_dot((163, 230, 53, 255))
-        self.menu.add_command(label="My notes — everything you've dictated",
-                              image=lime, compound="left",
-                              command=self.open_notes)
-        self.menu.add_checkbutton(label="Keep a copy of each dictation",
-                                  variable=self.save_notes_var,
-                                  command=self.on_save_notes_toggle)
-        self.menu.add_command(label="Save clipboard as a note — text, screenshot "
-                                    "or copied file  (middle-click, or hover "
-                                    "me + Ctrl+V)",
-                              image=blue, compound="left",
-                              command=self.save_clipboard_note)
-        self.menu.add_command(label="My files — every PDF, doc & photo as the "
-                                    "actual file",
-                              image=lime, compound="left",
-                              command=self.open_files_folder)
-        self.menu.add_separator()
-        if self.settings.get("sync_enabled") and self.cloud is not None:
+    def _menu_items(self):
+        s = self.settings
+        items = [
+            {"kind": "header", "text": "Output"},
+            {"kind": "item", "text": "Type into the box I'm working in",
+             "radio": s["mode"] == "type",
+             "command": lambda: self.set_mode("type")},
+            {"kind": "item", "text": "Copy to the clipboard instead",
+             "radio": s["mode"] == "clipboard",
+             "command": lambda: self.set_mode("clipboard")},
+            {"kind": "sep"},
+            {"kind": "header", "text": "Notes"},
+            {"kind": "item", "text": "My notes",
+             "hint": "everything you've dictated",
+             "command": self.open_notes},
+            {"kind": "item", "text": "My files",
+             "hint": "PDFs, docs & photos as real files",
+             "command": self.open_files_folder},
+            {"kind": "item", "text": "Save the clipboard as a note",
+             "hint": "middle-click · Ctrl+V over me",
+             "command": self.save_clipboard_note},
+            {"kind": "item", "text": "Keep a copy of each dictation",
+             "check": bool(s.get("save_notes", True)),
+             "command": self.toggle_save_notes},
+            {"kind": "sep"},
+            {"kind": "header", "text": "Phone sync"},
+        ]
+        if s.get("sync_enabled") and self.cloud is not None:
             state = self.cloud.status()["sync"]
-            label, color = {
-                "ok": ("Phone sync: on — notes flow both ways", green),
-                "offline": ("Phone sync: offline — will catch up", grey),
-                "needs-signin": ("Phone sync: needs sign-in", red),
-                "error": ("Phone sync: hiccup — retrying", grey),
-            }.get(state, ("Phone sync: starting…", grey))
-            self.menu.add_command(label=label, image=color,
-                                  compound="left", state="disabled")
-            self.menu.add_command(label="Turn off phone sync",
-                                  image=grey, compound="left",
-                                  command=self.sync_off)
+            text, color = {
+                "ok": ("Phone sync is on — notes flow both ways", MENU_GREEN),
+                "offline": ("Phone sync: offline — will catch up", MENU_SUB),
+                "needs-signin": ("Phone sync needs a fresh sign-in", MENU_RED),
+                "error": ("Phone sync hiccup — retrying", MENU_SUB),
+            }.get(state, ("Phone sync is starting…", MENU_SUB))
+            items.append({"kind": "status", "text": text, "bullet": color,
+                          "hint": s.get("sync_email", "")})
+            if state == "needs-signin":
+                items.append({"kind": "item", "text": "Sign in again…",
+                              "command": self.sync_dialog})
+            items += [
+                {"kind": "item", "text": "Email me a password-reset link",
+                 "hint": "forgot your sync password?",
+                 "command": self.send_reset_link},
+                {"kind": "item", "text": "Turn off phone sync",
+                 "command": self.sync_off},
+            ]
         else:
-            self.menu.add_command(label="Set up phone sync…",
-                                  image=lime, compound="left",
-                                  command=self.sync_dialog)
-        self.menu.add_separator()
-        self.menu.add_command(
-            label=f"Talk key: {self.hotkey_label()}  —  tap = start/stop, hold + speak = push-to-talk",
-            image=purple, compound="left", state="disabled")
-        self.menu.add_command(label="Change hotkey…", underline=0,
-                              image=purple, compound="left",
-                              command=self.start_capture)
-        self.menu.add_separator()
-        self.menu.add_command(label="Click me = start/stop   ·   drag me = move",
-                              image=grey, compound="left", state="disabled")
-        self.menu.add_command(label="Goes quiet? Stops by itself after 10 s",
-                              image=grey, compound="left", state="disabled")
-        self.menu.add_separator()
-        self.menu.add_command(label="Exit", image=red, compound="left",
-                              command=self.quit)
+            items.append({"kind": "item", "text": "Set up phone sync…",
+                          "hint": "your notes, on your phone",
+                          "command": self.sync_dialog})
+        items += [
+            {"kind": "sep"},
+            {"kind": "header", "text": f"Talk key — {self.hotkey_label()}"},
+            {"kind": "status",
+             "text": "Tap = start / stop · hold + speak = push-to-talk"},
+            {"kind": "item", "text": "Change the talk key…",
+             "command": self.start_capture},
+            {"kind": "sep"},
+            {"kind": "item", "text": "Exit DictationMic", "danger": True,
+             "command": self.quit},
+        ]
+        return items
+
+    def set_mode(self, mode):
+        self.settings["mode"] = mode
+        save_settings(self.settings)
+        self.show_toast("Words will be typed where your cursor is"
+                        if mode == "type"
+                        else "Words will be copied to the clipboard", 2200)
+
+    def toggle_save_notes(self):
+        self.settings["save_notes"] = not self.settings.get("save_notes", True)
+        save_settings(self.settings)
+        self.show_toast("Keeping a copy of every dictation in your notes"
+                        if self.settings["save_notes"]
+                        else "Not saving dictations to notes any more", 2200)
+
+    def send_reset_link(self):
+        email = (self.settings.get("sync_email") or "").strip()
+        if not email:
+            self.sync_dialog()
+            return
+        self.show_toast(f"Sending a password-reset link to {email}…", 2500)
+
+        def work():
+            from cloudsync import send_password_reset
+            ok, msg = send_password_reset(email)
+            self.events.put(("toast", msg))
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------------- model download (first run only) ----------------
 
@@ -1065,7 +1254,7 @@ class DictationApp:
             pass
         except Exception:
             pass
-        self.root.after(40, self.poll_events)
+        self.root.after(20, self.poll_events)
 
     def _handle_event(self, name, payload):
         if name == "model_loaded":
@@ -1080,10 +1269,25 @@ class DictationApp:
         elif name == "stop_if_listening":
             if self.state == LISTENING:
                 self.stop_listening()
+            elif self.state == STARTING:
+                self._stop_when_ready = True
+        elif name == "mic_ready":
+            if self.state != STARTING:
+                # stopped/quit while the mic was opening — close it again
+                threading.Thread(target=self.recorder.stop, daemon=True).start()
+            elif self._stop_when_ready:
+                self.state = LISTENING
+                self.stop_listening()
+            else:
+                self.state = LISTENING
+        elif name == "mic_failed":
+            if self.state == STARTING:
+                self.state = IDLE
+            self.beep(300, 120)
+            self.show_toast(f"Mic error: {payload}", 3000)
         elif name == "toast":
             self.show_toast(payload, 3500)
         elif name == "sync_status":
-            self.build_menu()      # refresh the status line
             if payload.get("sync") == "needs-signin":
                 self.show_toast("Phone sync needs a fresh sign-in — "
                                 "right-click me → Set up phone sync", 4000)
@@ -1094,7 +1298,6 @@ class DictationApp:
                 self.settings["hotkeys"] = [payload]
                 save_settings(self.settings)
                 self._refresh_hotkey_codes()
-                self.build_menu()
                 self.show_toast("Your talk key is now " + self.hotkey_label()
                                 + " — tap it and speak", 3500)
         elif name == "session_done":
@@ -1132,16 +1335,28 @@ class DictationApp:
             self.session_text = []
             self.context = ""
             self.session_start = time.time()
-            try:
-                self.recorder.start()
-            except Exception as ex:
-                self.show_toast(f"Mic error: {ex}", 3000)
-                return
-            self.state = LISTENING
+            # Feedback FIRST: opening the input stream can take a second on
+            # some audio drivers, and doing it inline froze the pill with no
+            # sign it had heard the hotkey. Beep + go lime instantly, open
+            # the mic on a thread, fall back to idle if it fails.
+            self.state = STARTING
+            self._stop_when_ready = False
             self.beep(880, 60)
             self.show_toast("Listening — talk away", 1200)
+            self.draw()
+            threading.Thread(target=self._open_mic, daemon=True).start()
+        elif self.state == STARTING:
+            self._stop_when_ready = True    # tapped off before the mic opened
         elif self.state == LISTENING:
             self.stop_listening()
+
+    def _open_mic(self):
+        try:
+            self.recorder.start()
+        except Exception as ex:
+            self.events.put(("mic_failed", str(ex)))
+        else:
+            self.events.put(("mic_ready", None))
 
     def stop_listening(self):
         self.state = FINISHING
@@ -1189,17 +1404,11 @@ class DictationApp:
 
     def on_right_click(self, e):
         self.hide_tooltip()
-        try:
-            self.menu.tk_popup(e.x_root, e.y_root)
-        finally:
-            self.menu.grab_release()
-
-    def on_mode_change(self):
-        self.settings["mode"] = self.mode_var.get()
-        save_settings(self.settings)
-        self.show_toast("Words will be typed where your cursor is"
-                        if self.settings["mode"] == "type"
-                        else "Words will be copied to the clipboard", 2200)
+        if self._menu is not None:
+            self._menu.close()
+        self._menu = PopupMenu(self.root, self._menu_items(),
+                               on_close=lambda: setattr(self, "_menu", None))
+        self._menu.show(e.x_root, e.y_root)
 
     # ---------------- throw things at the pill ----------------
     # Drag files, images or selected text onto the pill and each becomes its
@@ -1346,13 +1555,6 @@ class DictationApp:
                 self.events.put(("toast", f"Couldn't save that — {ex}"))
         threading.Thread(target=work, daemon=True).start()
 
-    def on_save_notes_toggle(self):
-        self.settings["save_notes"] = bool(self.save_notes_var.get())
-        save_settings(self.settings)
-        self.show_toast("Keeping a copy of every dictation in your notes"
-                        if self.settings["save_notes"]
-                        else "Not saving dictations to notes any more", 2200)
-
     def _sync_status(self):
         cloud = getattr(self, "cloud", None)
         if cloud is None:
@@ -1461,7 +1663,6 @@ class DictationApp:
         else:
             self.settings["sync_enabled"] = False
             save_settings(self.settings)
-        self.build_menu()
         self.show_toast("Phone sync is off — notes stay on this computer", 3000)
 
     def sync_dialog(self):
@@ -1475,7 +1676,7 @@ class DictationApp:
         win.title("DictationMic — phone sync")
         win.resizable(False, False)
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        win.geometry(f"360x250+{(sw - 360) // 2}+{max(0, (sh - 250) // 3)}")
+        win.geometry(f"360x286+{(sw - 360) // 2}+{max(0, (sh - 286) // 3)}")
         try:
             win.iconbitmap(os.path.join(APP_DIR, "icon.ico"))
         except Exception:
@@ -1486,12 +1687,11 @@ class DictationApp:
         tk.Label(win, text="Sync notes with your phone",
                  bg="#131512", fg=FG, font=("Segoe UI Semibold", 12)
                  ).pack(pady=(18, 2))
-        tk.Label(win, text="One account, used on the phone too.\n"
-                           "First time? It creates the account for you.",
+        tk.Label(win, text="Your own account — the same one you'll use on "
+                           "your phone.\nFirst time? Signing in creates it.",
                  bg="#131512", fg=SUB, font=("Segoe UI", 9)).pack()
 
-        email_var = tk.StringVar(value=self.settings.get("sync_email")
-                                 or "stevenmcginty@gmail.com")
+        email_var = tk.StringVar(value=self.settings.get("sync_email") or "")
         pw_var = tk.StringVar()
         for label, var, show in (("Email", email_var, None),
                                  ("Password", pw_var, "•")):
@@ -1503,8 +1703,35 @@ class DictationApp:
                      ).pack(fill="x", padx=36, ipady=5, pady=(0, 6))
 
         status = tk.Label(win, text="", bg="#131512", fg=SUB,
-                          font=("Segoe UI", 9))
+                          font=("Segoe UI", 9), wraplength=300)
         status.pack()
+
+        def forgot(_e=None):
+            email = email_var.get().strip()
+            if not email:
+                status.configure(text="Type your email above first",
+                                 fg="#ff5c48")
+                return
+            status.configure(text="Sending the reset link…", fg=SUB)
+
+            def work():
+                from cloudsync import send_password_reset
+                ok, msg = send_password_reset(email)
+
+                def done():
+                    try:
+                        status.configure(text=msg,
+                                         fg=LIME if ok else "#ff5c48")
+                    except tk.TclError:
+                        pass          # dialog was closed meanwhile
+                self.root.after(0, done)
+            threading.Thread(target=work, daemon=True).start()
+
+        link = tk.Label(win, text="Forgot password?  Email me a reset link",
+                        bg="#131512", fg=LIME, cursor="hand2",
+                        font=("Segoe UI", 9, "underline"))
+        link.pack(pady=(2, 0))
+        link.bind("<ButtonRelease-1>", forgot)
 
         def connect():
             email = email_var.get().strip()
@@ -1523,7 +1750,6 @@ class DictationApp:
                     if ok:
                         self.cloud = cs
                         cs.start()
-                        self.build_menu()
                         win.destroy()
                         self.show_toast(
                             "Phone sync is on — open the same link on your "
@@ -1658,7 +1884,7 @@ class DictationApp:
             self._photo = r.drop()
             self.label.configure(image=self._photo)
             return
-        if self.state == LISTENING:
+        if self.state in (LISTENING, STARTING):
             hist = list(self.level_hist)[-r.nbars:]
             bars = []
             for i, v in enumerate(hist):

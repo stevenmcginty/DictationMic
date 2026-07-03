@@ -17,6 +17,24 @@ function grabToken() {
   return sessionStorage.getItem("dictmic-token") || "";
 }
 
+// Hosted only: tap the sync capsule to see whose account this is / sign out.
+async function wireAccountPop() {
+  const { email, signOut } = await import("./auth.js");
+  const pop = $("accountPop");
+  $("statusCapsule").addEventListener("click", e => {
+    e.stopPropagation();
+    $("accountEmail").textContent = email() || "(unknown)";
+    pop.hidden = !pop.hidden;
+  });
+  $("signOutBtn").addEventListener("click", () => {
+    signOut();
+    location.reload();          // boot() shows the sign-in screen again
+  });
+  document.addEventListener("click", e => {
+    if (!pop.hidden && !pop.contains(e.target)) pop.hidden = true;
+  });
+}
+
 function fail(msg) {
   $("noteList").textContent = "";
   $("emptyState").hidden = false;
@@ -52,6 +70,7 @@ async function boot() {
       const { micAvailable, openMic } = await import("./speech.js");
       const app = new App(adapter, { showMic: micAvailable(), openMic });
       await app.start();
+      wireAccountPop();
     }
   } catch (e) {
     fail(e.message || "Something went wrong.");

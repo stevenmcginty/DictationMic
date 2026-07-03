@@ -35,6 +35,8 @@ SIGNIN_URL = ("https://identitytoolkit.googleapis.com/v1/"
 SIGNUP_URL = ("https://identitytoolkit.googleapis.com/v1/"
               "accounts:signUp?key=" + API_KEY)
 REFRESH_URL = "https://securetoken.googleapis.com/v1/token?key=" + API_KEY
+OOB_URL = ("https://identitytoolkit.googleapis.com/v1/"
+           "accounts:sendOobCode?key=" + API_KEY)
 
 TOMBSTONE_KEEP_MS = 30 * 24 * 3600 * 1000
 SCAN_TICK_S = 5.0
@@ -42,6 +44,31 @@ SCAN_TICK_S = 5.0
 
 def _now_ms():
     return int(time.time() * 1000)
+
+
+def send_password_reset(email):
+    """Ask Firebase to email a password-reset link. Returns (ok, message) —
+    the message is ready to show the user either way."""
+    import requests
+    try:
+        r = requests.post(OOB_URL, json={
+            "requestType": "PASSWORD_RESET", "email": email}, timeout=15)
+    except Exception:
+        return False, "Couldn't reach Firebase — check the internet"
+    if r.status_code == 200:
+        return True, f"Reset link sent to {email} — check your inbox"
+    try:
+        err = (r.json().get("error") or {}).get("message", "")
+    except ValueError:
+        err = ""
+    if err.startswith("EMAIL_NOT_FOUND"):
+        return False, ("No account with that email yet — signing in "
+                       "creates one")
+    if "INVALID_EMAIL" in err:
+        return False, "That email doesn't look right"
+    if "TOO_MANY_ATTEMPTS" in err:
+        return False, "Too many tries — wait a minute"
+    return False, "Couldn't send the reset email" + (f" ({err})" if err else "")
 
 
 class CloudSync:

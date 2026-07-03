@@ -4,7 +4,7 @@
 
 import { notesDb, outboxDb } from "../db.js";
 import { noteTitleFrom, uuid } from "../util.js";
-import { signedIn, signIn } from "../auth.js";
+import { signedIn, signIn, sendPasswordReset } from "../auth.js";
 import { startSync, flush, syncStatus, pendingIds as syncPending } from "../sync.js";
 
 const $ = id => document.getElementById(id);
@@ -135,6 +135,7 @@ export function showAuthIfNeeded() {
     const go = async () => {
       const email = $("authEmail").value.trim();
       const pw = $("authPassword").value;
+      err.classList.remove("ok");
       if (!email || !pw) { err.textContent = "Fill in both boxes"; return; }
       btn.disabled = true;
       btn.textContent = "Signing in…";
@@ -151,6 +152,19 @@ export function showAuthIfNeeded() {
     };
     btn.addEventListener("click", go);
     pane.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+    $("authForgot").addEventListener("click", async () => {
+      const email = $("authEmail").value.trim();
+      err.classList.remove("ok");
+      if (!email) { err.textContent = "Type your email above first"; return; }
+      err.textContent = "Sending the reset link…";
+      try {
+        await sendPasswordReset(email);
+        err.classList.add("ok");
+        err.textContent = `Reset link sent to ${email} — check your inbox`;
+      } catch (e) {
+        err.textContent = e.message;
+      }
+    });
     $("authEmail").focus();
   });
 }
