@@ -22,34 +22,36 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      HAVE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
     steps:
       - uses: actions/checkout@v4
-        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+        if: env.HAVE_SA == 'true'
 
       - name: Restore friend zip
         id: zipcache
-        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+        if: env.HAVE_SA == 'true'
         uses: actions/cache@v4
         with:
           path: hosting/downloads
           key: friend-downloads-v1
 
       - name: Fetch friend zip from the live site (cold cache only)
-        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' && steps.zipcache.outputs.cache-hit != 'true' }}
+        if: env.HAVE_SA == 'true' && steps.zipcache.outputs.cache-hit != 'true'
         run: |
           mkdir -p hosting/downloads
           curl -fL --retry 4 -o hosting/downloads/DictationMic-Windows.zip \
             https://dictationmic-sync.web.app/downloads/DictationMic-Windows.zip
 
       - name: Build hosting dir from web/
-        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+        if: env.HAVE_SA == 'true'
         run: |
           rsync -a --delete --exclude downloads web/ hosting/
           sed -i "s/^const CACHE = \".*\";/const CACHE = \"dictmic-${GITHUB_SHA::9}\";/" hosting/sw.js
           echo "stamped: $(grep -m1 '^const CACHE' hosting/sw.js)"
 
       - name: Deploy to live channel
-        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+        if: env.HAVE_SA == 'true'
         uses: FirebaseExtended/action-hosting-deploy@v0
         with:
           repoToken: ${{ secrets.GITHUB_TOKEN }}
