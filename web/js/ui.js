@@ -91,7 +91,11 @@ export class App {
       const time = document.createElement("span");
       time.className = "note-row-time";
       time.textContent = relTime(n.updatedAt);
-      top.append(title, time);
+      const del = document.createElement("button");
+      del.className = "row-del";
+      del.textContent = "×";
+      del.setAttribute("aria-label", `Delete ${n.title}`);
+      top.append(title, time, del);
 
       const snippet = document.createElement("div");
       snippet.className = "note-row-snippet" + (isImageBody(n.body) ? " has-thumb" : "");
@@ -340,13 +344,14 @@ export class App {
     } catch (e) { this.toast(e.message || "Couldn't rename"); }
   }
 
-  async _deleteActive() {
-    const id = this.activeId;
+  async _deleteActive() { return this._deleteNote(this.activeId); }
+
+  async _deleteNote(id) {
     if (!id) return;
     try {
       await this.adapter.remove(id);
       this.notes = this.notes.filter(n => n.id !== id);
-      location.hash = "#/";
+      if (this.activeId === id) location.hash = "#/";
       this.renderList();
       this.toast("Note deleted");
     } catch (e) { this.toast(e.message || "Couldn't delete"); }
@@ -405,12 +410,33 @@ export class App {
   // ---------------- events ----------------
 
   _bind() {
-    // list interactions
+    // list interactions (the row × arms first — a stray tap can't delete)
     $("noteList").addEventListener("click", e => {
+      const del = e.target.closest(".row-del");
+      if (del) {
+        e.stopPropagation();
+        const id = del.closest(".note-row")?.dataset.id;
+        if (!del.classList.contains("armed")) {
+          for (const b of $("noteList").querySelectorAll(".row-del.armed")) {
+            b.classList.remove("armed");
+            b.textContent = "×";
+          }
+          del.classList.add("armed");
+          del.textContent = "sure?";
+          setTimeout(() => {
+            del.classList.remove("armed");
+            del.textContent = "×";
+          }, 2600);
+        } else {
+          this._deleteNote(id);
+        }
+        return;
+      }
       const li = e.target.closest(".note-row");
       if (li) location.hash = `#/note/${li.dataset.id}`;
     });
     $("noteList").addEventListener("keydown", e => {
+      if (e.target.closest(".row-del")) return;   // Enter there = the ×
       const li = e.target.closest(".note-row");
       if (li && (e.key === "Enter" || e.key === " ")) {
         e.preventDefault();
@@ -438,6 +464,11 @@ export class App {
     // editor
     $("noteBody").addEventListener("input", () => this._saveBody());
     $("noteTitle").addEventListener("blur", () => this._commitTitle());
+    $("renameBtn").addEventListener("click", () => {
+      const t = $("noteTitle");
+      t.focus();
+      t.select();
+    });
     $("noteTitle").addEventListener("keydown", e => {
       if (e.key === "Enter") { e.preventDefault(); e.target.blur(); }
     });

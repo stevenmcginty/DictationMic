@@ -161,6 +161,11 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
 .list-head {
   display: flex; align-items: baseline; justify-content: space-between;
   padding: 22px 20px 10px;
+  /* pinned: + Image / + File / + New stay reachable however far you scroll */
+  position: sticky; top: 0; z-index: 6;
+  background: rgba(11, 12, 10, .88);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 .eyebrow {
   font-family: var(--mono);
@@ -195,6 +200,29 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
   font-family: var(--mono); font-size: 9.5px; letter-spacing: .14em;
   text-transform: uppercase; color: var(--faint);
 }
+/* quick delete: red × beside the time — hover on desktop, always on touch */
+.row-del {
+  flex: none;
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  border-radius: 11px;
+  color: var(--danger);
+  border: 1px solid transparent;
+  font-size: 15px; line-height: 1;
+  opacity: 0;
+  transition: opacity .15s, background .15s;
+}
+.note-row:hover .row-del, .note-row:focus-within .row-del { opacity: 1; }
+.row-del:hover { background: rgba(255, 92, 72, .14); border-color: rgba(255, 92, 72, .4); }
+.row-del.armed {
+  opacity: 1;
+  width: auto; padding: 0 9px;
+  background: var(--danger); border-color: var(--danger);
+  color: #0B0C0A;
+  font-size: 10px; font-weight: 700; letter-spacing: .08em;
+  font-family: var(--mono); text-transform: uppercase;
+}
+@media (hover: none) { .row-del { opacity: 1; } }
 .note-row-snippet {
   margin-top: 3px;
   font-size: 13px; line-height: 1.45; color: var(--muted);
@@ -265,6 +293,18 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
 .capsule.flash { background: var(--volt-dim); border-color: rgba(182, 238, 63, .5); color: var(--volt); }
 .back { display: none; }
 
+.title-row { display: flex; align-items: center; gap: 10px; }
+.rename-btn {
+  flex: none;
+  width: 34px; height: 34px;
+  margin-top: 22px;
+  display: grid; place-items: center;
+  border-radius: 17px;
+  border: 1px solid var(--hairline);
+  color: var(--muted);
+  transition: color .15s, border-color .15s;
+}
+.rename-btn:hover { color: var(--volt); border-color: rgba(182, 238, 63, .45); }
 .note-title {
   margin-top: 26px;
   width: 100%;
