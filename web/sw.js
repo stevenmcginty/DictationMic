@@ -1,7 +1,7 @@
 // Service worker — hosted origin only (main.js never registers it on
 // localhost). App shell is precached; data traffic is always network-only.
 
-const CACHE = "dictmic-v7";
+const CACHE = "dictmic-v8";
 const SHELL = [
   "./", "index.html", "styles.css", "config.js", "manifest.webmanifest",
   "js/main.js", "js/ui.js", "js/util.js", "js/db.js", "js/sync.js",
@@ -11,8 +11,11 @@ const SHELL = [
 ];
 
 self.addEventListener("install", e => {
+  // cache:"no-cache" = straight to the network, never the browser's HTTP
+  // cache — otherwise a fresh install can precache hour-old files
   e.waitUntil(caches.open(CACHE)
-    .then(c => Promise.allSettled(SHELL.map(u => c.add(u))))
+    .then(c => Promise.allSettled(
+      SHELL.map(u => c.add(new Request(u, { cache: "no-cache" })))))
     .then(() => self.skipWaiting()));
 });
 
@@ -41,7 +44,7 @@ self.addEventListener("fetch", e => {
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);
     const hit = await cache.match(e.request, { ignoreSearch: true });
-    const refresh = fetch(e.request).then(res => {
+    const refresh = fetch(e.request.url, { cache: "no-cache" }).then(res => {
       if (res && res.ok) cache.put(e.request, res.clone());
       return res;
     });
