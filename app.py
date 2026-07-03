@@ -35,6 +35,15 @@ import pyperclip
 import winsound
 from PIL import Image, ImageDraw, ImageFont
 
+# OS drag-and-drop onto the pill (tkdnd). Optional: if the package or its
+# native DLL is unavailable (Smart App Control has blocked stranger things),
+# the pill still runs — you just lose dropping, not the clipboard route.
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES, DND_TEXT
+except Exception:
+    TkinterDnD = None
+    DND_FILES = DND_TEXT = None
+
 
 def tk_photo(img):
     """PIL image -> tk.PhotoImage via in-memory PNG. Avoids PIL.ImageTk, whose
@@ -594,7 +603,7 @@ class DictationApp:
         self.session_start = 0.0
         self.dl_frac = 0.0
 
-        self.root = tk.Tk()
+        self.root = tk.Tk() if TkinterDnD is None else TkinterDnD.Tk()
         self.root.title("DictationMic")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -638,6 +647,7 @@ class DictationApp:
         self.label.bind("<ButtonRelease-3>", self.on_right_click)
         self.label.bind("<Enter>", self.on_enter)
         self.label.bind("<Leave>", self.on_leave)
+        self._install_drop_targets()
 
         self.mode_var = tk.StringVar(value=self.settings["mode"])
         self.save_notes_var = tk.BooleanVar(
@@ -839,7 +849,8 @@ class DictationApp:
         self.menu.add_checkbutton(label="Keep a copy of each dictation",
                                   variable=self.save_notes_var,
                                   command=self.on_save_notes_toggle)
-        self.menu.add_command(label="Save clipboard as a note  (or middle-click me)",
+        self.menu.add_command(label="Save clipboard as a note — text, screenshot "
+                                    "or copied file  (middle-click me)",
                               image=blue, compound="left",
                               command=self.save_clipboard_note)
         self.menu.add_separator()
@@ -1133,23 +1144,133 @@ class DictationApp:
                         if self.settings["mode"] == "type"
                         else "Words will be copied to the clipboard", 2200)
 
-    def save_clipboard_note(self):
-        """Copied text anywhere -> middle-click the pill (or use the menu)
-        and it lands in notes as its own entry, synced like a dictation."""
-        try:
-            text = (pyperclip.paste() or "").strip()
-        except Exception:
-            text = ""
-        if not text:
-            self.show_toast("Nothing on the clipboard to save", 2500)
+    # ---------------- throw things at the pill ----------------
+    # Drag files, images or selected text onto the pill and each becomes its
+    # own note (images compressed to a data URL body — see dropnotes.py).
+    # Middle-click does the same for whatever is on the clipboard.
+
+    def _install_drop_targets(self):
+        if TkinterDnD is None:
+            dbg("tkdnd unavailable — drag-and-drop disabled")
             return
         try:
-            save_note(text)
-            trimmed = " ".join(text.split())
-            preview = trimmed[:44] + ("…" if len(trimmed) > 44 else "")
-            self.show_toast(f"Saved to notes: {preview}", 2500)
+            for w in (self.root, self.label):
+                w.drop_target_register(DND_FILES, DND_TEXT)
+                w.dnd_bind("<<Drop:DND_Files>>", self._on_drop_files)
+                w.dnd_bind("<<Drop:DND_Text>>", self._on_drop_text)
+                w.dnd_bind("<<DropEnter>>", self._on_drop_enter)
+                w.dnd_bind("<<DropLeave>>", self._on_drop_leave)
+            dbg("tkdnd drop targets installed")
         except Exception as ex:
-            self.show_toast(f"Couldn't save that — {ex}", 3000)
+            dbg(f"tkdnd register failed: {ex!r}")
+
+    def _on_drop_enter(self, event):
+        self.hover = True                   # brighter rim: "I'll catch that"
+        return event.action
+
+    def _on_drop_leave(self, event):
+        self.hover = False
+        return event.action
+
+    def _on_drop_files(self, event):
+        self.hover = False
+        try:
+            paths = list(self.root.tk.splitlist(event.data or ""))
+        except Exception:
+            paths = []
+        if paths:
+            threading.Thread(target=self._ingest_paths, args=(paths,),
+                             daemon=True).start()
+        return getattr(event, "action", "copy")
+
+    def _on_drop_text(self, event):
+        self.hover = False
+        text = event.data or ""
+        if text.strip():
+            threading.Thread(target=self._ingest_text, args=(text,),
+                             daemon=True).start()
+        return getattr(event, "action", "copy")
+
+    def _saved_toast(self, title):
+        suffix = " — syncing to your phone" if (
+            self.settings.get("sync_enabled")
+            and self.settings.get("sync_refresh_token")) else ""
+        preview = title[:44] + ("…" if len(title) > 44 else "")
+        self.events.put(("toast", f"Saved to notes: {preview}{suffix}"))
+
+    def _ingest_paths(self, paths):
+        import dropnotes
+        saved_title, saved = "", 0
+        for p in paths[:10]:
+            try:
+                title, body = dropnotes.note_from_path(p)
+                get_store().create(title, body)
+                saved += 1
+                saved_title = title
+            except ValueError as ex:
+                self.events.put(("toast", str(ex)))
+            except Exception:
+                self.events.put(("toast", "Couldn't save "
+                                          + os.path.basename(str(p))))
+        if saved == 1:
+            self._saved_toast(saved_title)
+        elif saved:
+            self._saved_toast(f"{saved} files")
+
+    def _ingest_text(self, text):
+        import dropnotes
+        try:
+            title, body = dropnotes.note_from_dropped_text(text)
+            get_store().create(title, body)
+            self._saved_toast(title)
+        except ValueError as ex:
+            self.events.put(("toast", str(ex)))
+        except Exception:
+            self.events.put(("toast", "Couldn't save that"))
+
+    def save_clipboard_note(self):
+        """Whatever is on the clipboard -> middle-click the pill (or the
+        menu) and it lands in notes: a screenshot (Win+Shift+S), files
+        copied in Explorer, or plain text — synced like a dictation."""
+        def work():
+            import dropnotes
+            clip = None
+            try:
+                from PIL import ImageGrab
+                clip = ImageGrab.grabclipboard()
+            except Exception:
+                clip = None
+            try:
+                if isinstance(clip, Image.Image):
+                    body = dropnotes.compress_image(clip)
+                    title = dropnotes.photo_title("Clipboard image")
+                    get_store().create(title, body)
+                    self._saved_toast(title)
+                    return
+                if isinstance(clip, list) and clip:
+                    self._ingest_paths([p for p in clip if isinstance(p, str)])
+                    return
+            except ValueError as ex:
+                self.events.put(("toast", str(ex)))
+                return
+            except Exception as ex:
+                self.events.put(("toast", f"Couldn't save that image — {ex}"))
+                return
+            try:
+                text = (pyperclip.paste() or "").strip()
+            except Exception:
+                text = ""
+            if not text:
+                self.events.put(("toast", "Nothing on the clipboard to save"))
+                return
+            try:
+                title, body = dropnotes.note_from_dropped_text(text, fetch=False)
+                get_store().create(title, body)
+                trimmed = " ".join(text.split())
+                self._saved_toast(trimmed)
+            except Exception as ex:
+                self.events.put(("toast", f"Couldn't save that — {ex}"))
+        threading.Thread(target=work, daemon=True).start()
 
     def on_save_notes_toggle(self):
         self.settings["save_notes"] = bool(self.save_notes_var.get())
@@ -1411,6 +1532,7 @@ class DictationApp:
             f"Click or tap {self.hotkey_label()} — start / stop\n"
             "Hold the key — push-to-talk\n"
             "Hold + drag — move me\n"
+            "Drop text or images on me — saved as notes\n"
             "Right-click — options", ("Segoe UI", 9))
 
     def hide_tooltip(self):

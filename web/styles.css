@@ -487,9 +487,14 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
   .note-row.active { box-shadow: none; background: none; }
 }
 
-/* dictation works at every width — the button just steps aside while a
-   note or the mic pane itself is open */
+/* the mic button steps aside while a note or the mic pane itself is open */
 body.view-note .mic-fab, body.view-mic .mic-fab { display: none; }
+
+/* desktop dictates with the pill — the web app keeps notes only */
+@media (min-width: 900px) {
+  .pane-mic { display: none !important; }
+  .mic-fab { display: none !important; }
+}
 
 /* --------------------------------------------------------------------------
    Reduced motion
