@@ -1,0 +1,58 @@
+# Push to main -> the hosted app updates itself. Mirrors the local flow
+# (robocopy web -> hosting, bump sw cache, firebase deploy) with two twists:
+# the sw.js CACHE is stamped with the commit SHA so nobody ever forgets to
+# bump it, and the 110MB friend zip — which lives on the site but not in
+# git — is cached between runs (first run fetches it from the live site).
+
+name: Deploy to Firebase Hosting
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: firebase-hosting
+  cancel-in-progress: true
+
+# Every step is skipped (run stays green) until the deploy secret exists —
+# one-time setup: create the github-actions-deploy service account, grant
+# roles/firebasehosting.admin + serviceusage.apiKeysViewer on
+# dictationmic-sync, and store its JSON key as the repo secret
+# FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC.
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+
+      - name: Restore friend zip
+        id: zipcache
+        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+        uses: actions/cache@v4
+        with:
+          path: hosting/downloads
+          key: friend-downloads-v1
+
+      - name: Fetch friend zip from the live site (cold cache only)
+        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' && steps.zipcache.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p hosting/downloads
+          curl -fL --retry 4 -o hosting/downloads/DictationMic-Windows.zip \
+            https://dictationmic-sync.web.app/downloads/DictationMic-Windows.zip
+
+      - name: Build hosting dir from web/
+        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+        run: |
+          rsync -a --delete --exclude downloads web/ hosting/
+          sed -i "s/^const CACHE = \".*\";/const CACHE = \"dictmic-${GITHUB_SHA::9}\";/" hosting/sw.js
+          echo "stamped: $(grep -m1 '^const CACHE' hosting/sw.js)"
+
+      - name: Deploy to live channel
+        if: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC != '' }}
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC }}
+          channelId: live
+          projectId: dictationmic-sync

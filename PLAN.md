@@ -92,9 +92,14 @@ else. Model download is already automatic with resume/retry.
    build it with `robocopy web hosting /MIR /XD downloads` before every
    `firebase deploy --only hosting`, or the web app changes won't ship;
    the zip lives in `hosting\downloads\` and must never go inside `web\`
-   (web\ is bundled into the exe). Optional later: Inno Setup one-click
-   installer; SmartScreen warning stays unless a code-signing cert
-   (~£200/yr) is worth it.
+   (web\ is bundled into the exe). NEW 2026-07-03: pushing to main also
+   auto-deploys hosting via .github/workflows/firebase-hosting-deploy.yml
+   (stamps sw.js CACHE with the commit SHA, keeps the friend zip via
+   actions/cache) — activates once the one-time service-account secret
+   FIREBASE_SERVICE_ACCOUNT_DICTATIONMIC_SYNC is set on the repo; until
+   then the workflow runs green but skips. Optional later: Inno Setup
+   one-click installer; SmartScreen warning stays unless a code-signing
+   cert (~£200/yr) is worth it.
 2. **Mac** — MAC-PORT.md source exists; needs building **on a Mac**
    (PyInstaller can't cross-build). Produce a .app in a .dmg. Same
    first-run model download. Gatekeeper equivalent: right-click → Open.
@@ -112,6 +117,35 @@ else. Model download is already automatic with resume/retry.
    (MediaRecorder), ship it via Firebase to the laptop, transcribe with the
    same Whisper model, sync the text back. Desktop-grade accuracy on the
    phone, zero cloud cost, falls back to Web Speech when the laptop's off.
+
+## Phase 5 — A clipboard across devices  ✅ SHIPPED 2026-07-03 (late)
+
+Steve's brief: "treat the app like a clipboard" — throw text AND images at
+it from any device, get them on every other device, like Google Keep.
+
+Design: an image note is simply a note whose **body is a
+`data:image/...;base64` URL** — so images ride the existing sync, outbox,
+tombstones and desktop `.txt` files with zero storage/protocol changes.
+Compression contract (web/js/imgnote.js == dropnotes.py): longest edge
+1600px, JPEG quality ladder 80→50, hard cap 600 KB; originals ≤250 KB
+pass through untouched (GIF animation survives); EXIF rotation applied;
+transparency flattened. Refuse anything that isn't an image or UTF-8 text
+(≤200 KB) with a friendly toast.
+
+What works where:
+- **Pill (desktop)**: drag files / selected text / browser images onto it
+  (tkdnd; hover ring says "I'll catch it"); middle-click saves the
+  clipboard — now including screenshots (Win+Shift+S) and files copied in
+  Explorer. Same-day fix: removed speech.js's getUserMedia keep-alive that
+  current Android Chrome punishes by starving SpeechRecognition (was:
+  beeps but nothing transcribed).
+- **Phone/web**: + Image button (camera/gallery), paste anywhere, drag
+  onto the window, thumbnails in the list, Copy puts the actual image on
+  the clipboard, Share opens the system sheet.
+
+Known trade-off: RTDB's SSE sends the full snapshot on every (re)connect,
+so hundreds of image notes would make app-opens heavy. If that day comes,
+move image bytes to `/users/$uid/blobs/$noteId` and fetch lazily.
 
 ## Order of attack
 
