@@ -1,0 +1,22 @@
+# secrets & personal data — never commit these
+settings.json
+notes/
+debug.log
+
+# python runtime & build outputs
+venv/
+__pycache__/
+build/
+dist/
+*.spec
+
+# packaged app (rebuilt from source; too big for git)
+_internal/
+DictationMic.exe
+models/
+selftest_out.txt
+
+# deploy staging — regenerated with: robocopy web hosting /MIR /XD downloads
+# (hosting/downloads holds the 110MB friend zip, over GitHub's file limit)
+hosting/
+.firebase/

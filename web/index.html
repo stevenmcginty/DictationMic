@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script>
+// Opened as a local file (double-clicked index.html)? Modules can't load
+// from file://, so nothing would work — bounce to the hosted app instead.
+if (location.protocol === "file:") {
+  location.replace("https://dictationmic-sync.web.app/");
+}
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DictationMic — Notes</title>
+<meta name="theme-color" content="#0B0C0A">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="noise" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand" id="brand" title="DictationMic">
+    <span class="brand-pill" id="brandPill" aria-hidden="true">
+      <i></i><i></i><i></i><i></i><i></i>
+    </span>
+    <span class="brand-word">Dictation<b>Mic</b></span>
+  </div>
+  <div class="topbar-search">
+    <input id="search" type="search" placeholder="Search your notes…"
+           autocomplete="off" spellcheck="false" aria-label="Search notes">
+  </div>
+  <button class="status-capsule" id="statusCapsule" title="Sync status">
+    <span class="status-dot" id="statusDot"></span>
+    <span class="status-text" id="statusText">…</span>
+  </button>
+</header>
+
+<main class="app" id="app">
+
+  <!-- notes list -->
+  <section class="pane pane-list" id="listPane" aria-label="Notes">
+    <div class="list-head">
+      <span class="eyebrow">Notes</span>
+      <span class="count mono" id="noteCount"></span>
+    </div>
+    <div class="list-search">
+      <input id="searchMobile" type="search" placeholder="Search your notes…"
+             autocomplete="off" spellcheck="false" aria-label="Search notes">
+    </div>
+    <ul class="note-list" id="noteList"></ul>
+    <div class="empty" id="emptyState" hidden>
+      <span class="sleep-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+      <p id="emptyText">Nothing here yet.<br>Tap the pill and talk.</p>
+    </div>
+  </section>
+
+  <!-- note editor -->
+  <section class="pane pane-note" id="notePane" aria-label="Note">
+    <div class="note-inner" id="noteInner" hidden>
+      <div class="note-toolbar">
+        <button class="capsule ghost back" id="backBtn" aria-label="Back to notes">‹ Notes</button>
+        <div class="note-actions">
+          <button class="capsule" id="copyBtn">Copy</button>
+          <button class="capsule danger" id="deleteBtn">Delete</button>
+        </div>
+      </div>
+      <input class="note-title" id="noteTitle" spellcheck="false"
+             aria-label="Note title" maxlength="80">
+      <div class="note-meta mono" id="noteMeta"></div>
+      <textarea class="note-body" id="noteBody" spellcheck="false"
+                aria-label="Note text" placeholder="Say something…"></textarea>
+    </div>
+    <div class="note-blank" id="noteBlank">
+      <span class="sleep-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+      <p>Pick a note</p>
+    </div>
+  </section>
+
+  <!-- dictation (phone) -->
+  <section class="pane pane-mic" id="micPane" aria-label="Dictate" hidden>
+    <div class="mic-toolbar">
+      <button class="capsule ghost back" id="micBackBtn" aria-label="Back to notes">‹ Notes</button>
+      <span class="eyebrow" id="micState">Ready</span>
+    </div>
+    <div class="mic-transcript" id="micTranscript">
+      <span class="mic-final" id="micFinal"></span>
+      <span class="mic-interim" id="micInterim"></span>
+    </div>
+    <div class="mic-meter" id="micMeter" aria-hidden="true"></div>
+    <div class="mic-controls">
+      <button class="mic-main" id="micMainBtn" aria-label="Start dictating">
+        <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
+          <path fill="currentColor" d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-6a3.5 3.5 0 1 0-7 0v6A3.5 3.5 0 0 0 12 15Zm6-3.5a6 6 0 0 1-12 0H4.5a7.5 7.5 0 0 0 6.75 7.46V22h1.5v-3.04A7.5 7.5 0 0 0 19.5 11.5H18Z"/>
+        </svg>
+      </button>
+      <button class="capsule" id="micSaveBtn" hidden>Save note</button>
+      <button class="capsule ghost" id="micDiscardBtn" hidden>Discard</button>
+    </div>
+  </section>
+
+</main>
+
+<!-- sign-in (hosted only) -->
+<section class="auth" id="authPane" hidden>
+  <div class="auth-card">
+    <span class="brand-pill big" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+    <h1>Dictation<b>Mic</b></h1>
+    <p class="auth-sub">Sign in once — your notes stay in sync with your computer.</p>
+    <input id="authEmail" type="email" placeholder="Email" autocomplete="username">
+    <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password">
+    <button class="capsule solid" id="authBtn">Sign in</button>
+    <p class="auth-error mono" id="authError"></p>
+  </div>
+</section>
+
+<button class="mic-fab" id="micFab" hidden aria-label="Dictate a note">
+  <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">
+    <path fill="currentColor" d="M12 15a3.5 3.5 0 0 0 3.5-3.5v-6a3.5 3.5 0 1 0-7 0v6A3.5 3.5 0 0 0 12 15Zm6-3.5a6 6 0 0 1-12 0H4.5a7.5 7.5 0 0 0 6.75 7.46V22h1.5v-3.04A7.5 7.5 0 0 0 19.5 11.5H18Z"/>
+  </svg>
+</button>
+
+<div class="toast mono" id="toast" role="status"></div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

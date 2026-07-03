@@ -1,0 +1,1488 @@
+"""
+DictationMic — on-device live dictation for Windows.
+
+A floating, draggable, always-on-top dictation pill. Tap RIGHT CTRL (or click
+the pill) and just talk: each phrase is transcribed locally with Whisper the
+moment you pause, and typed straight into the focused input box (or
+accumulated to the clipboard). Goes quiet for 10 s? It stops by itself.
+Hold the hotkey instead of tapping for push-to-talk. Right-click the pill to
+change the hotkey to any key you like.
+
+First run downloads the speech model (~480 MB, one time); after that it is
+fully offline.
+"""
+
+import base64
+import ctypes
+import io
+import json
+import math
+import os
+import queue
+import re
+import sys
+import threading
+import time
+import tkinter as tk
+import urllib.error
+import urllib.request
+from collections import deque
+
+import numpy as np
+import sounddevice as sd
+import keyboard
+import pyperclip
+import winsound
+from PIL import Image, ImageDraw, ImageFont
+
+
+def tk_photo(img):
+    """PIL image -> tk.PhotoImage via in-memory PNG. Avoids PIL.ImageTk, whose
+    native DLL Smart App Control likes to block in freshly built exes."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return tk.PhotoImage(data=base64.b64encode(buf.getvalue()).decode("ascii"))
+
+# ----------------------------------------------------------------------------
+# Paths / settings
+# ----------------------------------------------------------------------------
+
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+APP_DIR = app_dir()
+SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+NOTES_DIR = os.path.join(APP_DIR, "notes")
+
+_DEBUG = bool(os.environ.get("DICTMIC_DEBUG"))
+
+def dbg(msg):
+    if _DEBUG:
+        try:
+            with open(os.path.join(APP_DIR, "debug.log"), "a", encoding="utf-8") as f:
+                f.write(f"{time.time():.3f} {msg}\n")
+        except Exception:
+            pass
+
+DEFAULT_SETTINGS = {
+    "mode": "type",            # "type" -> types into focused box, "clipboard" -> copies
+    "hotkeys": ["ctrl", "f8"],         # tap = start/stop, hold = push-to-talk
+    "model": "small.en",
+    "voice_model": "medium.en",  # phone voice notes: transcribed in the
+                                 # background, so a bigger, more accurate
+                                 # model costs nothing in dictation latency
+    "language": "en",
+    "beeps": True,
+    "save_notes": True,        # keep a copy of every dictation in notes\
+    "auto_stop_seconds": 10,   # stop listening after this much silence (0 = never)
+    "size": 84,                # pill width in px (height follows)
+    "seen_intro": False,
+    "seen_intro2": False,
+    "x": None,
+    "y": None,
+    "sync_enabled": False,     # phone sync via Firebase (cloudsync.py)
+    "sync_email": "",
+    "sync_refresh_token": "",
+    "sync_uid": "",
+}
+
+def load_settings():
+    s = dict(DEFAULT_SETTINGS)
+    loaded = {}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        s.update(loaded)
+    except Exception:
+        pass
+    # migrate old single-hotkey config
+    if "hotkeys" not in loaded:
+        old = loaded.get("hotkey")
+        s["hotkeys"] = ["ctrl", "f8"]
+        if old and old not in s["hotkeys"]:
+            s["hotkeys"].insert(0, old)
+    if not isinstance(s["hotkeys"], list) or not s["hotkeys"]:
+        s["hotkeys"] = ["ctrl", "f8"]
+    # left/right modifier variants can't be told apart reliably -> use the family
+    s["hotkeys"] = [("ctrl" if isinstance(hk, str) and hk.endswith("ctrl") else hk)
+                    for hk in s["hotkeys"]]
+    return s
+
+def save_settings(s):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+    except Exception:
+        pass
+
+# ----------------------------------------------------------------------------
+# Notes: every finished dictation is kept as a plain .txt in notes\
+# (file ownership + sync index live in notestore.py)
+# ----------------------------------------------------------------------------
+
+from notestore import NoteStore, sanitize_title, note_title_from
+
+_STORE = None
+
+def get_store():
+    global _STORE
+    if _STORE is None:
+        _STORE = NoteStore(NOTES_DIR, dbg=dbg)
+    return _STORE
+
+def save_note(text):
+    return get_store().create(note_title_from(text), text)
+
+
+# ----------------------------------------------------------------------------
+# Win32: never steal focus, hide from alt-tab, one instance only
+# ----------------------------------------------------------------------------
+
+GWL_EXSTYLE = -20
+WS_EX_NOACTIVATE = 0x08000000
+WS_EX_TOOLWINDOW = 0x00000080
+
+def make_non_activating(widget):
+    try:
+        hwnd = ctypes.windll.user32.GetParent(widget.winfo_id())
+        if not hwnd:
+            hwnd = widget.winfo_id()
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ctypes.windll.user32.SetWindowLongW(
+            hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+    except Exception:
+        pass
+
+def make_titlebar_dark(win):
+    """Ask DWM for a dark title bar so windows match the app."""
+    try:
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        v = ctypes.c_int(1)
+        for attr in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE (20; 19 pre-20H1)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(v), ctypes.sizeof(v)) == 0:
+                break
+    except Exception:
+        pass
+
+_mutex_handle = None
+
+def already_running():
+    """True if another DictationMic instance holds the mutex."""
+    global _mutex_handle
+    try:
+        ERROR_ALREADY_EXISTS = 183
+        _mutex_handle = ctypes.windll.kernel32.CreateMutexW(
+            None, False, "DictationMic_SingleInstance")
+        return ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+# ----------------------------------------------------------------------------
+# Live recorder: cuts the stream into phrases at natural pauses
+# ----------------------------------------------------------------------------
+
+SAMPLE_RATE = 16000
+BLOCK = 1024                       # 64 ms blocks
+PAUSE_CUT_S = 1.0                  # silence gap that ends a phrase — a real
+                                   # sentence pause, not a breath. Short gaps
+                                   # were splitting sentences into fragments
+                                   # that Whisper punctuated as "Full. Stops."
+SOFT_CUT_S = 0.55                  # mid-speech dip that's enough to split at...
+SOFT_CUT_AFTER_S = 7.0             # ...once the phrase is already this long
+MIN_VOICED_BLOCKS = 2              # ~130 ms of speech before a phrase counts
+MAX_PHRASE_S = 18                  # force a cut on very long phrases
+
+class LiveRecorder:
+    """Streams the mic and emits ("audio", phrase) items on natural pauses."""
+
+    def __init__(self, out_queue):
+        self.out = out_queue
+        self.stream = None
+        self.level = 0.0           # smoothed 0..1 for the animation
+        self.last_voice_time = 0.0
+        self._pending = []
+        self._voiced_blocks = 0
+        self._noise_floor = 0.004
+        self._recent_voiced = deque(maxlen=2)
+
+    def start(self):
+        self._pending = []
+        self._voiced_blocks = 0
+        self._recent_voiced.clear()
+        self.level = 0.0
+        self.last_voice_time = time.time()
+        self.stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            blocksize=BLOCK, callback=self._callback)
+        self.stream.start()
+
+    def _callback(self, indata, frames, t, status):
+        block = indata[:, 0].copy()
+        rms = float(np.sqrt(np.mean(block ** 2)))
+
+        # adaptive noise floor: falls fast, learns background noise slowly,
+        # and barely moves during speech — otherwise long unbroken talking
+        # drags the floor up until real words get classed as silence and
+        # thrown away by the silence-trim below
+        if rms < self._noise_floor:
+            self._noise_floor = 0.8 * self._noise_floor + 0.2 * rms
+        elif rms < self._noise_floor * 3.5:
+            self._noise_floor = 0.995 * self._noise_floor + 0.005 * rms
+        else:
+            self._noise_floor = 0.9995 * self._noise_floor + 0.0005 * rms
+        threshold = max(0.008, self._noise_floor * 3.5)
+
+        voiced = rms > threshold
+        self._recent_voiced.append(voiced)
+        now = time.time()
+        if any(self._recent_voiced):
+            self.last_voice_time = now
+
+        self.level = 0.55 * self.level + 0.45 * min(1.0, (rms / max(threshold, 1e-4)) * 0.35)
+
+        self._pending.append(block)
+        if voiced:
+            self._voiced_blocks += 1
+
+        pending_s = len(self._pending) * BLOCK / SAMPLE_RATE
+        silent_for = now - self.last_voice_time
+
+        if self._voiced_blocks >= MIN_VOICED_BLOCKS and silent_for > PAUSE_CUT_S:
+            # a real pause: the phrase already carries ~1s of trailing
+            # silence and the next one keeps everything from here on, so
+            # nothing can be clipped at this kind of cut
+            self._emit()
+        elif self._voiced_blocks >= MIN_VOICED_BLOCKS and (
+                (pending_s > SOFT_CUT_AFTER_S and silent_for > SOFT_CUT_S)
+                or pending_s > MAX_PHRASE_S):
+            # forced cut during (near-)continuous speech: never slice at
+            # "now" — that lands mid-word and Whisper drops both halves
+            self._emit_at_quietest()
+        elif self._voiced_blocks == 0 and pending_s > 3.0:
+            # nothing but silence piling up — drop it
+            self._pending = self._pending[-4:]
+
+    def _emit(self):
+        audio = np.concatenate(self._pending)
+        self._pending = []
+        self._voiced_blocks = 0
+        self.out.put(("audio", audio))
+
+    def _emit_at_quietest(self):
+        """Cut at the quietest instant of the last ~1.5s instead of right
+        now; the blocks after that instant seed the next phrase, so no
+        audio is lost and none is duplicated."""
+        tail = min(len(self._pending) - 1, int(1.5 * SAMPLE_RATE / BLOCK))
+        if tail < 3:
+            self._emit()
+            return
+        start = len(self._pending) - tail
+        rms = [float(np.sqrt(np.mean(b ** 2))) for b in self._pending[start:]]
+        cut = start + int(np.argmin(rms)) + 1
+        carry = self._pending[cut:]
+        self._pending = self._pending[:cut]
+        self._emit()
+        self._pending = carry
+        threshold = max(0.008, self._noise_floor * 3.5)
+        self._voiced_blocks = sum(
+            1 for b in carry if float(np.sqrt(np.mean(b ** 2))) > threshold)
+
+    def stop(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+        if self._voiced_blocks >= MIN_VOICED_BLOCKS:
+            self._emit()
+        self._pending = []
+        self.out.put(("end", None))
+
+# ----------------------------------------------------------------------------
+# Transcriber (local Whisper)
+# ----------------------------------------------------------------------------
+
+MODEL_SIZES = {"tiny.en": "~75 MB", "base.en": "~140 MB", "small.en": "~480 MB",
+               "medium.en": "~1.5 GB", "large-v3": "~2.9 GB"}
+
+def model_dir(name):
+    return os.path.join(APP_DIR, "models", name)
+
+def model_dir_for(settings):
+    return model_dir(settings["model"])
+
+def model_files_ready(name):
+    d = model_dir(name)
+    return (os.path.isfile(os.path.join(d, "model.bin"))
+            and os.path.getsize(os.path.join(d, "model.bin")) > 10_000_000
+            and os.path.isfile(os.path.join(d, "config.json"))
+            and os.path.isfile(os.path.join(d, "tokenizer.json")))
+
+def model_ready(settings):
+    return model_files_ready(settings["model"])
+
+class Transcriber:
+    def __init__(self, settings, model_key="model"):
+        self.settings = settings
+        self.model_key = model_key
+        self.model = None
+        self.error = None
+
+    def load(self):
+        try:
+            from faster_whisper import WhisperModel
+            name = self.settings.get(self.model_key) or self.settings["model"]
+            model_path = model_dir(name)
+            if not os.path.isdir(model_path):
+                model_path = name
+            self.model = WhisperModel(
+                model_path, device="cpu", compute_type="int8", cpu_threads=6)
+        except Exception as e:
+            self.error = str(e)
+
+    def transcribe(self, audio, context="", long=False):
+        if self.model is None:
+            return ""
+        # live phrases are already cut at silence by the recorder; a small beam
+        # buys back accuracy now that chunks are whole sentences. Voice notes
+        # (long=True) have no latency budget: wider beam, and VAD strips the
+        # trailing auto-stop silence that makes Whisper hallucinate.
+        beam = int(self.settings.get("beam_size") or 3)
+        segments, _ = self.model.transcribe(
+            audio,
+            language=self.settings.get("language") or None,
+            beam_size=max(beam, 5) if long else beam,
+            vad_filter=long,
+            without_timestamps=True,
+            condition_on_previous_text=False,
+            initial_prompt=context[-200:] if context else None,
+        )
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        # hesitations come out as "..." — never something you dictated
+        text = re.sub(r"\.{2,}|…", "", text)
+        text = re.sub(r"\s{2,}", " ", text).strip()
+        # what Whisper hears in a chunk of breath
+        if text.lower().strip(" .,!?") in (
+                "you", "thank you", "thanks for watching", "bye", "uh", "um"):
+            return ""
+        return text
+
+# ----------------------------------------------------------------------------
+# Typing helper: don't type while a modifier is physically held, or the held
+# key turns our letters into app shortcuts (e.g. push-to-talk on Right Ctrl)
+# ----------------------------------------------------------------------------
+
+_MODIFIERS = ("ctrl", "alt", "shift", "left windows", "right windows")
+
+# modifier families: left/right variants are indistinguishable at hook level
+MOD_FAMILIES = {
+    "ctrl": {"ctrl", "left ctrl", "right ctrl"},
+    "alt": {"alt", "left alt", "right alt", "alt gr"},
+    "shift": {"shift", "left shift", "right shift"},
+    "windows": {"windows", "left windows", "right windows"},
+}
+
+def mod_family(name):
+    for fam, names in MOD_FAMILIES.items():
+        if name in names:
+            return fam
+    return None
+
+def wait_modifiers_up(timeout=30.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        held = False
+        for m in _MODIFIERS:
+            try:
+                if keyboard.is_pressed(m):
+                    held = True
+                    break
+            except Exception:
+                pass
+        if not held:
+            return
+        time.sleep(0.05)
+
+# ----------------------------------------------------------------------------
+# Rendering (Pillow, supersampled) — dark capsule, lime voice meter
+# ----------------------------------------------------------------------------
+
+SS = 3  # supersampling factor
+
+C_TRANSPARENT = (1, 2, 3, 255)
+
+BODY_TOP = (28, 29, 33)                  # capsule gradient, top -> bottom
+BODY_BOT = (16, 17, 20)
+EDGE_IDLE = (255, 255, 255, 30)          # hairline rim
+EDGE_HOVER = (255, 255, 255, 58)
+EDGE_DIM = (255, 255, 255, 16)
+LIME = (163, 230, 53)                    # the voice meter
+NUB_IDLE = (94, 100, 108, 255)           # sleeping meter dots
+NUB_HOVER = (130, 138, 148, 255)
+NUB_DIM = (64, 69, 76, 255)
+DOT_THINK = (208, 213, 220, 255)         # "finishing" dots
+TEXT_SOFT = (225, 229, 235, 255)
+TRACK = (255, 255, 255, 34)              # download progress track
+
+
+class PillRenderer:
+    """Draws the capsule in every state. frame_* methods return PIL images
+    (testable without Tk); the public methods wrap them as PhotoImages."""
+
+    def __init__(self, width, height):
+        self.w, self.h = width, height
+        self.sw, self.sh = width * SS, height * SS
+        self.pad = SS                        # room so the rim's AA isn't clipped
+        self.edge_w = max(2, round(SS * 1.1))
+        # meter layout: bars stay clear of the round end caps
+        self.nbars = 11
+        inset = self.sh * 0.55
+        span = self.sw - 2 * inset
+        self.bar_w = span / (self.nbars * 1.85 - 0.85)
+        self.bar_gap = self.bar_w * 0.85
+        self.bar_x0 = inset
+        self.max_half = self.sh * 0.27       # bar half-height at full voice
+        self.nub_half = max(2.0, self.sh * 0.042)   # sleeping dot half-height
+        self._bodies = {}
+        self._static = {}
+        self._font = None
+        for name in ("seguisb.ttf", "segoeuib.ttf", "segoeui.ttf", "arialbd.ttf"):
+            try:
+                self._font = ImageFont.truetype(
+                    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", name),
+                    int(self.sh * 0.40))
+                break
+            except Exception:
+                continue
+
+    # ---- cached capsule bodies ----
+
+    def _body(self, key, edge_rgba):
+        if key in self._bodies:
+            return self._bodies[key]
+        sw, sh, p = self.sw, self.sh, self.pad
+        yy = np.linspace(0.0, 1.0, sh, dtype=np.float32)[:, None]
+        arr = np.empty((sh, sw, 4), np.uint8)
+        for i in range(3):
+            col = (BODY_TOP[i] + (BODY_BOT[i] - BODY_TOP[i]) * yy).astype(np.uint8)
+            arr[..., i] = np.broadcast_to(col, (sh, sw))
+        arr[..., 3] = 255
+        grad = Image.fromarray(arr, "RGBA")
+        box = [p, p, sw - p, sh - p]
+        radius = (sh - 2 * p) / 2
+        mask = Image.new("L", (sw, sh), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, fill=255)
+        body = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+        body.paste(grad, (0, 0), mask)
+        d = ImageDraw.Draw(body)
+        d.rounded_rectangle(box, radius=radius, outline=edge_rgba, width=self.edge_w)
+        self._bodies[key] = body
+        return body
+
+    # ---- shared meter ----
+
+    def _bars(self, d, vals, color):
+        cy = self.sh / 2
+        x = self.bar_x0
+        for v in vals:
+            half = self.nub_half + (self.max_half - self.nub_half) * max(0.0, min(1.0, v))
+            d.rounded_rectangle([x, cy - half, x + self.bar_w, cy + half],
+                                radius=self.bar_w / 2, fill=color)
+            x += self.bar_w + self.bar_gap
+
+    # ---- frames (pure PIL) ----
+
+    def _compose(self, img):
+        canvas = Image.new("RGBA", (self.sw, self.sh), C_TRANSPARENT)
+        canvas.alpha_composite(img)
+        return canvas.resize((self.w, self.h), Image.LANCZOS)
+
+    def _finish(self, img):
+        return tk_photo(self._compose(img))
+
+    def frame_idle(self, hover, dim=False):
+        if dim:
+            body, nub = self._body("dim", EDGE_DIM).copy(), NUB_DIM
+        elif hover:
+            body, nub = self._body("hover", EDGE_HOVER).copy(), NUB_HOVER
+        else:
+            body, nub = self._body("idle", EDGE_IDLE).copy(), NUB_IDLE
+        self._bars(ImageDraw.Draw(body), [0.0] * self.nbars, nub)
+        return body
+
+    def frame_listening(self, vals, pulse):
+        step = min(3, int(max(0.0, pulse) * 4))     # quantized so bodies cache
+        body = self._body(("listen", step), LIME + (95 + step * 16,)).copy()
+        self._bars(ImageDraw.Draw(body), vals, LIME + (255,))
+        return body
+
+    def frame_dots(self, phase):
+        body = self._body("idle", EDGE_IDLE).copy()
+        d = ImageDraw.Draw(body)
+        cy = self.sh / 2
+        r0 = self.sh * 0.065
+        gap = self.sh * 0.40
+        for i in range(3):
+            k = 0.6 + 0.4 * math.sin(phase - i * 0.9)
+            r = r0 * (0.55 + 0.75 * k)
+            x = self.sw / 2 + (i - 1) * gap
+            d.ellipse([x - r, cy - r, x + r, cy + r], fill=DOT_THINK)
+        return body
+
+    def frame_downloading(self, frac):
+        body = self._body("dim", EDGE_DIM).copy()
+        d = ImageDraw.Draw(body)
+        frac = max(0.0, min(1.0, frac))
+        x0, x1 = self.bar_x0, self.sw - self.bar_x0
+        th = max(2.0, self.sh * 0.05)
+        ty = self.sh * 0.70
+        d.rounded_rectangle([x0, ty - th, x1, ty + th], radius=th, fill=TRACK)
+        fx = x0 + max(th * 2.2, (x1 - x0) * frac)
+        d.rounded_rectangle([x0, ty - th, fx, ty + th], radius=th, fill=LIME + (255,))
+        if self._font is not None:
+            d.text((self.sw / 2, self.sh * 0.36), f"{int(frac * 100)}%",
+                   font=self._font, fill=TEXT_SOFT, anchor="mm")
+        return body
+
+    # ---- PhotoImage wrappers ----
+
+    def idle(self, hover, dim=False):
+        key = ("idle", hover, dim)
+        if key not in self._static:
+            self._static[key] = self._finish(self.frame_idle(hover, dim))
+        return self._static[key]
+
+    def listening(self, vals, pulse):
+        return self._finish(self.frame_listening(vals, pulse))
+
+    def dots(self, phase):
+        return self._finish(self.frame_dots(phase))
+
+    def downloading(self, frac):
+        return self._finish(self.frame_downloading(frac))
+
+
+# ----------------------------------------------------------------------------
+# App
+# ----------------------------------------------------------------------------
+
+IDLE, LOADING, LISTENING, FINISHING, DOWNLOADING = (
+    "idle", "loading", "listening", "finishing", "downloading")
+TRANSPARENT_HEX = "#010203"
+
+
+class DictationApp:
+    def __init__(self):
+        self.settings = load_settings()
+        self.width = max(64, int(self.settings.get("size") or 84))
+        self.height = max(24, round(self.width * 0.36))
+        self.events = queue.Queue()     # UI events
+        self.work = queue.Queue()       # audio phrases -> transcriber worker
+        self.recorder = LiveRecorder(self.work)
+        self.transcriber = Transcriber(self.settings)
+        self.voice_transcriber = None     # bigger model for phone notes (lazy)
+        self._voice_state = "idle"        # idle | preparing | ready | fallback
+        self._voice_lock = threading.Lock()
+        self.session_text = []
+        self.context = ""
+        self.session_start = 0.0
+        self.dl_frac = 0.0
+
+        self.root = tk.Tk()
+        self.root.title("DictationMic")
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-transparentcolor", TRANSPARENT_HEX)
+        self.root.configure(bg=TRANSPARENT_HEX)
+
+        x, y = self.settings.get("x"), self.settings.get("y")
+        if x is None or y is None:
+            x = (self.root.winfo_screenwidth() - self.width) // 2
+            y = self.root.winfo_screenheight() - self.height - 100
+        x = max(0, min(int(x), self.root.winfo_screenwidth() - self.width))
+        y = max(0, min(int(y), self.root.winfo_screenheight() - self.height))
+        self.root.geometry(f"{self.width}x{self.height}+{x}+{y}")
+
+        self.renderer = PillRenderer(self.width, self.height)
+        self.label = tk.Label(self.root, bg=TRANSPARENT_HEX, bd=0, cursor="hand2")
+        self.label.pack()
+        self._photo = None
+
+        self.hover = False
+        self.drag_start = None
+        self.dragging = False
+        self.phase = 0.0
+        self.level_hist = deque([0.0] * 24, maxlen=24)
+        self.key_is_down = False
+        self.key_press_time = 0.0
+        self.key_started = False
+        self._mod_down = False
+        self._mod_t = 0.0
+        self._mod_other = False
+        self._mod_ptt = False
+        self.toast = None
+        self.tooltip = None
+        self._tooltip_job = None
+        self._capturing = False
+
+        self.label.bind("<ButtonPress-1>", self.on_press)
+        self.label.bind("<B1-Motion>", self.on_motion)
+        self.label.bind("<ButtonRelease-1>", self.on_release)
+        self.label.bind("<ButtonRelease-3>", self.on_right_click)
+        self.label.bind("<Enter>", self.on_enter)
+        self.label.bind("<Leave>", self.on_leave)
+
+        self.mode_var = tk.StringVar(value=self.settings["mode"])
+        self.save_notes_var = tk.BooleanVar(
+            value=bool(self.settings.get("save_notes", True)))
+        self.local_server = None
+        self.cloud = None
+        self.menu = None
+        self.build_menu()
+        self._start_cloud_sync()
+
+        self.root.update_idletasks()
+        make_non_activating(self.root)
+
+        if model_ready(self.settings):
+            self.state = LOADING
+            threading.Thread(target=self._load_model, daemon=True).start()
+        else:
+            self.state = DOWNLOADING
+            threading.Thread(target=self._download_model, daemon=True).start()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+        self.install_keyboard_hook()
+
+        if not self.settings.get("seen_intro3"):
+            self.settings["seen_intro3"] = True
+            self.settings["seen_intro2"] = True
+            self.settings["seen_intro"] = True
+            save_settings(self.settings)
+            self.root.after(1500, lambda: self.show_toast(
+                "Tap CTRL (on its own) and just talk — words appear as you speak.\n"
+                "Tap CTRL again to stop, or hold CTRL down while you speak.\n"
+                "Right-click me to pick a different key.", 7000))
+
+        self.tick()
+        self.poll_events()
+        self.assert_topmost()
+
+    # ---------------- hotkeys ----------------
+
+    def hotkey_label(self):
+        parts = []
+        for hk in self.settings["hotkeys"]:
+            name = hk.get("name") if isinstance(hk, dict) else str(hk)
+            name = mod_family(name or "") or name or f"key {hk.get('sc')}"
+            if name.upper() not in parts:
+                parts.append(name.upper())
+        return " or ".join(parts)
+
+    def _refresh_hotkey_codes(self):
+        """Split hotkeys into modifier families (gesture keys) and direct keys.
+
+        The hook can't reliably tell left from right modifiers, so a modifier
+        hotkey means the whole family: tapped ALONE = start/stop, held ALONE =
+        push-to-talk. Combos (Ctrl+C etc.) never trigger. Direct keys (F8, F9,
+        captured keys) fire on plain press.
+        """
+        self._mod_names, self._mod_sc = set(), set()
+        self._direct_names, self._direct_sc = set(), set()
+        for hk in self.settings["hotkeys"]:
+            name = hk.get("name") if isinstance(hk, dict) else hk
+            sc = hk.get("sc") if isinstance(hk, dict) else None
+            fam = MOD_FAMILIES.get(mod_family(name or ""))
+            if fam:
+                self._mod_names |= fam
+                for n in fam:
+                    try:
+                        self._mod_sc |= set(keyboard.key_to_scan_codes(n))
+                    except Exception:
+                        pass
+                if sc:
+                    self._mod_sc.add(sc)
+            else:
+                if name:
+                    self._direct_names.add(name)
+                if sc:
+                    self._direct_sc.add(sc)
+                elif name:
+                    try:
+                        self._direct_sc |= set(keyboard.key_to_scan_codes(name))
+                    except Exception:
+                        pass
+
+    def _global_kb(self, e):
+        """Single always-on hook: hotkey gestures AND 'press any key' capture."""
+        try:
+            dbg(f"hook {e.event_type} name={e.name!r} sc={e.scan_code} "
+                f"cap={self._capturing}")
+            if self._capturing:
+                if e.event_type == "down" and (e.name or e.scan_code):
+                    self._capturing = False
+                    self.events.put(("hotkey_captured",
+                                     {"name": e.name or "", "sc": e.scan_code or 0}))
+                return
+            name, sc, now = e.name, e.scan_code, time.time()
+            is_mod = (name in self._mod_names) or (sc in self._mod_sc)
+            is_direct = (not is_mod) and ((name in self._direct_names)
+                                          or (sc in self._direct_sc))
+            if e.event_type == "down":
+                if is_mod:
+                    if not self._mod_down:
+                        self._mod_down = True
+                        self._mod_t = now
+                        self._mod_other = False
+                        self._mod_ptt = False
+                elif is_direct:
+                    if not self.key_is_down:    # ignore auto-repeat
+                        self.key_is_down = True
+                        self.key_press_time = now
+                        self.key_started = (self.state == IDLE)
+                        self.events.put(("toggle", None))
+                elif self._mod_down:
+                    self._mod_other = True      # it's a combo like Ctrl+C — stand down
+            else:
+                if is_mod and self._mod_down:
+                    held = now - self._mod_t
+                    self._mod_down = False
+                    if not self._mod_other:
+                        if self._mod_ptt:
+                            if held > 0.9:      # push-to-talk finished
+                                self.events.put(("stop_if_listening", None))
+                        elif held < 0.45:       # clean tap
+                            self.events.put(("toggle", None))
+                    self._mod_ptt = False
+                elif is_direct and self.key_is_down:
+                    self.key_is_down = False
+                    if self.key_started and now - self.key_press_time > 0.7:
+                        self.events.put(("stop_if_listening", None))
+        except Exception:
+            pass
+
+    def install_keyboard_hook(self):
+        try:
+            self._refresh_hotkey_codes()
+            keyboard.hook(self._global_kb, suppress=False)
+            dbg("keyboard.hook installed")
+        except Exception as ex:
+            dbg(f"keyboard.hook FAILED: {ex!r}")
+            self.events.put(("toast", "Couldn't attach the keyboard hook — "
+                                      "hotkeys won't work, but clicking will"))
+        if _DEBUG:
+            try:
+                keyboard.on_press_key("f7", lambda e: dbg(
+                    f"on_press_key f7 fired name={e.name!r} sc={e.scan_code}"))
+                keyboard.on_press(lambda e: dbg(
+                    f"on_press(generic) fired name={e.name!r} sc={e.scan_code}"))
+                dbg("debug probes installed")
+            except Exception as ex:
+                dbg(f"debug probes FAILED: {ex!r}")
+
+    def start_capture(self):
+        if self._capturing:
+            return
+        self._capturing = True
+        self.show_toast("NOW PRESS the key you want as your talk button.\n"
+                        "(Esc = keep " + self.hotkey_label() + ")", 15000)
+
+        def timeout():
+            if self._capturing:
+                self._capturing = False
+                self.show_toast("No key pressed — hotkey stays "
+                                + self.hotkey_label(), 3000)
+        self.root.after(15000, timeout)
+
+    # ---------------- menu ----------------
+
+    def _menu_dot(self, color):
+        if not hasattr(self, "_dot_cache"):
+            self._dot_cache = {}
+        if color not in self._dot_cache:
+            img = Image.new("RGBA", (14, 14), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.ellipse([2, 2, 12, 12], fill=color)
+            self._dot_cache[color] = tk_photo(img)
+        return self._dot_cache[color]
+
+    def build_menu(self):
+        if self.menu is None:
+            self.menu = tk.Menu(self.root, tearoff=0, font=("Segoe UI", 10))
+        else:
+            self.menu.delete(0, "end")
+        blue = self._menu_dot((0, 150, 255, 255))
+        green = self._menu_dot((0, 205, 110, 255))
+        purple = self._menu_dot((168, 110, 255, 255))
+        grey = self._menu_dot((150, 156, 166, 255))
+        red = self._menu_dot((236, 80, 90, 255))
+        self.menu.add_radiobutton(label="Write into the box I'm typing in",
+                                  image=blue, compound="left",
+                                  variable=self.mode_var, value="type",
+                                  command=self.on_mode_change)
+        self.menu.add_radiobutton(label="Copy to clipboard instead",
+                                  image=green, compound="left",
+                                  variable=self.mode_var, value="clipboard",
+                                  command=self.on_mode_change)
+        self.menu.add_separator()
+        lime = self._menu_dot((163, 230, 53, 255))
+        self.menu.add_command(label="My notes — everything you've dictated",
+                              image=lime, compound="left",
+                              command=self.open_notes)
+        self.menu.add_checkbutton(label="Keep a copy of each dictation",
+                                  variable=self.save_notes_var,
+                                  command=self.on_save_notes_toggle)
+        self.menu.add_separator()
+        if self.settings.get("sync_enabled") and self.cloud is not None:
+            state = self.cloud.status()["sync"]
+            label, color = {
+                "ok": ("Phone sync: on — notes flow both ways", green),
+                "offline": ("Phone sync: offline — will catch up", grey),
+                "needs-signin": ("Phone sync: needs sign-in", red),
+                "error": ("Phone sync: hiccup — retrying", grey),
+            }.get(state, ("Phone sync: starting…", grey))
+            self.menu.add_command(label=label, image=color,
+                                  compound="left", state="disabled")
+            self.menu.add_command(label="Turn off phone sync",
+                                  image=grey, compound="left",
+                                  command=self.sync_off)
+        else:
+            self.menu.add_command(label="Set up phone sync…",
+                                  image=lime, compound="left",
+                                  command=self.sync_dialog)
+        self.menu.add_separator()
+        self.menu.add_command(
+            label=f"Talk key: {self.hotkey_label()}  —  tap = start/stop, hold + speak = push-to-talk",
+            image=purple, compound="left", state="disabled")
+        self.menu.add_command(label="Change hotkey…", underline=0,
+                              image=purple, compound="left",
+                              command=self.start_capture)
+        self.menu.add_separator()
+        self.menu.add_command(label="Click me = start/stop   ·   drag me = move",
+                              image=grey, compound="left", state="disabled")
+        self.menu.add_command(label="Goes quiet? Stops by itself after 10 s",
+                              image=grey, compound="left", state="disabled")
+        self.menu.add_separator()
+        self.menu.add_command(label="Exit", image=red, compound="left",
+                              command=self.quit)
+
+    # ---------------- model download (first run only) ----------------
+
+    def _download_model(self):
+        if self._download_files(self.settings["model"], primary=True):
+            self.events.put(("dl_done", None))
+
+    def _download_files(self, mdl, primary):
+        """Fetch one Whisper model into models\\<mdl>. primary drives the
+        pill's % readout; the voice-note model downloads quietly."""
+        d = model_dir(mdl)
+        os.makedirs(d, exist_ok=True)
+        base = f"https://huggingface.co/Systran/faster-whisper-{mdl}/resolve/main/"
+        files = ["config.json", "tokenizer.json", "vocabulary.txt", "model.bin"]
+        warned = False
+        for name in files:
+            dest = os.path.join(d, name)
+            if os.path.isfile(dest) and (name != "model.bin"
+                                         or os.path.getsize(dest) > 10_000_000):
+                continue
+            part = dest + ".part"
+            while True:
+                try:
+                    self._fetch(base + name, part,
+                                big=(name == "model.bin" and primary))
+                    os.replace(part, dest)
+                    break
+                except urllib.error.HTTPError as ex:
+                    if ex.code == 416:          # range beyond end -> already complete
+                        os.replace(part, dest)
+                        break
+                    if ex.code == 404 and name != "model.bin":
+                        break                   # optional file missing upstream
+                    self.events.put(("toast",
+                                     f"Couldn't fetch the speech model (HTTP {ex.code})"))
+                    return False
+                except Exception:
+                    if not warned:
+                        warned = True
+                        size = MODEL_SIZES.get(mdl, "several hundred MB")
+                        self.events.put(("toast",
+                                         f"Fetching the speech model (one-time, {size}).\n"
+                                         "Waiting for internet…"))
+                    time.sleep(4)
+        return True
+
+    def _fetch(self, url, part, big=False):
+        existing = os.path.getsize(part) if os.path.isfile(part) else 0
+        headers = {"User-Agent": "DictationMic/1.0"}
+        if existing:
+            headers["Range"] = f"bytes={existing}-"
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            if existing and getattr(r, "status", 200) != 206:
+                existing = 0                    # server ignored resume
+            total = existing + int(r.headers.get("Content-Length") or 0)
+            done = existing
+            with open(part, "ab" if existing else "wb") as f:
+                while True:
+                    chunk = r.read(262144)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if big and total:
+                        self.dl_frac = done / total
+            if total and done < total:
+                raise IOError("incomplete download")
+
+    # ---------------- background: model + transcription worker ----------------
+
+    def _load_model(self):
+        self.transcriber.load()
+        if self.transcriber.model is not None:
+            try:    # warm-up so the first real phrase isn't the slow one
+                self.transcriber.transcribe(np.zeros(SAMPLE_RATE // 2, np.float32))
+            except Exception:
+                pass
+        self.events.put(("model_loaded", None))
+
+    def _worker(self):
+        while True:
+            kind, audio = self.work.get()
+            if kind == "end":
+                self.events.put(("session_done", None))
+                continue
+            if self.transcriber.model is None:
+                continue
+            try:
+                text = self.transcriber.transcribe(audio, self.context)
+            except Exception:
+                text = ""
+            if not text:
+                continue
+            self.context += " " + text
+            self.session_text.append(text)
+            try:
+                if self.settings["mode"] == "type":
+                    wait_modifiers_up()
+                    # delay=0 fire-hoses keystrokes and some apps drop
+                    # characters from long phrases; 2ms/key is still instant
+                    keyboard.write(text + " ", delay=0.002)
+                else:
+                    pyperclip.copy(" ".join(self.session_text))
+            except Exception:
+                pass
+
+    # ---------------- events ----------------
+
+    def poll_events(self):
+        # one bad event must never kill the pump — it drives all hotkey actions
+        try:
+            while True:
+                name, payload = self.events.get_nowait()
+                try:
+                    self._handle_event(name, payload)
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+        self.root.after(40, self.poll_events)
+
+    def _handle_event(self, name, payload):
+        if name == "model_loaded":
+            self.state = IDLE
+            if self.transcriber.error:
+                self.show_toast("Speech model failed to load — check the models folder", 4000)
+        elif name == "dl_done":
+            self.state = LOADING
+            threading.Thread(target=self._load_model, daemon=True).start()
+        elif name == "toggle":
+            self.toggle()
+        elif name == "stop_if_listening":
+            if self.state == LISTENING:
+                self.stop_listening()
+        elif name == "toast":
+            self.show_toast(payload, 3500)
+        elif name == "sync_status":
+            self.build_menu()      # refresh the status line
+            if payload.get("sync") == "needs-signin":
+                self.show_toast("Phone sync needs a fresh sign-in — "
+                                "right-click me → Set up phone sync", 4000)
+        elif name == "hotkey_captured":
+            if payload.get("name") == "esc":
+                self.show_toast("Hotkey unchanged — still " + self.hotkey_label(), 2500)
+            else:
+                self.settings["hotkeys"] = [payload]
+                save_settings(self.settings)
+                self._refresh_hotkey_codes()
+                self.build_menu()
+                self.show_toast("Your talk key is now " + self.hotkey_label()
+                                + " — tap it and speak", 3500)
+        elif name == "session_done":
+            if self.state == FINISHING:
+                self.state = IDLE
+                if self.settings["mode"] == "clipboard" and self.session_text:
+                    full = " ".join(self.session_text)
+                    self.show_toast("Copied: " + (full[:70] + "…" if len(full) > 70 else full), 3000)
+                elif not self.session_text:
+                    self.show_toast("Didn't catch anything", 1800)
+                full = " ".join(self.session_text).strip()
+                if full and self.settings.get("save_notes", True):
+                    try:
+                        save_note(full)
+                    except OSError:
+                        pass
+                    else:
+                        if not self.settings.get("seen_notes_hint"):
+                            self.settings["seen_notes_hint"] = True
+                            save_settings(self.settings)
+                            self.show_toast("Kept a copy in your notes — "
+                                            "right-click me → My notes", 3500)
+
+    # ---------------- session control ----------------
+
+    def toggle(self):
+        if self.state == DOWNLOADING:
+            self.show_toast(f"Fetching the speech model — {int(self.dl_frac * 100)}% "
+                            "(one-time download)", 2200)
+            return
+        if self.state == IDLE:
+            if self.transcriber.model is None:
+                self.show_toast("Still loading the speech model…", 1800)
+                return
+            self.session_text = []
+            self.context = ""
+            self.session_start = time.time()
+            try:
+                self.recorder.start()
+            except Exception as ex:
+                self.show_toast(f"Mic error: {ex}", 3000)
+                return
+            self.state = LISTENING
+            self.beep(880, 60)
+            self.show_toast("Listening — talk away", 1200)
+        elif self.state == LISTENING:
+            self.stop_listening()
+
+    def stop_listening(self):
+        self.state = FINISHING
+        self.beep(620, 60)
+        threading.Thread(target=self.recorder.stop, daemon=True).start()
+
+    # ---------------- pointer ----------------
+
+    def on_enter(self, e):
+        self.hover = True
+        self._tooltip_job = self.root.after(650, self.show_tooltip)
+
+    def on_leave(self, e):
+        self.hover = False
+        if self._tooltip_job:
+            self.root.after_cancel(self._tooltip_job)
+            self._tooltip_job = None
+        self.hide_tooltip()
+
+    def on_press(self, e):
+        self.hide_tooltip()
+        self.drag_start = (e.x_root, e.y_root,
+                           self.root.winfo_x(), self.root.winfo_y())
+        self.dragging = False
+
+    def on_motion(self, e):
+        if self.drag_start is None:
+            return
+        dx = e.x_root - self.drag_start[0]
+        dy = e.y_root - self.drag_start[1]
+        if abs(dx) > 4 or abs(dy) > 4:
+            self.dragging = True
+        if self.dragging:
+            self.root.geometry(f"+{self.drag_start[2] + dx}+{self.drag_start[3] + dy}")
+
+    def on_release(self, e):
+        if self.dragging:
+            self.settings["x"] = self.root.winfo_x()
+            self.settings["y"] = self.root.winfo_y()
+            save_settings(self.settings)
+        else:
+            self.toggle()
+        self.drag_start = None
+        self.dragging = False
+
+    def on_right_click(self, e):
+        self.hide_tooltip()
+        try:
+            self.menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def on_mode_change(self):
+        self.settings["mode"] = self.mode_var.get()
+        save_settings(self.settings)
+        self.show_toast("Words will be typed where your cursor is"
+                        if self.settings["mode"] == "type"
+                        else "Words will be copied to the clipboard", 2200)
+
+    def on_save_notes_toggle(self):
+        self.settings["save_notes"] = bool(self.save_notes_var.get())
+        save_settings(self.settings)
+        self.show_toast("Keeping a copy of every dictation in your notes"
+                        if self.settings["save_notes"]
+                        else "Not saving dictations to notes any more", 2200)
+
+    def _sync_status(self):
+        cloud = getattr(self, "cloud", None)
+        if cloud is None:
+            return {"sync": "off", "lastSync": 0}
+        return cloud.status()
+
+    def open_notes(self):
+        import webbrowser
+        # With phone sync on, the hosted app is the one source of truth for
+        # every device — open it instead of the localhost viewer.
+        if (self.settings.get("sync_enabled")
+                and self.settings.get("sync_refresh_token")):
+            webbrowser.open("https://dictationmic-sync.web.app/")
+            return
+        if self.local_server is None:
+            from localserver import LocalServer
+            self.local_server = LocalServer(get_store(),
+                                            status_fn=self._sync_status, dbg=dbg)
+        if not self.local_server.start():
+            self.show_toast("Couldn't open your notes — try again", 3000)
+            return
+        webbrowser.open(self.local_server.url())
+
+    # ---------------- phone sync ----------------
+
+    def _voice_stt(self, audio_bytes):
+        """Turn a phone voice note (webm/mp4 bytes) into text. Notes are
+        transcribed in the background, so they get the bigger voice_model
+        (fetched on first use) — live dictation stays on the small, snappy
+        one. None = busy/not ready, cloudsync retries in a few seconds."""
+        if self.recorder.stream is not None:
+            return None                    # live dictation owns the CPU
+        t = self._voice_transcriber()
+        if t is None or t.model is None:
+            return None                    # a model is still on its way
+        from io import BytesIO
+        from faster_whisper.audio import decode_audio
+        audio = decode_audio(BytesIO(audio_bytes), sampling_rate=SAMPLE_RATE)
+        if len(audio) < SAMPLE_RATE * 0.3:
+            return ""
+        return t.transcribe(audio, long=True) or ""
+
+    def _voice_transcriber(self):
+        """The Transcriber for voice notes: the dedicated voice_model once
+        it's fetched and loaded, the live-dictation model when they're the
+        same or the big one can't load. None while still preparing."""
+        name = self.settings.get("voice_model") or self.settings["model"]
+        if name == self.settings["model"] or self._voice_state == "fallback":
+            return self.transcriber
+        if self._voice_state == "ready":
+            return self.voice_transcriber
+        with self._voice_lock:
+            if self._voice_state == "idle":
+                self._voice_state = "preparing"
+                threading.Thread(target=self._prepare_voice_model,
+                                 daemon=True).start()
+        return None
+
+    def _prepare_voice_model(self):
+        name = self.settings.get("voice_model")
+        if not model_files_ready(name):
+            self.events.put(("toast",
+                "Fetching a bigger speech model for phone notes (one-time, "
+                f"{MODEL_SIZES.get(name, 'a big download')}) — notes queue "
+                "until it's ready"))
+        if model_files_ready(name) or self._download_files(name, primary=False):
+            t = Transcriber(self.settings, model_key="voice_model")
+            t.load()
+            if t.model is not None:
+                self.voice_transcriber = t
+                self._voice_state = "ready"
+                dbg(f"voice model ready: {name}")
+                return
+            dbg(f"voice model load failed: {t.error}")
+        # can't have the big one — the live model does voice notes, as before
+        self._voice_state = "fallback"
+
+    def _start_cloud_sync(self):
+        if not (self.settings.get("sync_enabled")
+                and self.settings.get("sync_refresh_token")):
+            return
+        try:
+            from cloudsync import CloudSync
+            self.cloud = CloudSync(get_store(), self.settings, save_settings,
+                                   self.events, dbg=dbg,
+                                   voice_stt=self._voice_stt)
+            self.cloud.start()
+        except Exception as ex:
+            dbg(f"cloud sync failed to start: {ex}")
+            self.cloud = None
+
+    def sync_off(self):
+        if self.cloud is not None:
+            try:
+                self.cloud.disable()
+            except Exception:
+                pass
+            self.cloud = None
+        else:
+            self.settings["sync_enabled"] = False
+            save_settings(self.settings)
+        self.build_menu()
+        self.show_toast("Phone sync is off — notes stay on this computer", 3000)
+
+    def sync_dialog(self):
+        try:
+            from cloudsync import CloudSync
+        except Exception:
+            self.show_toast("Sync isn't available in this build", 3000)
+            return
+
+        win = tk.Toplevel(self.root, bg="#131512")
+        win.title("DictationMic — phone sync")
+        win.resizable(False, False)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"360x250+{(sw - 360) // 2}+{max(0, (sh - 250) // 3)}")
+        try:
+            win.iconbitmap(os.path.join(APP_DIR, "icon.ico"))
+        except Exception:
+            pass
+        make_titlebar_dark(win)
+
+        FG, SUB, LIME, FIELD = "#eceee7", "#8a919c", "#b6ee3f", "#1a1d18"
+        tk.Label(win, text="Sync notes with your phone",
+                 bg="#131512", fg=FG, font=("Segoe UI Semibold", 12)
+                 ).pack(pady=(18, 2))
+        tk.Label(win, text="One account, used on the phone too.\n"
+                           "First time? It creates the account for you.",
+                 bg="#131512", fg=SUB, font=("Segoe UI", 9)).pack()
+
+        email_var = tk.StringVar(value=self.settings.get("sync_email")
+                                 or "stevenmcginty@gmail.com")
+        pw_var = tk.StringVar()
+        for label, var, show in (("Email", email_var, None),
+                                 ("Password", pw_var, "•")):
+            tk.Label(win, text=label, bg="#131512", fg=SUB,
+                     font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=36)
+            tk.Entry(win, textvariable=var, show=show or "",
+                     bg=FIELD, fg=FG, insertbackground=LIME,
+                     relief="flat", font=("Segoe UI", 10)
+                     ).pack(fill="x", padx=36, ipady=5, pady=(0, 6))
+
+        status = tk.Label(win, text="", bg="#131512", fg=SUB,
+                          font=("Segoe UI", 9))
+        status.pack()
+
+        def connect():
+            email = email_var.get().strip()
+            pw = pw_var.get()
+            if not email or not pw:
+                status.configure(text="Fill in both boxes", fg="#ff5c48")
+                return
+            btn.configure(state="disabled", text="Connecting…")
+            status.configure(text="", fg=SUB)
+
+            def work():
+                cs = CloudSync(get_store(), self.settings, save_settings,
+                               self.events, dbg=dbg)
+                ok, msg = cs.setup(email, pw)
+                def done():
+                    if ok:
+                        self.cloud = cs
+                        cs.start()
+                        self.build_menu()
+                        win.destroy()
+                        self.show_toast(
+                            "Phone sync is on — open the same link on your "
+                            "phone and sign in", 4500)
+                    else:
+                        btn.configure(state="normal", text="Connect")
+                        status.configure(text=msg, fg="#ff5c48")
+                self.root.after(0, done)
+            threading.Thread(target=work, daemon=True).start()
+
+        btn = tk.Button(win, text="Connect", command=connect,
+                        bg=LIME, fg="#0b0c0a", activebackground="#c9f56a",
+                        relief="flat", font=("Segoe UI Semibold", 10),
+                        cursor="hand2")
+        btn.pack(pady=8, ipadx=26, ipady=3)
+        win.bind("<Return>", lambda e: connect())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.lift()
+        win.focus_force()
+
+    def quit(self):
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        self.settings["x"] = self.root.winfo_x()
+        self.settings["y"] = self.root.winfo_y()
+        save_settings(self.settings)
+        self.root.destroy()
+
+    def assert_topmost(self):
+        try:
+            self.root.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.root.after(2000, self.assert_topmost)
+
+    # ---------------- feedback ----------------
+
+    def beep(self, freq, ms):
+        if self.settings.get("beeps"):
+            threading.Thread(target=winsound.Beep, args=(freq, ms),
+                             daemon=True).start()
+
+    def _popup(self, text, font=("Segoe UI", 10)):
+        t = tk.Toplevel(self.root)
+        t.overrideredirect(True)
+        try:
+            t.title("DM|" + text.split("\n")[0][:80])
+        except Exception:
+            pass
+        t.attributes("-topmost", True)
+        tk.Label(t, text=text, bg="#141519", fg="#eceef2", font=font,
+                 padx=14, pady=8, justify="left").pack()
+        t.update_idletasks()
+        x = self.root.winfo_x() + self.width // 2 - t.winfo_width() // 2
+        y = self.root.winfo_y() - t.winfo_height() - 10
+        if y < 0:
+            y = self.root.winfo_y() + self.height + 10
+        x = max(0, min(x, self.root.winfo_screenwidth() - t.winfo_width()))
+        t.geometry(f"+{x}+{y}")
+        make_non_activating(t)
+        return t
+
+    def show_toast(self, text, ms=2400):
+        if self.toast is not None:
+            try:
+                self.toast.destroy()
+            except Exception:
+                pass
+        self.toast = self._popup(text)
+        ref = self.toast
+
+        def _expire():
+            try:
+                ref.destroy()
+            except Exception:
+                pass
+            if self.toast is ref:
+                self.toast = None
+        ref.after(ms, _expire)
+
+    def show_tooltip(self):
+        if self.tooltip is not None or self.state not in (IDLE, LOADING, DOWNLOADING):
+            return
+        self.tooltip = self._popup(
+            f"Click or tap {self.hotkey_label()} — start / stop\n"
+            "Hold the key — push-to-talk\n"
+            "Hold + drag — move me\n"
+            "Right-click — options", ("Segoe UI", 9))
+
+    def hide_tooltip(self):
+        if self.tooltip is not None:
+            try:
+                self.tooltip.destroy()
+            except Exception:
+                pass
+            self.tooltip = None
+
+    # ---------------- animation ----------------
+
+    def tick(self):
+        try:
+            self.phase += 0.16
+            # lone-held modifier (e.g. Ctrl) => start push-to-talk
+            if (self._mod_down and not self._mod_other and not self._mod_ptt
+                    and self.state == IDLE
+                    and time.time() - self._mod_t > 0.45):
+                self._mod_ptt = True
+                self.toggle()
+            if self.state == LISTENING:
+                self.level_hist.append(self.recorder.level)
+                limit = self.settings.get("auto_stop_seconds") or 0
+                if limit > 0:
+                    quiet = time.time() - max(self.recorder.last_voice_time,
+                                              self.session_start)
+                    if quiet > limit:
+                        self.stop_listening()
+                        self.show_toast("Stopped listening (it went quiet)", 2200)
+            else:
+                self.level_hist.append(0.0)
+            self.draw()
+        except Exception:
+            pass
+        self.root.after(33, self.tick)
+
+    def draw(self):
+        r = self.renderer
+        if self.state == LISTENING:
+            hist = list(self.level_hist)[-r.nbars:]
+            bars = []
+            for i, v in enumerate(hist):
+                breathe = 0.05 + 0.04 * math.sin(self.phase * 1.7 + i * 0.7)
+                bars.append(max(breathe, min(1.0, v * 1.8)))
+            pulse = 0.5 + 0.5 * math.sin(self.phase * 0.9)
+            self._photo = r.listening(bars, pulse)
+        elif self.state == FINISHING:
+            self._photo = r.dots(self.phase)
+        elif self.state == DOWNLOADING:
+            self._photo = r.downloading(self.dl_frac)
+        elif self.state == LOADING:
+            self._photo = r.idle(False, dim=True)
+        else:
+            self._photo = r.idle(self.hover)
+        self.label.configure(image=self._photo)
+
+    def run(self):
+        self.root.mainloop()
+
+# ----------------------------------------------------------------------------
+
+def selftest(wav_path):
+    """Transcribe a wav file and write the result next to the exe (build check)."""
+    import wave
+    with wave.open(wav_path, "rb") as w:
+        audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        audio = audio.astype(np.float32) / 32768.0
+    t = Transcriber(load_settings())
+    t.load()
+    out = os.path.join(APP_DIR, "selftest_out.txt")
+    with open(out, "w", encoding="utf-8") as f:
+        if t.error:
+            f.write("LOAD ERROR: " + t.error)
+        else:
+            f.write("live: " + (t.transcribe(audio) or "(empty)") + "\n")
+            f.write("long: " + (t.transcribe(audio, long=True) or "(empty)"))
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
+        selftest(sys.argv[2])
+        return
+    if already_running():
+        ctypes.windll.user32.MessageBoxW(
+            0, "DictationMic is already running — look for the small dark pill "
+               "floating on your screen.", "DictationMic", 0x40)
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    DictationApp().run()
+
+
+if __name__ == "__main__":
+    main()
