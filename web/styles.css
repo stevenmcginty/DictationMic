@@ -324,6 +324,50 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
   background: var(--surface);
 }
 
+/* file notes (PDF, Word, Excel, …) */
+.file-badge {
+  display: inline-grid; place-items: center;
+  min-width: 46px; height: 46px;
+  padding: 0 8px;
+  border-radius: 12px;
+  background: var(--volt-dim);
+  border: 1px solid rgba(182, 238, 63, .4);
+  color: var(--volt);
+  font-size: 11px; font-weight: 700; letter-spacing: .06em;
+  flex: none;
+}
+.file-badge.small {
+  min-width: 30px; height: 22px;
+  border-radius: 7px;
+  font-size: 9px;
+}
+.file-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  margin-top: 4px;
+  max-width: 100%;
+}
+.file-chip-name {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--muted);
+}
+.note-file-wrap {
+  margin-top: 28px;
+  display: flex; flex-direction: column; gap: 16px;
+  align-items: flex-start;
+}
+.file-card {
+  display: flex; align-items: center; gap: 14px;
+  width: 100%; max-width: 460px;
+  padding: 16px 18px;
+  border: 1px solid var(--hairline);
+  border-radius: 14px;
+  background: var(--surface);
+}
+.file-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.file-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.file-size { font-size: 12px; color: var(--muted); }
+.file-actions { display: flex; gap: 10px; }
+
 /* full-window drop target */
 .drop-hint {
   position: fixed; inset: 0; z-index: 80;

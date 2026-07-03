@@ -147,6 +147,31 @@ Known trade-off: RTDB's SSE sends the full snapshot on every (re)connect,
 so hundreds of image notes would make app-opens heavy. If that day comes,
 move image bytes to `/users/$uid/blobs/$noteId` and fetch lazily.
 
+## Phase 6 — File notes: documents across devices  ✅ SHIPPED 2026-07-03
+
+Steve's brief: "almost an AirDrop" — PDFs, Word docs, spreadsheets dragged
+onto the pill, viewable on phone/desktop. No videos.
+
+Design: the image-note trick generalised. A file note's body is
+`data:<mime>;name=<urlencoded filename>;base64,…` — the `;name=` param
+(which image bodies never carry) is what marks a file note and carries the
+filename for open/share/download. Files ride every existing pipe (notes\
+.txt, RTDB, outbox, IndexedDB) with zero sync/storage changes. Contracts:
+dropnotes.py ⇄ web/js/filenote.js, round-trip tested both directions.
+
+Rules: 7 MB cap (base64 of 7 MB ≈ 9.4 MB, under RTDB's 10 MB string
+limit); video/audio refused with a toast; CSV/text stay editable text
+notes; images stay image notes; a known document mime never falls into the
+text path (a tiny all-ASCII PDF must still be a PDF).
+
+What works where:
+- **Pill**: drag any document on (or middle-click with files copied in
+  Explorer — the clipboard route reuses note_from_path).
+- **Phone/web**: + File button, drag onto the window, paste copied files;
+  list shows an ext badge + name + size chip; the note view is a file card
+  with Open (blob URL, PDFs render in the tab) and Share (share sheet on
+  the phone → WhatsApp/Files, download on desktop). sw.js CACHE → v14.
+
 ## Order of attack
 
 1. Phase 1 (phone) — the pain point; 1 session of work + phone testing.

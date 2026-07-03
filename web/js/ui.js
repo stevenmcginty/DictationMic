@@ -6,6 +6,9 @@ import {
   isImageBody, imageKb, fileToImageBody, imageBodyToPngBlob,
   imageBodyToFile, photoTitle,
 } from "./imgnote.js";
+import {
+  isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody,
+} from "./filenote.js";
 
 const $ = id => document.getElementById(id);
 
@@ -59,10 +62,16 @@ export class App {
   renderList() {
     const list = $("noteList");
     const q = this.filter.trim().toLowerCase();
+    const searchText = n => {
+      if (isImageBody(n.body)) return n.title + "\nimage photo";
+      if (isFileBody(n.body)) {                       // don't grep base64 soup
+        const f = fileMeta(n.body);
+        return `${n.title}\n${f.name}\n${f.ext}\nfile document`;
+      }
+      return n.title + "\n" + n.body;
+    };
     const shown = q
-      ? this.notes.filter(n => (isImageBody(n.body)
-          ? n.title + "\nimage photo"                 // don't grep base64 soup
-          : n.title + "\n" + n.body).toLowerCase().includes(q))
+      ? this.notes.filter(n => searchText(n).toLowerCase().includes(q))
       : this.notes;
     const pending = this.adapter.pendingIds();
 
@@ -94,6 +103,18 @@ export class App {
         img.loading = "lazy";
         img.decoding = "async";
         snippet.append(img);
+      } else if (isFileBody(n.body)) {
+        const f = fileMeta(n.body);
+        const chip = document.createElement("span");
+        chip.className = "file-chip";
+        const badge = document.createElement("span");
+        badge.className = "file-badge small";
+        badge.textContent = f.ext || "FILE";
+        const label = document.createElement("span");
+        label.className = "file-chip-name";
+        label.textContent = `${f.name} · ${fmtBytes(f.bytes)}`;
+        chip.append(badge, label);
+        snippet.append(chip);
       } else {
         snippet.textContent = n.body.slice(0, 220);
       }
@@ -183,12 +204,35 @@ export class App {
     } catch (e) { this.toast(e.message || "Couldn't save"); }
   }
 
-  async saveDroppedTextFile(f) {
-    const texty = f.type.startsWith("text/") || /\.(txt|md|markdown|csv|log|json|xml|ya?ml|ini|py|js|ts|html|css)$/i.test(f.name || "");
-    if (!texty) {
-      this.toast(`Can't save ${f.name || "that file"} — images and text only`);
-      return;
+  // one router for every picked/dropped/pasted file: images -> image notes,
+  // small text -> editable text notes, any other document -> file note
+  async saveAnyFiles(files) {
+    for (const f of [...files].slice(0, 10)) {
+      if (f.type.startsWith("image/")) {
+        await this.saveImageFiles([f]);
+        continue;
+      }
+      const texty = f.type.startsWith("text/")
+        || /\.(txt|md|markdown|csv|log|json|xml|ya?ml|ini|py|js|ts|html|css)$/i.test(f.name || "");
+      if (texty && f.size <= 200 * 1024) {
+        await this.saveDroppedTextFile(f);
+        continue;
+      }
+      try {
+        const body = await fileToFileBody(f);
+        const stem = (f.name || "").replace(/\.[^.]+$/, "").trim();
+        this._cache(await this.adapter.create({
+          title: stem.slice(0, 60) || (f.name || "File").slice(0, 60), body,
+        }));
+        this.renderList();
+        this.toast(`${f.name || "File"} saved to notes`);
+      } catch (e) {
+        this.toast(e.message || `Couldn't save ${f.name || "that file"}`);
+      }
     }
+  }
+
+  async saveDroppedTextFile(f) {
     if (f.size > 200 * 1024) {
       this.toast(`${f.name} is too big for a note`);
       return;
@@ -220,12 +264,21 @@ export class App {
 
   _fillEditor(n) {
     const image = isImageBody(n.body);
+    const file = !image && isFileBody(n.body);
     $("noteTitle").value = n.title;
-    $("noteBody").value = image ? "" : n.body;
-    $("noteBody").hidden = image;
+    $("noteBody").value = image || file ? "" : n.body;
+    $("noteBody").hidden = image || file;
     $("noteImageWrap").hidden = !image;
     $("noteImage").src = image ? n.body : "";
-    $("shareBtn").hidden = !image;
+    $("noteFileWrap").hidden = !file;
+    if (file) {
+      const f = fileMeta(n.body);
+      $("noteFileBadge").textContent = f.ext || "FILE";
+      $("noteFileName").textContent = f.name;
+      $("noteFileSize").textContent = fmtBytes(f.bytes);
+    }
+    $("shareBtn").hidden = !(image || file);
+    $("copyBtn").hidden = file;                 // nothing sensible to copy
     this._renderMeta(n);
   }
 
@@ -236,6 +289,9 @@ export class App {
     if (created) bits.push(`created ${created}`);
     if (isImageBody(n.body)) {
       bits.push(`image · ${imageKb(n.body)} kB`);
+    } else if (isFileBody(n.body)) {
+      const f = fileMeta(n.body);
+      bits.push(`${f.ext || "file"} · ${fmtBytes(f.bytes)}`);
     } else {
       const words = n.body.trim() ? n.body.trim().split(/\s+/).length : 0;
       bits.push(`${words} word${words === 1 ? "" : "s"}`);
@@ -254,7 +310,8 @@ export class App {
     const id = this.activeId;
     if (!id) return;
     const current = this.notes.find(n => n.id === id);
-    if (current && isImageBody(current.body)) return;   // images aren't edited
+    if (current && (isImageBody(current.body)
+        || isFileBody(current.body))) return;   // images/files aren't edited
     try {
       const updated = await this.adapter.update(id, $("noteBody").value);
       if (updated) {
@@ -410,17 +467,31 @@ export class App {
 
     $("shareBtn").addEventListener("click", async () => {
       const n = this.notes.find(x => x.id === this.activeId);
-      if (!n || !isImageBody(n.body)) return;
-      const file = imageBodyToFile(n.body, n.title);
+      if (!n) return;
+      let file;
+      if (isImageBody(n.body)) file = imageBodyToFile(n.body, n.title);
+      else if (isFileBody(n.body)) file = fileBodyToFile(n.body);
+      else return;
       if (navigator.canShare?.({ files: [file] })) {
         try { await navigator.share({ files: [file], title: n.title }); }
         catch { /* user closed the share sheet */ }
       } else {
         const a = document.createElement("a");     // desktop: download instead
-        a.href = n.body;
+        a.href = URL.createObjectURL(file);
         a.download = file.name;
         a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 30000);
       }
+    });
+
+    // file notes: Open = view in a new tab (PDFs etc. render right there)
+    $("fileOpenBtn").addEventListener("click", () => {
+      const n = this.notes.find(x => x.id === this.activeId);
+      if (!n || !isFileBody(n.body)) return;
+      const url = URL.createObjectURL(fileBodyToFile(n.body));
+      const win = open(url, "_blank");
+      if (!win) this.toast("Pop-up blocked — use Share instead");
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
     });
 
     $("deleteBtn").addEventListener("click", () => {
@@ -445,14 +516,20 @@ export class App {
       e.target.value = "";
     });
 
-    // paste anywhere: an image always becomes a new note; text becomes one
+    // add a file: any document from Files/Explorer becomes a file note
+    $("addFileBtn").addEventListener("click", () => $("fileInput").click());
+    $("fileInput").addEventListener("change", async e => {
+      await this.saveAnyFiles(e.target.files);
+      e.target.value = "";
+    });
+
+    // paste anywhere: files/images always become new notes; text becomes one
     // too unless you're typing in a box (that stays a normal paste)
     document.addEventListener("paste", e => {
-      const files = [...(e.clipboardData?.files || [])]
-        .filter(f => f.type.startsWith("image/"));
+      const files = [...(e.clipboardData?.files || [])];
       if (files.length) {
         e.preventDefault();
-        this.saveImageFiles(files);
+        this.saveAnyFiles(files);
         return;
       }
       const tag = document.activeElement?.tagName;
@@ -487,10 +564,7 @@ export class App {
       if (!dt) return;
       const files = [...dt.files];
       if (files.length) {
-        await this.saveImageFiles(files.filter(f => f.type.startsWith("image/")));
-        for (const f of files.filter(f => !f.type.startsWith("image/")).slice(0, 4)) {
-          await this.saveDroppedTextFile(f);
-        }
+        await this.saveAnyFiles(files);
         return;
       }
       const text = dt.getData("text/plain");

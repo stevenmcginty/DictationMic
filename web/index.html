@@ -46,9 +46,11 @@ if (location.protocol === "file:") {
       <span class="head-tools">
         <span class="count mono" id="noteCount"></span>
         <button class="capsule small" id="addImageBtn" aria-label="Add an image">+ Image</button>
+        <button class="capsule small" id="addFileBtn" aria-label="Add a file">+ File</button>
         <button class="capsule small" id="newNoteBtn" aria-label="New note">+ New</button>
       </span>
       <input id="imageInput" type="file" accept="image/*" multiple hidden>
+      <input id="fileInput" type="file" multiple hidden>
     </div>
     <div class="list-search">
       <input id="searchMobile" type="search" placeholder="Search your notes…"
@@ -79,6 +81,18 @@ if (location.protocol === "file:") {
                 aria-label="Note text" placeholder="Say something…"></textarea>
       <div class="note-image-wrap" id="noteImageWrap" hidden>
         <img id="noteImage" alt="Image note">
+      </div>
+      <div class="note-file-wrap" id="noteFileWrap" hidden>
+        <div class="file-card">
+          <span class="file-badge" id="noteFileBadge">FILE</span>
+          <div class="file-info">
+            <span class="file-name" id="noteFileName"></span>
+            <span class="file-size mono" id="noteFileSize"></span>
+          </div>
+        </div>
+        <div class="file-actions">
+          <button class="capsule solid" id="fileOpenBtn">Open</button>
+        </div>
       </div>
     </div>
     <div class="note-blank" id="noteBlank">
@@ -133,7 +147,7 @@ if (location.protocol === "file:") {
 <div class="drop-hint" id="dropHint" hidden aria-hidden="true">
   <div class="drop-hint-card">
     <strong>Drop to save</strong>
-    <span>images &amp; text become new notes</span>
+    <span>files, images &amp; text become new notes</span>
   </div>
 </div>
 

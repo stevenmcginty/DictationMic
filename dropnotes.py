@@ -8,13 +8,22 @@ exact contract of web/js/imgnote.js, so the same entry renders on the phone,
 the hosted app and the desktop viewer with zero changes to sync or storage.
 Compression mirrors the web ladder: longest edge 1600px, JPEG, stepping down
 until the result fits MAX_IMAGE_BYTES.
+
+A file note is the same trick for documents (PDF, Word, Excel, …): the body
+is data:<mime>;name=<urlencoded filename>;base64,<bytes> — the contract of
+web/js/filenote.js. The ;name= parameter is what tells a file note apart
+from an image note, and carries the filename for download/share. Capped at
+MAX_FILE_BYTES so the base64 stays under Firebase RTDB's 10 MB string limit;
+video and audio are refused (this is a document pipe, not a media locker).
 """
 
 import base64
 import io
+import mimetypes
 import os
 import re
 import time
+import urllib.parse
 import urllib.request
 
 from PIL import Image, ImageOps
@@ -23,6 +32,8 @@ MAX_IMAGE_BYTES = 600 * 1024        # hard cap AFTER compression (= imgnote.js)
 KEEP_ORIGINAL_BYTES = 250 * 1024    # already small and web-friendly? keep as-is
 MAX_SOURCE_BYTES = 40 * 1024 * 1024
 MAX_TEXT_BYTES = 200 * 1024
+MAX_FILE_BYTES = 7 * 1024 * 1024    # file notes (= filenote.js); b64 of 7 MB
+                                    # ≈ 9.4 MB, under RTDB's 10 MB string cap
 LADDER = ((1600, 80), (1600, 65), (1280, 60), (1024, 55), (800, 50))
 
 PASSTHROUGH_MIMES = ("image/png", "image/jpeg", "image/webp", "image/gif")
@@ -30,6 +41,19 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
 TEXTY_EXTS = {".txt", ".md", ".markdown", ".csv", ".log", ".json", ".xml",
               ".yaml", ".yml", ".ini", ".py", ".js", ".ts", ".html", ".css"}
 DULL_STEMS = {"image", "img", "download", "unnamed", "screenshot", "untitled"}
+
+# extensions mimetypes sometimes misses on a bare Windows install
+EXTRA_MIMES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".doc": "application/msword",
+    ".xls": "application/vnd.ms-excel",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pdf": "application/pdf",
+    ".epub": "application/epub+zip",
+    ".zip": "application/zip",
+}
 
 DATA_URL_RE = re.compile(
     r"^data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$")
@@ -107,7 +131,7 @@ def text_note_from_file(path):
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
-        raise ValueError("Can't save " + name + " — images and text only")
+        raise ValueError("Can't save " + name + " — it doesn't look like text")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         raise ValueError(name + " is empty")
@@ -125,9 +149,37 @@ def _is_image_file(path):
         return False
 
 
+def mime_for(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in EXTRA_MIMES:
+        return EXTRA_MIMES[ext]
+    return mimetypes.guess_type(os.path.basename(path))[0] \
+        or "application/octet-stream"
+
+
+def file_note_from_file(path):
+    """Any document -> (title, data:<mime>;name=…;base64 body). The phone
+    and desktop viewers turn it back into a viewable/sharable file."""
+    name = os.path.basename(path)
+    size = os.path.getsize(path)
+    if size == 0:
+        raise ValueError(name + " is empty")
+    if size > MAX_FILE_BYTES:
+        raise ValueError(f"{name} is {size / (1024 * 1024):.0f} MB — "
+                         "files up to 7 MB can sync")
+    with open(path, "rb") as f:
+        raw = f.read()
+    body = "data:%s;name=%s;base64,%s" % (
+        mime_for(path), urllib.parse.quote(name),
+        base64.b64encode(raw).decode("ascii"))
+    stem = os.path.splitext(name)[0].strip()
+    return (stem[:60] or name[:60]), body
+
+
 def note_from_path(path):
-    """(title, body) for any dropped file; ValueError with a friendly
-    message when it's neither an image nor text."""
+    """(title, body) for any dropped file. Images become image notes, text
+    stays an editable text note, video/audio are refused, and every other
+    document becomes a file note. ValueError = friendly refusal."""
     if not os.path.isfile(path):
         raise ValueError("Can't find " + os.path.basename(path))
     ext = os.path.splitext(path)[1].lower()
@@ -135,9 +187,21 @@ def note_from_path(path):
         return image_note_from_file(path)
     if ext in TEXTY_EXTS:
         return text_note_from_file(path)
+    mime = mime_for(path)
+    if mime.startswith(("video/", "audio/")):
+        raise ValueError(os.path.basename(path)
+                         + " — videos and audio don't sync, documents only")
     if (os.path.getsize(path) <= MAX_SOURCE_BYTES and _is_image_file(path)):
         return image_note_from_file(path)
-    return text_note_from_file(path)       # raises the friendly refusal
+    # unknown extension (no known mime) but plain text inside? keep it
+    # editable — known document types always stay real files
+    if (mime == "application/octet-stream"
+            and os.path.getsize(path) <= MAX_TEXT_BYTES):
+        try:
+            return text_note_from_file(path)
+        except ValueError:
+            pass
+    return file_note_from_file(path)
 
 
 def _fetch_image(url):

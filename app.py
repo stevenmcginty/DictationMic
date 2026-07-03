@@ -1532,7 +1532,7 @@ class DictationApp:
             f"Click or tap {self.hotkey_label()} — start / stop\n"
             "Hold the key — push-to-talk\n"
             "Hold + drag — move me\n"
-            "Drop text or images on me — saved as notes\n"
+            "Drop files, text or images on me — synced as notes\n"
             "Right-click — options", ("Segoe UI", 9))
 
     def hide_tooltip(self):
