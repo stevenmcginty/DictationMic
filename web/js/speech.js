@@ -32,14 +32,11 @@ let idleTimer = null;
 let wakeLock = null;
 let restartCount = 0;
 let lastRestart = 0;
-// our own mic stream, held open for the whole session: Chrome then treats
-// it as one continuous capture and (on most phones) stops playing its
-// start/stop chime at every recognition restart — and it feeds a real
-// level meter instead of a fake animation
-let micStream = null;
-let audioCtx = null;
-let analyser = null;
-let meterData = null;
+// NOTE: no page-held getUserMedia keep-alive stream here. Holding the mic
+// used to silence Chrome's per-run chime, but Android Chrome now refuses to
+// feed SpeechRecognition while the page owns the mic — runs hear nothing,
+// no-speech restarts loop forever and dictation looks dead. Recognition
+// must have the mic to itself; the chime per phrase is the accepted cost.
 
 export function micAvailable() { return !!SR; }
 
@@ -67,37 +64,15 @@ function bind() {
   });
 }
 
-async function start() {
+function start() {
   if (!SR) return;
   active = true;
   restartCount = 0;
-  await acquireMicStream();   // before the first run, so no chime plays
   startRun();
   acquireWake();
   startMeter();
   armIdleTimer();
   render();
-}
-
-async function acquireMicStream() {
-  if (micStream) return;
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = audioCtx.createMediaStreamSource(micStream);
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    src.connect(analyser);
-    meterData = new Uint8Array(analyser.frequencyBinCount);
-  } catch {
-    micStream = null;          // denied/unavailable: meter falls back to fake
-  }
-}
-
-function releaseMicStream() {
-  try { micStream?.getTracks().forEach(t => t.stop()); } catch { }
-  try { audioCtx?.close(); } catch { }
-  micStream = audioCtx = analyser = meterData = null;
 }
 
 // Merge a new hypothesis into what we already have. Handles every observed
@@ -135,10 +110,11 @@ function startRun() {
   };
 
   rec.onerror = e => {
-    if (e.error === "audio-capture" && micStream) {
-      // rare devices won't share the mic with our keep-alive stream —
-      // give it up (beeps return, dictation keeps working)
-      releaseMicStream();
+    if (e.error === "audio-capture") {
+      active = false;
+      app?.toast("Can't reach the microphone — is another app using it?", 3500);
+      finishRun();
+      render();
       return;
     }
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
@@ -197,7 +173,6 @@ function finishRun() {
   clearTimeout(commitTimer);
   clearTimeout(idleTimer);
   stopMeter();
-  releaseMicStream();
   releaseWake();
   app?.setBrandLive(false);
 }
@@ -257,26 +232,9 @@ function startMeter() {
   let phase = 0;
   meterTimer = setInterval(() => {
     phase += 0.6;
-    let level = null;                       // real mic level, 0..1
-    if (analyser) {
-      analyser.getByteTimeDomainData(meterData);
-      let sum = 0;
-      for (let i = 0; i < meterData.length; i++) {
-        const v = (meterData[i] - 128) / 128;
-        sum += v * v;
-      }
-      level = Math.min(1, Math.sqrt(sum / meterData.length) * 4);
-    }
     for (let i = 0; i < bars.length; i++) {
-      let h;
-      if (level !== null) {
-        const wave = Math.abs(Math.sin(phase * 0.9 + i * 0.7));
-        h = 4 + level * (14 + wave * 26);
-      } else {
-        const wave = Math.sin(phase + i * 0.55) * Math.sin(phase * 0.33 + i);
-        h = 5 + Math.abs(wave) * 30 + Math.random() * 6;
-      }
-      bars[i].style.height = `${h}px`;
+      const wave = Math.sin(phase + i * 0.55) * Math.sin(phase * 0.33 + i);
+      bars[i].style.height = `${5 + Math.abs(wave) * 30 + Math.random() * 6}px`;
     }
   }, 100);
 }
