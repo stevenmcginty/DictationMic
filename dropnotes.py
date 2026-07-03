@@ -38,7 +38,7 @@ LADDER = ((1600, 80), (1600, 65), (1280, 60), (1024, 55), (800, 50))
 
 PASSTHROUGH_MIMES = ("image/png", "image/jpeg", "image/webp", "image/gif")
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
-TEXTY_EXTS = {".txt", ".md", ".markdown", ".csv", ".log", ".json", ".xml",
+TEXTY_EXTS = {".txt", ".md", ".markdown", ".log", ".json", ".xml",
               ".yaml", ".yml", ".ini", ".py", ".js", ".ts", ".html", ".css"}
 DULL_STEMS = {"image", "img", "download", "unnamed", "screenshot", "untitled"}
 
@@ -58,6 +58,35 @@ EXTRA_MIMES = {
 DATA_URL_RE = re.compile(
     r"^data:image/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$")
 URL_RE = re.compile(r"^https?://\S+$")
+
+# body sniffers, mirroring web/js/filenote.js and imgnote.js
+FILE_BODY_RE = re.compile(r"^data:([\w.+-]+/[\w.+-]+);name=([^;,]*);base64,")
+IMAGE_BODY_RE = re.compile(r"^data:image/(png|jpeg|webp|gif);base64,")
+
+
+def decode_file_body(body):
+    """File-note body -> (filename, raw bytes), or None if it isn't one."""
+    m = FILE_BODY_RE.match(body[:400]) if isinstance(body, str) else None
+    if not m:
+        return None
+    try:
+        raw = base64.b64decode(body[body.index(",") + 1:])
+    except Exception:
+        return None
+    name = os.path.basename(urllib.parse.unquote(m.group(2)).strip()) or "file"
+    return name, raw
+
+
+def decode_image_body(body):
+    """Image-note body -> ('.jpg' | '.png' | …, raw bytes), or None."""
+    m = IMAGE_BODY_RE.match(body[:64]) if isinstance(body, str) else None
+    if not m:
+        return None
+    try:
+        raw = base64.b64decode(re.sub(r"\s+", "", body[body.index(",") + 1:]))
+    except Exception:
+        return None
+    return "." + ("jpg" if m.group(1) == "jpeg" else m.group(1)), raw
 
 
 def photo_title(prefix="Photo"):

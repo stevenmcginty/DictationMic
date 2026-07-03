@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -68,6 +69,7 @@ class NoteStore:
         os.makedirs(self.dir, exist_ok=True)
         self._load_index()
         self.scan()
+        self._backfill_files()
 
     # ---------------- change notifications ----------------
 
@@ -124,6 +126,87 @@ class NoteStore:
     def _read_file(self, filename):
         with open(self._path(filename), "r", encoding="utf-8", errors="replace") as f:
             return f.read()
+
+    # ---------------- real files for file/image notes ----------------
+    # A note whose body is a data URL (a dropped PDF, doc, spreadsheet or
+    # photo) also lives as the actual file in notes\files — openable and
+    # copyable like any document, whether it was dropped on the pill or
+    # arrived from the phone. e["file"] tracks the copy we own so deletes
+    # clean it up. The sync contract (data-URL bodies in .txt) is untouched.
+
+    FILES_DIRNAME = "files"
+
+    def files_dir(self):
+        return os.path.join(self.dir, self.FILES_DIRNAME)
+
+    def _unique_real_name(self, name):
+        base, ext = os.path.splitext(name)
+        cand, n = name, 2
+        while os.path.exists(os.path.join(self.files_dir(), cand)):
+            cand = f"{base} ({n}){ext}"
+            n += 1
+        return cand
+
+    def _materialize(self, e, body, src_path=None):
+        """Write/refresh the real file for a file or image note body.
+        src_path: the original dropped file — copied verbatim when given
+        (keeps photos full-resolution; the note body is the compressed
+        sync copy)."""
+        try:
+            import dropnotes
+            decoded = dropnotes.decode_file_body(body)
+            if decoded:
+                name, raw = decoded
+            else:
+                img = dropnotes.decode_image_body(body)
+                if img is None:
+                    self._unmaterialize(e)
+                    return
+                ext, raw = img
+                name = (e.get("title") or "Image") + ext
+            if src_path and os.path.isfile(src_path):
+                name, raw = os.path.basename(src_path), None
+            self._unmaterialize(e)
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", name).strip() or "file"
+            os.makedirs(self.files_dir(), exist_ok=True)
+            name = self._unique_real_name(name)
+            dest = os.path.join(self.files_dir(), name)
+            if raw is None:
+                shutil.copy2(src_path, dest)
+            else:
+                with open(dest + ".tmp", "wb") as f:
+                    f.write(raw)
+                os.replace(dest + ".tmp", dest)
+            e["file"] = name
+        except Exception as ex:
+            self.dbg(f"notestore: couldn't write real file: {ex}")
+
+    def _unmaterialize(self, e):
+        name = e.pop("file", None) if e else None
+        if name:
+            try:
+                os.remove(os.path.join(self.files_dir(), name))
+            except OSError:
+                pass
+
+    def _backfill_files(self):
+        """One-off catch-up for file/image notes saved before notes\\files
+        existed: give each its real file. Entries that already have one
+        (even if the user then deleted it by hand) are left alone."""
+        with self.lock:
+            changed = False
+            for e in self.notes.values():
+                if "file" in e or e.get("deletedLocally"):
+                    continue
+                try:
+                    body = self._read_file(e["filename"])
+                except OSError:
+                    continue
+                if body.startswith("data:"):
+                    self._materialize(e, body)
+                    changed = "file" in e or changed
+            if changed:
+                self._save_index()
 
     def _unique_filename(self, title, keep_id=None):
         """'title.txt', suffixing ' (2)' while the name belongs to another
@@ -196,7 +279,7 @@ class NoteStore:
 
     # ---------------- local mutations (UI / dictation) ----------------
 
-    def create(self, title, body, note_id=None):
+    def create(self, title, body, note_id=None, src_path=None):
         with self.lock:
             note_id = note_id or uuid.uuid4().hex
             filename = self._unique_filename(title or note_title_from(body))
@@ -207,6 +290,7 @@ class NoteStore:
                 "hash": _hash(body), "size": st.st_size, "mtime": st.st_mtime,
                 "createdAt": _now_ms(), "syncedRev": 0, "dirty": True,
             }
+            self._materialize(self.notes[note_id], body, src_path)
             self._save_index()
         self._notify("create", note_id)
         return self.get(note_id)
@@ -219,6 +303,7 @@ class NoteStore:
             self._write_file(e["filename"], body)
             st = os.stat(self._path(e["filename"]))
             e.update(hash=_hash(body), size=st.st_size, mtime=st.st_mtime, dirty=True)
+            self._materialize(e, body)
             self._save_index()
         self._notify("update", note_id)
         return self.get(note_id)
@@ -249,6 +334,7 @@ class NoteStore:
                 os.remove(self._path(e["filename"]))
             except OSError:
                 pass
+            self._unmaterialize(e)
             if self.keep_deletes:
                 # pending local delete until sync pushes the tombstone
                 e["deletedLocally"] = True
@@ -293,6 +379,7 @@ class NoteStore:
                         os.remove(self._path(e["filename"]))
                     except OSError:
                         pass
+                    self._unmaterialize(e)
                     self._save_index()
                     kind = "remote_delete"
                 else:
@@ -316,11 +403,13 @@ class NoteStore:
                         "createdAt": int(record.get("createdAt") or _now_ms()),
                         "syncedRev": rev, "dirty": False,
                     }
+                    self._materialize(self.notes[note_id], body)
                     kind = "remote_create"
                 else:
                     changed = False
                     if _hash(body) != e["hash"]:
                         self._write_file(e["filename"], body)
+                        self._materialize(e, body)
                         changed = True
                     want = sanitize_title(title) or "Note"
                     if want != os.path.splitext(e["filename"])[0]:
@@ -404,11 +493,13 @@ class NoteStore:
                         "hash": h, "size": st.st_size, "mtime": st.st_mtime,
                         "createdAt": _now_ms(), "syncedRev": 0, "dirty": True,
                     }
+                    self._materialize(self.notes[note_id], body)
                     self._notify("create", note_id)
                 changed = True
 
             # whatever is still orphaned was deleted on disk
             for note_id, e in orphans.items():
+                self._unmaterialize(e)
                 if self.keep_deletes:
                     e["deletedLocally"] = True
                     e["dirty"] = True

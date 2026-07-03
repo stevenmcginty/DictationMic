@@ -853,6 +853,10 @@ class DictationApp:
                                     "or copied file  (middle-click me)",
                               image=blue, compound="left",
                               command=self.save_clipboard_note)
+        self.menu.add_command(label="My files — every PDF, doc & photo as the "
+                                    "actual file",
+                              image=lime, compound="left",
+                              command=self.open_files_folder)
         self.menu.add_separator()
         if self.settings.get("sync_enabled") and self.cloud is not None:
             state = self.cloud.status()["sync"]
@@ -1191,31 +1195,34 @@ class DictationApp:
                              daemon=True).start()
         return getattr(event, "action", "copy")
 
-    def _saved_toast(self, title):
+    def _saved_toast(self, title, real_file=False):
         suffix = " — syncing to your phone" if (
             self.settings.get("sync_enabled")
             and self.settings.get("sync_refresh_token")) else ""
+        if real_file:
+            suffix = " (file kept — see My files)" + suffix
         preview = title[:44] + ("…" if len(title) > 44 else "")
         self.events.put(("toast", f"Saved to notes: {preview}{suffix}"))
 
     def _ingest_paths(self, paths):
         import dropnotes
-        saved_title, saved = "", 0
+        saved_title, saved, real = "", 0, False
         for p in paths[:10]:
             try:
                 title, body = dropnotes.note_from_path(p)
-                get_store().create(title, body)
+                get_store().create(title, body, src_path=p)
                 saved += 1
                 saved_title = title
+                real = real or body.startswith("data:")
             except ValueError as ex:
                 self.events.put(("toast", str(ex)))
             except Exception:
                 self.events.put(("toast", "Couldn't save "
                                           + os.path.basename(str(p))))
         if saved == 1:
-            self._saved_toast(saved_title)
+            self._saved_toast(saved_title, real_file=real)
         elif saved:
-            self._saved_toast(f"{saved} files")
+            self._saved_toast(f"{saved} files", real_file=real)
 
     def _ingest_text(self, text):
         import dropnotes
@@ -1284,6 +1291,13 @@ class DictationApp:
         if cloud is None:
             return {"sync": "off", "lastSync": 0}
         return cloud.status()
+
+    def open_files_folder(self):
+        """Explorer on notes\\files — the real PDFs, docs and photos behind
+        file/image notes, ready to copy-paste anywhere."""
+        d = get_store().files_dir()
+        os.makedirs(d, exist_ok=True)
+        os.startfile(d)
 
     def open_notes(self):
         import webbrowser
