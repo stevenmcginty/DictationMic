@@ -545,6 +545,31 @@ class PillRenderer:
             d.ellipse([x - r, cy - r, x + r, cy + r], fill=DOT_THINK)
         return body
 
+    def frame_drop(self):
+        """Drag hovering over the pill: full lime ring + arrow-into-tray,
+        so there's no doubt it will catch the drop. Static on purpose."""
+        body = self._body("drop", LIME + (235,)).copy()
+        d = ImageDraw.Draw(body)
+        p = self.pad
+        d.rounded_rectangle([p, p, self.sw - p, self.sh - p],
+                            radius=(self.sh - 2 * p) / 2,
+                            outline=LIME + (235,), width=self.edge_w * 2)
+        cx = self.sw / 2
+        ah = self.sh * 0.50                      # glyph box height
+        top = self.sh / 2 - ah / 2
+        shaft = max(2.0, self.sh * 0.075)
+        head = self.sh * 0.17
+        tip = top + ah * 0.68
+        lime = LIME + (255,)
+        d.rounded_rectangle([cx - shaft / 2, top, cx + shaft / 2,
+                             tip - head * 0.7], radius=shaft / 2, fill=lime)
+        d.polygon([(cx - head, tip - head), (cx + head, tip - head),
+                   (cx, tip)], fill=lime)
+        ty = top + ah                            # the tray it drops into
+        d.rounded_rectangle([cx - head * 1.55, ty - shaft, cx + head * 1.55, ty],
+                            radius=shaft / 2, fill=lime)
+        return body
+
     def frame_downloading(self, frac):
         body = self._body("dim", EDGE_DIM).copy()
         d = ImageDraw.Draw(body)
@@ -567,6 +592,11 @@ class PillRenderer:
         if key not in self._static:
             self._static[key] = self._finish(self.frame_idle(hover, dim))
         return self._static[key]
+
+    def drop(self):
+        if "drop" not in self._static:
+            self._static["drop"] = self._finish(self.frame_drop())
+        return self._static["drop"]
 
     def listening(self, vals, pulse):
         return self._finish(self.frame_listening(vals, pulse))
@@ -625,6 +655,7 @@ class DictationApp:
         self._photo = None
 
         self.hover = False
+        self.drop_hover = False        # a drag is over the pill right now
         self.drag_start = None
         self.dragging = False
         self.phase = 0.0
@@ -1191,15 +1222,15 @@ class DictationApp:
             dbg(f"tkdnd register failed: {ex!r}")
 
     def _on_drop_enter(self, event):
-        self.hover = True                   # brighter rim: "I'll catch that"
+        self.drop_hover = True              # lime ring + tray: "I'll catch that"
         return event.action
 
     def _on_drop_leave(self, event):
-        self.hover = False
+        self.drop_hover = False
         return event.action
 
     def _on_drop_files(self, event):
-        self.hover = False
+        self.drop_hover = False
         try:
             paths = list(self.root.tk.splitlist(event.data or ""))
         except Exception:
@@ -1210,7 +1241,7 @@ class DictationApp:
         return getattr(event, "action", "copy")
 
     def _on_drop_text(self, event):
-        self.hover = False
+        self.drop_hover = False
         text = event.data or ""
         if text.strip():
             threading.Thread(target=self._ingest_text, args=(text,),
@@ -1623,6 +1654,10 @@ class DictationApp:
 
     def draw(self):
         r = self.renderer
+        if self.drop_hover:                 # a drag is over us — outrank all
+            self._photo = r.drop()
+            self.label.configure(image=self._photo)
+            return
         if self.state == LISTENING:
             hist = list(self.level_hist)[-r.nbars:]
             bars = []
