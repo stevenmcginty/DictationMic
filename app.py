@@ -406,8 +406,15 @@ class Transcriber:
             model_path = model_dir(name)
             if not os.path.isdir(model_path):
                 model_path = name
+            # Use only HALF the cores so the pill's animation, the audio meter
+            # and keypress handling stay snappy WHILE Whisper transcribes. On
+            # this hybrid CPU (Lunar Lake: 4 fast P-cores + 4 slow E-cores) 6
+            # threads bought only ~9% over 4 yet pegged 6/8 cores and made the
+            # UI stutter during dictation. Half the cores is still ~7x real-time
+            # for small.en — far more than live dictation needs.
+            threads = min(6, max(2, (os.cpu_count() or 8) // 2))
             self.model = WhisperModel(
-                model_path, device="cpu", compute_type="int8", cpu_threads=6)
+                model_path, device="cpu", compute_type="int8", cpu_threads=threads)
         except Exception as e:
             self.error = str(e)
 
