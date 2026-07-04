@@ -327,18 +327,21 @@ export class App {
 
   async _commitBody() {
     const id = this.activeId;
-    if (!id) return;
+    if (!id) return null;
     const current = this.notes.find(n => n.id === id);
     if (current && (isImageBody(current.body)
-        || isFileBody(current.body))) return;   // images/files aren't edited
+        || isFileBody(current.body))) return current;   // images/files aren't edited
+    const body = $("noteBody").value;
+    if (current && body === current.body) return current;   // nothing new to save
     try {
-      const updated = await this.adapter.update(id, $("noteBody").value);
+      const updated = await this.adapter.update(id, body);
       if (updated) {
         this._cache(updated);
         this.renderList();
         if (this.activeId === id) this._renderMeta(updated);
       }
-    } catch (e) { this.toast(e.message || "Couldn't save"); }
+      return updated;
+    } catch (e) { this.toast(e.message || "Couldn't save"); return null; }
   }
 
   async _commitTitle() {
@@ -349,6 +352,14 @@ export class App {
       if (n) $("noteTitle").value = n.title;
       return;
     }
+    // The body box saves on a 700ms debounce; a quick rename must not outrun it.
+    // If it does, adapter.rename() reads a body that's still empty and ships
+    // {title, body:""} to the cloud — every other device shows the new title
+    // but loses the text, while this phone's editor still shows it. Commit (and
+    // await) any pending body edit BEFORE renaming so the rename carries the
+    // real body.
+    this._saveBody.cancel();
+    await this._commitBody();
     try {
       const updated = await this.adapter.rename(id, wanted);
       if (updated) {
