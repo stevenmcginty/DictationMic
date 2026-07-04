@@ -10,6 +10,8 @@ let lastSync = 0;
 let es = null;
 let esBackoff = 1000;
 let flushing = false;
+let flushAgain = false;       // a queue() came in mid-flush — its entry was
+                               // never in this flush's snapshot, so re-run
 let onRemote = () => {};      // adapter refreshes the UI through this
 let onState = () => {};
 let retryTimer = null;        // failed flush → quick retry, backing off
@@ -42,9 +44,10 @@ export async function pendingIds() {
 // ---------------------------------------------------------------------------
 
 export async function flush() {
-  if (flushing) return;
+  if (flushing) { flushAgain = true; return; }
   if (!navigator.onLine) { scheduleRetry(); return; }
   flushing = true;
+  flushAgain = false;
   try {
     const entries = await outboxDb.all();          // key order = queue order
     if (!entries.length) {
@@ -91,6 +94,7 @@ export async function flush() {
     onRemote();                                     // pending dots vanish
   } finally {
     flushing = false;
+    if (flushAgain) { flushAgain = false; flush(); }
   }
 }
 
