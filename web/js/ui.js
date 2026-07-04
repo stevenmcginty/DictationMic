@@ -7,7 +7,7 @@ import {
   imageBodyToFile, photoTitle,
 } from "./imgnote.js";
 import {
-  isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody,
+  isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody, SHEET_EXT_RE,
 } from "./filenote.js";
 
 const $ = id => document.getElementById(id);
@@ -229,7 +229,7 @@ export class App {
       }
       // spreadsheets are never editable text — they stay real file notes so
       // Open can hand them to Excel (same rule as the pill's dropnotes.py)
-      const sheet = /\.(csv|tsv)$/i.test(f.name || "") || f.type === "text/csv";
+      const sheet = SHEET_EXT_RE.test(f.name || "") || f.type === "text/csv";
       const texty = !sheet && (f.type.startsWith("text/")
         || /\.(txt|md|markdown|log|json|xml|ya?ml|ini|py|js|ts|html|css)$/i.test(f.name || ""));
       if (texty && f.size <= 200 * 1024) {
@@ -522,6 +522,21 @@ export class App {
       }
     });
 
+    // real-file helpers shared by Share's desktop fallback, Open, and Download
+    const triggerDownload = file => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(file);
+      a.download = file.name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+    };
+    const openInTab = blob => {
+      const url = URL.createObjectURL(blob);
+      const win = open(url, "_blank");
+      if (!win) this.toast("Pop-up blocked — use Share instead");
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    };
+
     $("shareBtn").addEventListener("click", async () => {
       const n = this.notes.find(x => x.id === this.activeId);
       if (!n) return;
@@ -533,36 +548,37 @@ export class App {
         try { await navigator.share({ files: [file], title: n.title }); }
         catch { /* user closed the share sheet */ }
       } else {
-        const a = document.createElement("a");     // desktop: download instead
-        a.href = URL.createObjectURL(file);
-        a.download = file.name;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+        triggerDownload(file);       // desktop: download instead
       }
     });
 
     // file notes: Open hands the file to the device, never a viewer in
-    // here. PDFs and images go to a new tab (browsers render those);
-    // everything else — CSVs, Word docs, … — downloads under its real
-    // name so the default app (Excel and friends) opens it.
+    // here. PDFs, images and spreadsheets go to a new tab (browsers render
+    // those — CSV/TSV as plain text, since there's no built-in table
+    // viewer); everything else — Word docs and friends — downloads under
+    // its real name so the default app opens it.
     $("fileOpenBtn").addEventListener("click", () => {
       const n = this.notes.find(x => x.id === this.activeId);
       if (!n || !isFileBody(n.body)) return;
       const f = fileMeta(n.body);
       const file = fileBodyToFile(n.body);
+      const sheet = SHEET_EXT_RE.test(f.name) || f.mime === "text/csv";
       if (f.mime === "application/pdf" || f.mime.startsWith("image/")) {
-        const url = URL.createObjectURL(file);
-        const win = open(url, "_blank");
-        if (!win) this.toast("Pop-up blocked — use Share instead");
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
-        return;
+        return openInTab(file);
       }
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(file);
-      a.download = file.name;
-      a.click();
+      if (sheet) {
+        return openInTab(new Blob([file], { type: "text/plain;charset=utf-8" }));
+      }
+      triggerDownload(file);
       this.toast(`${file.name} is in your Downloads — it opens in your usual app`);
-      setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+    });
+
+    $("fileDownloadBtn").addEventListener("click", () => {
+      const n = this.notes.find(x => x.id === this.activeId);
+      if (!n || !isFileBody(n.body)) return;
+      const file = fileBodyToFile(n.body);
+      triggerDownload(file);
+      this.toast(`${file.name} is in your Downloads`);
     });
 
     $("deleteBtn").addEventListener("click", () => {

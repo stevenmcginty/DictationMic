@@ -10,6 +10,10 @@ export const MAX_FILE_BYTES = 7 * 1024 * 1024;   // b64 of 7 MB ≈ 9.4 MB,
 
 const FILE_BODY_RE = /^data:([\w.+-]+\/[\w.+-]+);name=([^;,]*);base64,/;
 
+// Spreadsheets stay real file notes (never editable text) and open as a
+// plain-text preview rather than downloading — same rule everywhere it's used.
+export const SHEET_EXT_RE = /\.(csv|tsv)$/i;
+
 export function isFileBody(body) {
   return typeof body === "string" && FILE_BODY_RE.test(body.slice(0, 400));
 }
