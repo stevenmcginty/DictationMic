@@ -90,7 +90,7 @@ if (location.protocol === "file:") {
         <img id="noteImage" alt="Image note">
       </div>
       <div class="note-file-wrap" id="noteFileWrap" hidden>
-        <div class="file-card">
+        <div class="file-card" draggable="true">
           <span class="file-badge" id="noteFileBadge">FILE</span>
           <div class="file-info">
             <span class="file-name" id="noteFileName"></span>
@@ -166,16 +166,6 @@ if (location.protocol === "file:") {
     <strong>Drop to save</strong>
     <span>files, images &amp; text become new notes</span>
   </div>
-</div>
-
-<!-- in-app file viewer (CSVs as a table, text files as text) -->
-<div class="file-viewer" id="fileViewer" hidden>
-  <div class="file-viewer-bar">
-    <span class="file-badge" id="viewerBadge">FILE</span>
-    <span class="file-viewer-name" id="viewerName"></span>
-    <button class="capsule ghost" id="viewerCloseBtn" aria-label="Close viewer">Close</button>
-  </div>
-  <div class="file-viewer-body" id="viewerBody"></div>
 </div>
 
 <div class="toast mono" id="toast" role="status"></div>

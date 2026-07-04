@@ -228,6 +228,7 @@ SOFT_CUT_S = 0.55                  # mid-speech dip that's enough to split at...
 SOFT_CUT_AFTER_S = 7.0             # ...once the phrase is already this long
 MIN_VOICED_BLOCKS = 2              # ~130 ms of speech before a phrase counts
 MAX_PHRASE_S = 18                  # force a cut on very long phrases
+MIC_MAX_BOOST = 12.0               # software mic gain cap (~ +21 dB)
 
 class LiveRecorder:
     """Streams the mic and emits ("audio", phrase) items on natural pauses."""
@@ -241,11 +242,17 @@ class LiveRecorder:
         self._voiced_blocks = 0
         self._noise_floor = 0.004
         self._recent_voiced = deque(maxlen=2)
+        self._gain = 1.0
+        self._peaks = deque(maxlen=int(6 * SAMPLE_RATE / BLOCK))  # ~6s of peaks
 
     def start(self):
         self._pending = []
         self._voiced_blocks = 0
         self._recent_voiced.clear()
+        self._peaks.clear()
+        # _gain is deliberately NOT reset: the mic doesn't get louder between
+        # sessions, and re-learning from 1.0 would swallow the first quiet
+        # words of every dictation
         self.level = 0.0
         self.last_voice_time = time.time()
         self.stream = sd.InputStream(
@@ -267,7 +274,13 @@ class LiveRecorder:
             self._noise_floor = 0.995 * self._noise_floor + 0.005 * rms
         else:
             self._noise_floor = 0.9995 * self._noise_floor + 0.0005 * rms
-        threshold = max(0.008, self._noise_floor * 3.5)
+        # the mic-boost gain divides the absolute floor: on a quiet mic (or
+        # a Windows input level someone left low) soft speech used to fall
+        # under the fixed 0.008 gate and get thrown away as silence — you
+        # had to shout. Once the AGC learns the mic is quiet, the bar drops
+        # with it; noisy rooms are still handled by the 3.5x relative gate,
+        # which compares raw signal to raw floor and never sees the gain.
+        threshold = max(0.008 / self._gain, self._noise_floor * 3.5)
 
         voiced = rms > threshold
         self._recent_voiced.append(voiced)
@@ -277,7 +290,25 @@ class LiveRecorder:
 
         self.level = 0.55 * self.level + 0.45 * min(1.0, (rms / max(threshold, 1e-4)) * 0.35)
 
-        self._pending.append(block)
+        # software mic boost for Whisper's benefit: aim the loudest recent
+        # audio at a healthy peak so quiet mics transcribe like loud ones.
+        # Adapt ONLY while the window holds real signal (well clear of the
+        # noise floor) — during silence the gain HOLDS, so a thinking pause
+        # can't wind it to max and drop the gate onto amplified room noise.
+        raw_peak = float(np.max(np.abs(block))) if block.size else 0.0
+        self._peaks.append(raw_peak)
+        # learn only from blocks that were clearly signal (well above the
+        # raw noise floor): silence never dilutes the estimate, so a healthy
+        # mic keeps gain ~1 and behaves exactly as before this boost existed
+        sig = [p for p in self._peaks if p > self._noise_floor * 6]
+        if len(sig) >= 8:
+            loud = sorted(sig)[int(len(sig) * 0.9)]
+            want = min(MIC_MAX_BOOST, max(1.0, 0.40 / max(loud, 1e-5)))
+            self._gain += 0.1 * (want - self._gain)
+        if raw_peak * self._gain > 0.98:         # never clip — duck instantly
+            self._gain = 0.98 / max(raw_peak, 1e-5)
+
+        self._pending.append(block * self._gain)
         if voiced:
             self._voiced_blocks += 1
 
@@ -320,7 +351,8 @@ class LiveRecorder:
         self._pending = self._pending[:cut]
         self._emit()
         self._pending = carry
-        threshold = max(0.008, self._noise_floor * 3.5)
+        # carried blocks are gain-boosted, the floor tracks the raw signal
+        threshold = max(0.008, self._noise_floor * 3.5 * self._gain)
         self._voiced_blocks = sum(
             1 for b in carry if float(np.sqrt(np.mean(b ** 2))) > threshold)
 
@@ -456,6 +488,7 @@ EDGE_IDLE = (255, 255, 255, 30)          # hairline rim
 EDGE_HOVER = (255, 255, 255, 58)
 EDGE_DIM = (255, 255, 255, 16)
 LIME = (163, 230, 53)                    # the voice meter
+ICE = (86, 197, 255)                     # "caught it" flash after a drop/paste
 NUB_IDLE = (94, 100, 108, 255)           # sleeping meter dots
 NUB_HOVER = (130, 138, 148, 255)
 NUB_DIM = (64, 69, 76, 255)
@@ -543,7 +576,9 @@ class PillRenderer:
         if dim:
             body, nub = self._body("dim", EDGE_DIM).copy(), NUB_DIM
         elif hover:
-            body, nub = self._body("hover", EDGE_HOVER).copy(), NUB_HOVER
+            # lime rim the moment the pointer touches the pill: it's armed —
+            # a click talks, Ctrl+V / middle-click pastes, a drag drops in
+            body, nub = self._body("hover", LIME + (120,)).copy(), NUB_HOVER
         else:
             body, nub = self._body("idle", EDGE_IDLE).copy(), NUB_IDLE
         self._bars(ImageDraw.Draw(body), [0.0] * self.nbars, nub)
@@ -593,6 +628,25 @@ class PillRenderer:
                             radius=shaft / 2, fill=lime)
         return body
 
+    def frame_flash(self):
+        """A completely different colour the instant a drop/paste lands —
+        full ice-blue ring + tick, so there's no doubt the pill caught it
+        (the lime states all mean voice/drop-armed; blue means 'saved')."""
+        body = self._body("flash", ICE + (235,)).copy()
+        d = ImageDraw.Draw(body)
+        p = self.pad
+        d.rounded_rectangle([p, p, self.sw - p, self.sh - p],
+                            radius=(self.sh - 2 * p) / 2,
+                            outline=ICE + (235,), width=self.edge_w * 2)
+        cx, cy = self.sw / 2, self.sh / 2
+        u = self.sh * 0.16                       # tick glyph scale
+        w = max(2.0, self.sh * 0.075)
+        ice = ICE + (255,)
+        d.line([(cx - 1.6 * u, cy), (cx - 0.4 * u, cy + u),
+                (cx + 1.7 * u, cy - 1.1 * u)], fill=ice, width=int(w),
+               joint="curve")
+        return body
+
     def frame_downloading(self, frac):
         body = self._body("dim", EDGE_DIM).copy()
         d = ImageDraw.Draw(body)
@@ -620,6 +674,11 @@ class PillRenderer:
         if "drop" not in self._static:
             self._static["drop"] = self._finish(self.frame_drop())
         return self._static["drop"]
+
+    def flash(self):
+        if "flash" not in self._static:
+            self._static["flash"] = self._finish(self.frame_flash())
+        return self._static["flash"]
 
     def listening(self, vals, pulse):
         return self._finish(self.frame_listening(vals, pulse))
@@ -857,6 +916,7 @@ class DictationApp:
         self.toast = None
         self.tooltip = None
         self._tooltip_job = None
+        self.flash_until = 0.0         # pill shows the blue "caught it" ring
         self._capturing = False
         self._stop_when_ready = False
 
@@ -1285,6 +1345,8 @@ class DictationApp:
                 self.state = IDLE
             self.beep(300, 120)
             self.show_toast(f"Mic error: {payload}", 3000)
+        elif name == "flash":
+            self.flash_until = time.time() + 1.1
         elif name == "toast":
             self.show_toast(payload, 3500)
         elif name == "sync_status":
@@ -1464,6 +1526,7 @@ class DictationApp:
         if real_file:
             suffix = " (file kept — see My files)" + suffix
         preview = title[:44] + ("…" if len(title) > 44 else "")
+        self.events.put(("flash", None))   # blue ring: the pill caught it
         self.events.put(("toast", f"Saved to notes: {preview}{suffix}"))
 
     def _ingest_paths(self, paths):
@@ -1602,6 +1665,13 @@ class DictationApp:
         audio = decode_audio(BytesIO(audio_bytes), sampling_rate=SAMPLE_RATE)
         if len(audio) < SAMPLE_RATE * 0.3:
             return ""
+        # quiet phone recordings (soft speaker, phone at arm's length) get
+        # normalised up before Whisper hears them — same cure as the live
+        # mic's software boost. Judged on the 95th percentile, not the max,
+        # so one handling thump can't veto the boost for the whole note.
+        body = float(np.percentile(np.abs(audio), 95))
+        if 0 < body < 0.30:
+            audio = np.clip(audio * min(MIC_MAX_BOOST, 0.30 / body), -1.0, 1.0)
         return t.transcribe(audio, long=True) or ""
 
     def _voice_transcriber(self):
@@ -1882,6 +1952,10 @@ class DictationApp:
         r = self.renderer
         if self.drop_hover:                 # a drag is over us — outrank all
             self._photo = r.drop()
+            self.label.configure(image=self._photo)
+            return
+        if time.time() < self.flash_until:  # just caught a drop/paste
+            self._photo = r.flash()
             self.label.configure(image=self._photo)
             return
         if self.state in (LISTENING, STARTING):

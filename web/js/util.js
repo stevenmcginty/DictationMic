@@ -31,6 +31,25 @@ export function relTime(ms) {
     (d.getFullYear() !== new Date().getFullYear() ? ` ${d.getFullYear()}` : "");
 }
 
+// Day headings the notes list groups under. dayKey collapses a timestamp
+// to its calendar day; dayHeading renders it as "Tuesday 1st of June"
+// (year added only when it isn't this year's).
+export function dayKey(ms) {
+  return new Date(ms).toDateString();
+}
+
+export function dayHeading(ms) {
+  const d = new Date(ms);
+  const n = d.getDate();
+  const suffix = n % 10 === 1 && n !== 11 ? "st"
+    : n % 10 === 2 && n !== 12 ? "nd"
+    : n % 10 === 3 && n !== 13 ? "rd" : "th";
+  const weekday = d.toLocaleDateString("en-GB", { weekday: "long" });
+  const month = d.toLocaleDateString("en-GB", { month: "long" });
+  const year = d.getFullYear() !== new Date().getFullYear() ? ` ${d.getFullYear()}` : "";
+  return `${weekday} ${n}${suffix} of ${month}${year}`;
+}
+
 export function debounce(fn, ms) {
   let t = null;
   const wrapped = (...args) => {

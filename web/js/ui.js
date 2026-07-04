@@ -1,14 +1,13 @@
 // All DOM logic for the notes app. Views: list / note / mic (routes via
 // location.hash, panes toggled with body classes — see styles.css).
 
-import { relTime, debounce, noteTitleFrom } from "./util.js";
+import { relTime, dayKey, dayHeading, debounce, noteTitleFrom } from "./util.js";
 import {
   isImageBody, imageKb, fileToImageBody, imageBodyToPngBlob,
   imageBodyToFile, photoTitle,
 } from "./imgnote.js";
 import {
   isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody,
-  isViewableText, fileBodyToText, parseCsv,
 } from "./filenote.js";
 
 const $ = id => document.getElementById(id);
@@ -77,11 +76,22 @@ export class App {
     const pending = this.adapter.pendingIds();
 
     list.textContent = "";
-    shown.forEach((n, i) => {
+    let lastDay = null;                 // notes are newest-first, so each
+    shown.forEach((n, i) => {           // day's notes sit together already
+      const day = n.updatedAt ? dayKey(n.updatedAt) : lastDay;
+      if (day !== lastDay) {
+        lastDay = day;
+        const head = document.createElement("li");
+        head.className = "day-head";
+        head.textContent = dayHeading(n.updatedAt);
+        list.append(head);
+      }
       const li = document.createElement("li");
       li.className = "note-row" + (n.id === this.activeId ? " active" : "");
       li.dataset.id = n.id;
       li.tabIndex = 0;
+      // image/file rows can be dragged straight out of the list as real files
+      if (isImageBody(n.body) || isFileBody(n.body)) li.draggable = true;
       li.style.animationDelay = `${Math.min(i, 14) * 12}ms`;
 
       const top = document.createElement("div");
@@ -217,8 +227,11 @@ export class App {
         await this.saveImageFiles([f]);
         continue;
       }
-      const texty = f.type.startsWith("text/")
-        || /\.(txt|md|markdown|csv|log|json|xml|ya?ml|ini|py|js|ts|html|css)$/i.test(f.name || "");
+      // spreadsheets are never editable text — they stay real file notes so
+      // Open can hand them to Excel (same rule as the pill's dropnotes.py)
+      const sheet = /\.(csv|tsv)$/i.test(f.name || "") || f.type === "text/csv";
+      const texty = !sheet && (f.type.startsWith("text/")
+        || /\.(txt|md|markdown|log|json|xml|ya?ml|ini|py|js|ts|html|css)$/i.test(f.name || ""));
       if (texty && f.size <= 200 * 1024) {
         await this.saveDroppedTextFile(f);
         continue;
@@ -285,52 +298,6 @@ export class App {
     $("shareBtn").hidden = !(image || file);
     $("copyBtn").hidden = file;                 // nothing sensible to copy
     this._renderMeta(n);
-  }
-
-  _openFileViewer(n) {
-    const f = fileMeta(n.body);
-    let text;
-    try { text = fileBodyToText(n.body); }
-    catch { this.toast("Couldn't read that file"); return; }
-    $("viewerBadge").textContent = f.ext || "FILE";
-    $("viewerName").textContent = f.name;
-    const box = $("viewerBody");
-    box.textContent = "";
-    if (f.ext === "CSV" || f.ext === "TSV") {
-      const rows = f.ext === "TSV"
-        ? text.split("\n").map(r => r.replace(/\r$/, "").split("\t"))
-              .filter(r => r.some(c => c !== "")).slice(0, 1000)
-        : parseCsv(text);
-      const table = document.createElement("table");
-      table.className = "viewer-table mono";
-      rows.forEach((r, i) => {
-        const tr = document.createElement("tr");
-        for (const cell of r) {
-          const td = document.createElement(i === 0 ? "th" : "td");
-          td.textContent = cell;
-          tr.append(td);
-        }
-        table.append(tr);
-      });
-      box.append(table);
-      if (rows.length >= 1000) {
-        const more = document.createElement("p");
-        more.className = "viewer-more mono";
-        more.textContent = "Showing the first 1000 rows — Share the file to see it all";
-        box.append(more);
-      }
-    } else {
-      const pre = document.createElement("pre");
-      pre.className = "viewer-pre mono";
-      pre.textContent = text;
-      box.append(pre);
-    }
-    $("fileViewer").hidden = false;
-  }
-
-  _closeFileViewer() {
-    $("fileViewer").hidden = true;
-    $("viewerBody").textContent = "";   // drop the big DOM
   }
 
   _renderMeta(n) {
@@ -574,20 +541,28 @@ export class App {
       }
     });
 
-    // file notes: Open = in-app viewer for CSVs/text (a blob tab would just
-    // download those), new tab for PDFs & images (browsers render them)
+    // file notes: Open hands the file to the device, never a viewer in
+    // here. PDFs and images go to a new tab (browsers render those);
+    // everything else — CSVs, Word docs, … — downloads under its real
+    // name so the default app (Excel and friends) opens it.
     $("fileOpenBtn").addEventListener("click", () => {
       const n = this.notes.find(x => x.id === this.activeId);
       if (!n || !isFileBody(n.body)) return;
-      if (isViewableText(fileMeta(n.body))) { this._openFileViewer(n); return; }
-      const url = URL.createObjectURL(fileBodyToFile(n.body));
-      const win = open(url, "_blank");
-      if (!win) this.toast("Pop-up blocked — use Share instead");
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-    });
-    $("viewerCloseBtn").addEventListener("click", () => this._closeFileViewer());
-    addEventListener("keydown", e => {
-      if (e.key === "Escape" && !$("fileViewer").hidden) this._closeFileViewer();
+      const f = fileMeta(n.body);
+      const file = fileBodyToFile(n.body);
+      if (f.mime === "application/pdf" || f.mime.startsWith("image/")) {
+        const url = URL.createObjectURL(file);
+        const win = open(url, "_blank");
+        if (!win) this.toast("Pop-up blocked — use Share instead");
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        return;
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(file);
+      a.download = file.name;
+      a.click();
+      this.toast(`${file.name} is in your Downloads — it opens in your usual app`);
+      setTimeout(() => URL.revokeObjectURL(a.href), 30000);
     });
 
     $("deleteBtn").addEventListener("click", () => {
@@ -619,6 +594,44 @@ export class App {
       e.target.value = "";
     });
 
+    // dragging a note OUT of the app: hand the other side a real file,
+    // never the base64 body. DownloadURL means dropping on the desktop or
+    // Explorer writes the actual image/document; the text flavour is just
+    // the filename, so a terminal or chat gets one line, not base64 soup.
+    const dragOut = (e, n) => {
+      if (!n) return;
+      let file;
+      if (isImageBody(n.body)) file = imageBodyToFile(n.body, n.title);
+      else if (isFileBody(n.body)) file = fileBodyToFile(n.body);
+      else return;                        // text notes keep the normal drag
+      if (this._dragUrl) URL.revokeObjectURL(this._dragUrl);
+      const url = this._dragUrl = URL.createObjectURL(file);
+      e.dataTransfer.clearData();
+      e.dataTransfer.setData("DownloadURL", `${file.type}:${file.name}:${url}`);
+      e.dataTransfer.setData("text/plain", file.name);
+      e.dataTransfer.effectAllowed = "copy";
+    };
+    // only our own drag-outs carry the DownloadURL flavour — checking the
+    // drag itself (not a flag) can't get stuck if a mid-drag list re-render
+    // eats the dragend event
+    const ownDrag = dt =>
+      dt && [...dt.types].some(t => t.toLowerCase() === "downloadurl");
+    $("noteList").addEventListener("dragstart", e => {
+      const li = e.target.closest(".note-row");
+      if (li) dragOut(e, this.notes.find(n => n.id === li.dataset.id));
+    });
+    for (const id of ["noteImage", "noteFileWrap"]) {
+      $(id).addEventListener("dragstart", e =>
+        dragOut(e, this.notes.find(n => n.id === this.activeId)));
+    }
+    addEventListener("dragend", () => {
+      if (this._dragUrl) {                // let a slow drop finish writing
+        const u = this._dragUrl;
+        this._dragUrl = null;
+        setTimeout(() => URL.revokeObjectURL(u), 30000);
+      }
+    });
+
     // paste anywhere: files/images always become new notes; text becomes one
     // too unless you're typing in a box (that stays a normal paste)
     document.addEventListener("paste", e => {
@@ -641,6 +654,7 @@ export class App {
     this._dragDepth = 0;
     const hint = show => { $("dropHint").hidden = !show; };
     addEventListener("dragenter", e => {
+      if (ownDrag(e.dataTransfer)) return;   // one of our notes on its way out
       const types = e.dataTransfer ? [...e.dataTransfer.types] : [];
       if (types.includes("Files") || types.includes("text/plain")) {
         e.preventDefault();
@@ -657,7 +671,8 @@ export class App {
       this._dragDepth = 0;
       hint(false);
       const dt = e.dataTransfer;
-      if (!dt) return;
+      if (!dt || ownDrag(dt)) return;     // don't re-save a note onto itself
+
       const files = [...dt.files];
       if (files.length) {
         await this.saveAnyFiles(files);
