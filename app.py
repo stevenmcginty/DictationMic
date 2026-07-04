@@ -459,6 +459,12 @@ def mod_family(name):
             return fam
     return None
 
+# Keys whose only "side-effect" is flipping a sticky Windows state. If one of
+# these is chosen as the talk key we suppress it at the hook so a press ONLY
+# starts/stops dictation — otherwise every tap would also toggle Caps/Num/
+# Scroll Lock (leaving you typing in CAPITALS) or Insert (overtype mode).
+SIDE_EFFECT_KEYS = {"caps lock", "num lock", "scroll lock", "insert"}
+
 def wait_modifiers_up(timeout=30.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -919,6 +925,7 @@ class DictationApp:
         self.flash_until = 0.0         # pill shows the blue "caught it" ring
         self._capturing = False
         self._stop_when_ready = False
+        self._suppress_removers = []   # per-key hooks that swallow OS side-effects
 
         self.label.bind("<ButtonPress-1>", self.on_press)
         self.label.bind("<B1-Motion>", self.on_motion)
@@ -987,6 +994,7 @@ class DictationApp:
         """
         self._mod_names, self._mod_sc = set(), set()
         self._direct_names, self._direct_sc = set(), set()
+        self._suppress_keys = set()   # direct keys whose OS side-effect we block
         for hk in self.settings["hotkeys"]:
             name = hk.get("name") if isinstance(hk, dict) else hk
             sc = hk.get("sc") if isinstance(hk, dict) else None
@@ -1003,6 +1011,14 @@ class DictationApp:
             else:
                 if name:
                     self._direct_names.add(name)
+                    # A suppressed key runs its handler INLINE on the hook's
+                    # listening thread; a normal direct key runs it on the
+                    # processing thread. Keep a side-effect key the SOLE direct
+                    # hotkey (the capture UI always writes a single-key list) —
+                    # pairing it with another direct key via a hand-edited
+                    # settings.json would race the shared key_is_down state.
+                    if name in SIDE_EFFECT_KEYS:
+                        self._suppress_keys.add(name)
                 if sc:
                     self._direct_sc.add(sc)
                 elif name:
@@ -1080,11 +1096,44 @@ class DictationApp:
         try:
             self._refresh_hotkey_codes()
             keyboard.hook(self._global_kb, suppress=False)
+            self._sync_suppressed_keys()
             dbg("keyboard.hook installed")
         except Exception as ex:
             dbg(f"keyboard.hook FAILED: {ex!r}")
             self.events.put(("toast", "Couldn't attach the keyboard hook — "
                                       "hotkeys won't work, but clicking will"))
+
+    def _sync_suppressed_keys(self):
+        """Attach a dedicated suppressing hook for each talk key that would
+        otherwise flip a sticky Windows state (Caps/Num/Scroll Lock, Insert).
+        The hook forwards the event to the SAME brain (`_global_kb`, which
+        already treats it as an instant direct key) and returns False so the
+        OS side-effect is swallowed — the key does nothing but talk.
+
+        If the suppressing hook can't attach, the key still works through the
+        normal (unsuppressed) direct path — it just also toggles its state."""
+        for rem in self._suppress_removers:
+            try:
+                rem()
+            except Exception:
+                pass
+        self._suppress_removers = []
+        for name in getattr(self, "_suppress_keys", ()):
+            try:
+                rem = keyboard.hook_key(name, self._suppress_hook, suppress=True)
+                self._suppress_removers.append(rem)
+                dbg(f"suppressing side-effect of talk key: {name}")
+            except Exception as ex:
+                dbg(f"couldn't suppress {name}: {ex!r}")
+
+    def _suppress_hook(self, e):
+        """Runs INLINE on the hook thread with the keystroke held pending, so
+        it must stay fast and never touch Tk (same rules as _global_kb)."""
+        try:
+            self._global_kb(e)
+        except Exception:
+            pass
+        return False    # block the Caps/Num/Scroll Lock / Insert state flip
 
     def start_capture(self):
         if self._capturing:
@@ -1360,6 +1409,7 @@ class DictationApp:
                 self.settings["hotkeys"] = [payload]
                 save_settings(self.settings)
                 self._refresh_hotkey_codes()
+                self._sync_suppressed_keys()
                 self.show_toast("Your talk key is now " + self.hotkey_label()
                                 + " — tap it and speak", 3500)
         elif name == "session_done":
