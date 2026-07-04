@@ -296,6 +296,7 @@ export class App {
       $("noteFileSize").textContent = fmtBytes(f.bytes);
     }
     $("shareBtn").hidden = !(image || file);
+    $("assetActions").hidden = !(image || file);  // Open/Download: every asset
     $("copyBtn").hidden = file;                 // nothing sensible to copy
     this._renderMeta(n);
   }
@@ -552,14 +553,18 @@ export class App {
       }
     });
 
-    // file notes: Open hands the file to the device, never a viewer in
-    // here. PDFs, images and spreadsheets go to a new tab (browsers render
-    // those — CSV/TSV as plain text, since there's no built-in table
-    // viewer); everything else — Word docs and friends — downloads under
-    // its real name so the default app opens it.
+    // every non-text asset — image, PDF, spreadsheet, zipped folder, any
+    // other document — gets the same Open/Download pair. Open hands the
+    // asset to the device, never a viewer in here: images, PDFs and
+    // spreadsheets go to a new tab (browsers render those — CSV/TSV as
+    // plain text, since there's no built-in table viewer); everything
+    // else — Word docs and friends — downloads under its real name so the
+    // default app opens it.
     $("fileOpenBtn").addEventListener("click", () => {
       const n = this.notes.find(x => x.id === this.activeId);
-      if (!n || !isFileBody(n.body)) return;
+      if (!n) return;
+      if (isImageBody(n.body)) return openInTab(imageBodyToFile(n.body, n.title));
+      if (!isFileBody(n.body)) return;
       const f = fileMeta(n.body);
       const file = fileBodyToFile(n.body);
       const sheet = SHEET_EXT_RE.test(f.name) || f.mime === "text/csv";
@@ -575,8 +580,11 @@ export class App {
 
     $("fileDownloadBtn").addEventListener("click", () => {
       const n = this.notes.find(x => x.id === this.activeId);
-      if (!n || !isFileBody(n.body)) return;
-      const file = fileBodyToFile(n.body);
+      if (!n) return;
+      let file;
+      if (isImageBody(n.body)) file = imageBodyToFile(n.body, n.title);
+      else if (isFileBody(n.body)) file = fileBodyToFile(n.body);
+      else return;
       triggerDownload(file);
       this.toast(`${file.name} is in your Downloads`);
     });

@@ -25,6 +25,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 
 from PIL import Image, ImageOps
 
@@ -34,6 +35,8 @@ MAX_SOURCE_BYTES = 40 * 1024 * 1024
 MAX_TEXT_BYTES = 200 * 1024
 MAX_FILE_BYTES = 7 * 1024 * 1024    # file notes (= filenote.js); b64 of 7 MB
                                     # ≈ 9.4 MB, under RTDB's 10 MB string cap
+MAX_ZIP_SOURCE_BYTES = 150 * 1024 * 1024   # walk-and-sum guard before we
+                                           # bother zipping a dropped folder
 LADDER = ((1600, 80), (1600, 65), (1280, 60), (1024, 55), (800, 50))
 
 PASSTHROUGH_MIMES = ("image/png", "image/jpeg", "image/webp", "image/gif")
@@ -205,10 +208,50 @@ def file_note_from_file(path):
     return (stem[:60] or name[:60]), body
 
 
+def zip_note_from_dir(path):
+    """A dropped folder -> (title, data:application/zip;name=…;base64 body).
+    Zips everything inside (recursively) in memory and rides the same file-
+    note pipe as any other document. Refuses folders clearly too big to
+    bother with, and again if compression didn't bring it under the cap."""
+    name = os.path.basename(path.rstrip("\\/")) or "folder"
+    total, entries = 0, []
+    for root, _dirs, files in os.walk(path):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                continue
+            if total > MAX_ZIP_SOURCE_BYTES:
+                raise ValueError(
+                    f"{name} is over {MAX_ZIP_SOURCE_BYTES // (1024 * 1024)} "
+                    "MB — too big to zip")
+            entries.append((fp, os.path.relpath(fp, path)))
+    if not entries:
+        raise ValueError(name + " is empty")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fp, arcname in entries:
+            try:
+                zf.write(fp, arcname)
+            except OSError:
+                continue        # unreadable file mid-walk — skip, keep going
+    raw = buf.getvalue()
+    if len(raw) > MAX_FILE_BYTES:
+        raise ValueError(f"{name}.zip is {len(raw) / (1024 * 1024):.1f} MB "
+                         "even zipped — files up to 7 MB can sync")
+    body = "data:application/zip;name=%s;base64,%s" % (
+        urllib.parse.quote(name + ".zip"), base64.b64encode(raw).decode("ascii"))
+    return name[:60], body
+
+
 def note_from_path(path):
-    """(title, body) for any dropped file. Images become image notes, text
-    stays an editable text note, video/audio are refused, and every other
-    document becomes a file note. ValueError = friendly refusal."""
+    """(title, body) for any dropped file or folder. Images become image
+    notes, text stays an editable text note, video/audio are refused, a
+    folder gets zipped, and every other document becomes a file note.
+    ValueError = friendly refusal."""
+    if os.path.isdir(path):
+        return zip_note_from_dir(path)
     if not os.path.isfile(path):
         raise ValueError("Can't find " + os.path.basename(path))
     ext = os.path.splitext(path)[1].lower()
