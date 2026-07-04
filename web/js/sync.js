@@ -129,23 +129,34 @@ async function handle(kind, ev) {
   try { msg = JSON.parse(ev.data); } catch { return; }
   const path = (msg?.path || "/").replace(/^\/+|\/+$/g, "");
   if (path === "") {
-    await reconcile(msg.data || {});
+    // "put" at the root is the whole snapshot; "patch" names only the notes
+    // that changed, and each carries only its changed fields — so merge those.
+    if (kind === "patch") {
+      for (const [id, part] of Object.entries(msg.data || {})) await applyPatch(id, part);
+    } else {
+      await reconcile(msg.data || {});
+    }
   } else {
     const id = path.split("/")[0];
     if (path.includes("/")) {
-      // sub-field patch: re-fetch the whole record once
-      try {
-        const token = await idToken();
-        const res = await fetch(notesUrl(id, token));
-        if (res.ok) await applyOne(id, await res.json());
-      } catch { /* next snapshot heals it */ }
+      await refetch(id);                  // a single field moved: re-pull the whole note
+    } else if (kind === "patch") {
+      await applyPatch(id, msg.data);      // changed fields only — never the full note
     } else {
-      await applyOne(id, msg.data);
+      await applyOne(id, msg.data);        // "put": the complete record (or a delete)
     }
   }
   lastSync = Date.now();
   setState("ok");
   onRemote();
+}
+
+async function refetch(id) {
+  try {
+    const token = await idToken();
+    const res = await fetch(notesUrl(id, token));
+    if (res.ok) await applyOne(id, await res.json());
+  } catch { /* next snapshot heals it */ }
 }
 
 async function applyOne(id, record) {
@@ -168,6 +179,29 @@ async function applyOne(id, record) {
     title: record.title || "Note",
     body: record.body || "",
     createdAt: Number(record.createdAt) || rev,
+    updatedAt: rev,
+    syncedRev: rev,
+  });
+}
+
+// A Realtime-Database "patch" hands us only the fields that changed. Fold them
+// onto the note we already hold, so renaming a note never drops its body and
+// editing a body never drops its title. A patch for a note we've never seen —
+// or a delete — can't be merged, so fetch/handle the whole record instead.
+async function applyPatch(id, part) {
+  if (part == null) return;
+  const pending = await pendingIds();
+  if (pending.has(id)) return;              // our queued intent wins until flushed
+  if (part.deleted) { await applyOne(id, part); return; }
+  const local = await notesDb.get(id);
+  if (!local) { await refetch(id); return; }
+  const rev = Number(part.updatedAt) || 0;
+  if (rev <= (local.syncedRev || 0)) return;             // echo of our own push
+  await notesDb.put({
+    ...local,
+    ...(part.title != null ? { title: part.title } : {}),
+    ...(part.body != null ? { body: part.body } : {}),
+    ...(part.createdAt != null ? { createdAt: Number(part.createdAt) } : {}),
     updatedAt: rev,
     syncedRev: rev,
   });

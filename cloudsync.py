@@ -348,16 +348,23 @@ class CloudSync:
         path = (msg or {}).get("path", "/")
         data = (msg or {}).get("data")
         if path == "/":
-            self._reconcile(data or {})
+            if kind == "patch":
+                # only the notes that changed, each with only its changed fields
+                for nid, part in (data or {}).items():
+                    self._apply_patch(nid, part)
+            else:
+                self._reconcile(data or {})
         else:
             nid = path.strip("/").split("/")[0]
             if "/" in path.strip("/"):
-                # field-level patch — fetch nothing, fold into a full apply
-                # next snapshot; cheap approximation: re-pull this note
+                # field-level patch — re-pull this note whole
                 self._q.put(("remote", ("put", {"path": f"/{nid}",
                                                 "data": self._fetch_note(nid)})))
                 return
-            self._apply_one(nid, data)
+            if kind == "patch":
+                self._apply_patch(nid, data)      # changed fields only
+            else:
+                self._apply_one(nid, data)        # the complete record (or delete)
         self._last_sync = _now_ms()
         self._set_state("ok")
 
@@ -401,6 +408,31 @@ class CloudSync:
             if local_ms >= rev:
                 return                            # LWW: our edit is newer, push wins
         self.store.apply_remote(nid, record)
+
+    def _apply_patch(self, nid, part):
+        """A cloud 'patch' carries only the fields that changed. Fold them onto
+        the note we already have so a rename never wipes the body (and a body
+        edit never wipes the title). A patch for a note we've never seen — or a
+        delete — can't be merged, so fetch/apply the whole record instead."""
+        if not isinstance(part, dict):
+            return
+        if part.get("deleted"):
+            self._apply_one(nid, part)
+            return
+        cur = self.store.get(nid)
+        if cur is None:                          # unknown or locally deleted
+            rec = self._fetch_note(nid)
+            if rec is not None:
+                self._apply_one(nid, rec)
+            return
+        merged = {
+            "title": part.get("title", cur["title"]),
+            "body": part["body"] if "body" in part else cur["body"],
+            "createdAt": part.get("createdAt", cur["createdAt"]),
+            "updatedAt": part.get("updatedAt"),
+            "deleted": False,
+        }
+        self._apply_one(nid, merged)
 
     def _reconcile(self, snapshot):
         seen = set()
