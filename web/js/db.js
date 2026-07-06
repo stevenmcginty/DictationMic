@@ -34,7 +34,13 @@ function tx(store, mode, fn) {
   return openDb().then(db => new Promise((resolve, reject) => {
     const t = db.transaction(store, mode);
     const result = fn(t.objectStore(store));
-    t.oncomplete = () => resolve(result.__value ?? result);
+    // Every fn() hands back a holder ({__value: …}); unwrap it. Crucially a
+    // *miss* (get with no row) must resolve to undefined, not the holder — the
+    // old `result.__value ?? result` leaked the truthy holder object on a miss,
+    // so callers doing `if (!local)` saw an id-less {__value: undefined} and
+    // spread it into put() → "key path did not yield a value" on every patch.
+    t.oncomplete = () =>
+      resolve(result && "__value" in result ? result.__value : result);
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);
   }));
