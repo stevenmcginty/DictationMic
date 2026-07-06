@@ -12,6 +12,9 @@ import {
 
 const $ = id => document.getElementById(id);
 
+// a plain 5-point star — outlined when off, filled gold when on (see styles.css)
+const STAR_SVG = `<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>`;
+
 export class App {
   constructor(adapter, opts = {}) {
     this.adapter = adapter;
@@ -87,7 +90,8 @@ export class App {
         list.append(head);
       }
       const li = document.createElement("li");
-      li.className = "note-row" + (n.id === this.activeId ? " active" : "");
+      li.className = "note-row" + (n.id === this.activeId ? " active" : "")
+        + (n.starred ? " starred" : "");
       li.dataset.id = n.id;
       li.tabIndex = 0;
       // image/file rows can be dragged straight out of the list as real files
@@ -99,6 +103,11 @@ export class App {
       const title = document.createElement("span");
       title.className = "note-row-title";
       title.textContent = n.title;
+      const star = document.createElement("button");
+      star.className = "row-star" + (n.starred ? " on" : "");
+      star.innerHTML = STAR_SVG;
+      star.setAttribute("aria-pressed", n.starred ? "true" : "false");
+      star.setAttribute("aria-label", n.starred ? `Unstar ${n.title}` : `Star ${n.title}`);
       const time = document.createElement("span");
       time.className = "note-row-time";
       time.textContent = relTime(n.updatedAt);
@@ -106,7 +115,7 @@ export class App {
       del.className = "row-del";
       del.textContent = "×";
       del.setAttribute("aria-label", `Delete ${n.title}`);
-      top.append(title, time, del);
+      top.append(title, star, time, del);
 
       const snippet = document.createElement("div");
       snippet.className = "note-row-snippet" + (isImageBody(n.body) ? " has-thumb" : "");
@@ -157,6 +166,41 @@ export class App {
   _markActiveRow() {
     for (const li of $("noteList").children) {
       li.classList.toggle("active", li.dataset.id === this.activeId);
+    }
+  }
+
+  // Toggle the gold star. We flip it in place first (no reorder, instant feel),
+  // then persist; the adapter owns getting it to the other devices.
+  async _toggleStar(id) {
+    const n = this.notes.find(x => x.id === id);
+    if (!n || typeof this.adapter.setStar !== "function") return;
+    const want = !n.starred;
+    n.starred = want;
+    n.starredAt = Date.now();
+    this._markStarRow(id, want);
+    try {
+      const updated = await this.adapter.setStar(id, want);
+      if (updated) {
+        const i = this.notes.findIndex(x => x.id === id);
+        if (i >= 0) this.notes[i] = { ...this.notes[i], ...updated };
+      }
+    } catch (e) {
+      n.starred = !want;                       // put it back
+      this._markStarRow(id, !want);
+      this.toast(e.message || "Couldn't update the star");
+    }
+  }
+
+  _markStarRow(id, on) {
+    const li = [...$("noteList").children].find(el => el.dataset?.id === id);
+    if (!li) return;
+    li.classList.toggle("starred", on);
+    const btn = li.querySelector(".row-star");
+    if (btn) {
+      btn.classList.toggle("on", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      const title = this.notes.find(x => x.id === id)?.title || "";
+      btn.setAttribute("aria-label", (on ? "Unstar " : "Star ") + title);
     }
   }
 
@@ -443,6 +487,13 @@ export class App {
   _bind() {
     // list interactions (the row × arms first — a stray tap can't delete)
     $("noteList").addEventListener("click", e => {
+      const star = e.target.closest(".row-star");
+      if (star) {
+        e.stopPropagation();
+        const id = star.closest(".note-row")?.dataset.id;
+        if (id) this._toggleStar(id);
+        return;
+      }
       const del = e.target.closest(".row-del");
       if (del) {
         e.stopPropagation();
@@ -467,7 +518,8 @@ export class App {
       if (li) location.hash = `#/note/${li.dataset.id}`;
     });
     $("noteList").addEventListener("keydown", e => {
-      if (e.target.closest(".row-del")) return;   // Enter there = the ×
+      // Enter/Space on the × or the star acts on that button, not the row
+      if (e.target.closest(".row-del") || e.target.closest(".row-star")) return;
       const li = e.target.closest(".note-row");
       if (li && (e.key === "Enter" || e.key === " ")) {
         e.preventDefault();

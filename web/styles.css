@@ -27,6 +27,8 @@
   --volt: #B6EE3F;
   --volt-dim: rgba(182, 238, 63, .14);
   --danger: #FF5C48;
+  --gold: #F4C752;
+  --gold-dim: rgba(244, 199, 82, .13);
   --sans: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
   --ease: cubic-bezier(.2, .7, .2, 1);
@@ -234,6 +236,29 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
   font-family: var(--mono); text-transform: uppercase;
 }
 @media (hover: none) { .row-del { opacity: 1; } }
+
+/* star toggle: a quiet outline that appears on hover, a warm gold once on.
+   Sits between the title and the time; when starred it stays lit. */
+.row-star {
+  flex: none;
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  border-radius: 11px;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity .15s, color .15s, background .15s, transform .12s;
+}
+.row-star svg { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linejoin: round; }
+.note-row:hover .row-star, .note-row:focus-within .row-star { opacity: .85; }
+.row-star:hover { color: var(--gold); background: var(--gold-dim); transform: scale(1.1); }
+.row-star.on { opacity: 1; color: var(--gold); }
+.row-star.on svg { fill: var(--gold); stroke: var(--gold); }
+@media (hover: none) { .row-star { opacity: .5; } .row-star.on { opacity: 1; } }
+
+/* a starred note gets a whisper of warmth so it reads as flagged at a glance */
+.note-row.starred { background: linear-gradient(90deg, var(--gold-dim), transparent 62%); }
+.note-row.starred:hover { background: linear-gradient(90deg, var(--gold-dim), var(--surface) 82%); }
+
 .note-row-snippet {
   margin-top: 3px;
   font-size: 13px; line-height: 1.45; color: var(--muted);

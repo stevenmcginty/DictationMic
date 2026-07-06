@@ -47,6 +47,12 @@ export class LocalAdapter {
     return this._fetch(`/api/notes/${id}/title`, { method: "PUT", body: JSON.stringify({ title }) });
   }
 
+  setStar(id, starred) {
+    return this._fetch(`/api/notes/${id}/star`, {
+      method: "PUT", body: JSON.stringify({ starred: !!starred }),
+    });
+  }
+
   remove(id) { return this._fetch(`/api/notes/${id}`, { method: "DELETE" }); }
 
   async status() {

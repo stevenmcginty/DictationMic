@@ -298,7 +298,8 @@ class CloudSync:
     def _push_dirty(self):
         import requests
         dirty = self.store.dirty_ids()
-        if not dirty:
+        star_dirty = self.store.star_dirty_ids()
+        if not dirty and not star_dirty:
             return
         token = self._token()
         if token is None:
@@ -337,6 +338,40 @@ class CloudSync:
                 self.store.drop_entry(nid, tombstone_rev=rev)
             else:
                 self.store.mark_synced(nid, rev)
+            self._last_sync = _now_ms()
+
+        # Stars ride their own PATCH — just {starred, starredAt} — so they merge
+        # into the cloud note without a title/body/updatedAt of their own. The
+        # body push above ran first, so a freshly-made-then-starred note already
+        # exists in the cloud by the time its star lands.
+        for nid in star_dirty:
+            e = self.store.entry(nid)
+            if e is None or e.get("deletedLocally"):
+                self.store.mark_star_synced(nid, _now_ms())   # gone — forget it
+                continue
+            # Never let a star be the FIRST write to a note id: a bare
+            # {starred, starredAt} PATCH would create a title/body-less ghost
+            # node that other devices materialize. Wait until the body has
+            # reached the cloud (dirty cleared, syncedRev set); starDirty stays
+            # set so this retries on a later tick.
+            if e.get("dirty") or int(e.get("syncedRev") or 0) <= 0:
+                continue
+            pushed_at = int(e.get("starredAt") or 0)
+            payload = {"starred": bool(e.get("starred")),
+                       "starredAt": pushed_at, "origin": "laptop"}
+            try:
+                r = requests.patch(self._notes_url(nid, token),
+                                   json=payload, timeout=20)
+            except Exception:
+                self._set_state("offline")
+                return                                    # retry next tick
+            if r.status_code == 401:
+                self._id_token = None
+                return
+            if r.status_code != 200:
+                self.dbg(f"cloudsync star push {nid}: {r.status_code} {r.text[:120]}")
+                continue
+            self.store.mark_star_synced(nid, pushed_at)
             self._last_sync = _now_ms()
         self._set_state("ok")
 
@@ -384,6 +419,15 @@ class CloudSync:
                 self.store.apply_remote(nid, {"deleted": True,
                                               "updatedAt": _now_ms()})
             return
+        # The star is a standalone last-writer-wins field that can move without
+        # bumping updatedAt, so merge it BEFORE the echo guards below (a
+        # reconnect snapshot re-sends an unchanged body with a newer star). For
+        # a brand-new note this is a no-op — apply_remote carries the star in on
+        # create. Deletes never carry a star.
+        if (isinstance(record, dict) and not record.get("deleted")
+                and ("starred" in record or "starredAt" in record)):
+            self.store.set_remote_star(nid, record.get("starred"),
+                                       int(record.get("starredAt") or 0))
         # a phone voice note still waiting for text: queue it for Whisper
         # regardless of the echo guards below — after a restart the record
         # is old news to the file store but the audio still needs doing
@@ -419,6 +463,13 @@ class CloudSync:
         if part.get("deleted"):
             self._apply_one(nid, part)
             return
+        # a star-only patch (no title/body/updatedAt) folds straight in
+        if "starred" in part or "starredAt" in part:
+            self.store.set_remote_star(nid, part.get("starred"),
+                                       int(part.get("starredAt") or 0))
+            if not any(k in part for k in
+                       ("title", "body", "createdAt", "updatedAt")):
+                return
         cur = self.store.get(nid)
         if cur is None:                          # unknown or locally deleted
             rec = self._fetch_note(nid)

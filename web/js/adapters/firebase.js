@@ -106,6 +106,24 @@ export class FirebaseAdapter {
     return { ok: true };
   }
 
+  // Starring rides its own outbox op — no updatedAt bump, so a star never
+  // reorders the list. The local record is the truth the moment it's written;
+  // the op just carries it to the cloud (and on to the laptop) when there's
+  // signal.
+  async setStar(id, starred) {
+    const note = await notesDb.get(id);
+    if (!note) return null;
+    const starredAt = Date.now();
+    Object.assign(note, { starred: !!starred, starredAt });
+    await notesDb.put(note);
+    await outboxDb.add({
+      op: "star", id, starred: !!starred, starredAt, queuedAt: Date.now(),
+    });
+    this._pending.add(id);
+    flush();
+    return note;
+  }
+
   async _queue(note) {
     await outboxDb.add({
       op: "put", id: note.id, queuedAt: Date.now(),

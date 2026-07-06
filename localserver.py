@@ -205,6 +205,10 @@ class LocalServer:
                     if not (body.get("title") or "").strip():
                         return self._send(400, {"error": "need title"})
                     note = store.rename(arg[1], body["title"])
+                elif len(arg) == 3 and arg[2] == "star":     # .../{id}/star
+                    if not isinstance(body.get("starred"), bool):
+                        return self._send(400, {"error": "need starred"})
+                    note = store.set_star(arg[1], body["starred"])
                 else:
                     return self._send(404, {"error": "no such endpoint"})
                 return self._send(200, note) if note else \

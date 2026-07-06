@@ -239,7 +239,7 @@ class NoteStore:
     # ---------------- public snapshots ----------------
 
     def all_notes(self):
-        """Newest first: [{id, title, body, createdAt, updatedAt}]"""
+        """Newest first: [{id, title, body, createdAt, updatedAt, starred, starredAt}]"""
         with self.lock:
             out = []
             for i, e in self.notes.items():
@@ -251,7 +251,9 @@ class NoteStore:
                     continue
                 out.append({"id": i, "title": e["title"], "body": body,
                             "createdAt": e.get("createdAt") or 0,
-                            "updatedAt": int(e.get("mtime", 0) * 1000)})
+                            "updatedAt": int(e.get("mtime", 0) * 1000),
+                            "starred": bool(e.get("starred")),
+                            "starredAt": int(e.get("starredAt") or 0)})
             out.sort(key=lambda n: n["updatedAt"], reverse=True)
             return out
 
@@ -266,7 +268,9 @@ class NoteStore:
                 return None
             return {"id": note_id, "title": e["title"], "body": body,
                     "createdAt": e.get("createdAt") or 0,
-                    "updatedAt": int(e.get("mtime", 0) * 1000)}
+                    "updatedAt": int(e.get("mtime", 0) * 1000),
+                    "starred": bool(e.get("starred")),
+                    "starredAt": int(e.get("starredAt") or 0)}
 
     def entry(self, note_id):
         with self.lock:
@@ -276,6 +280,12 @@ class NoteStore:
     def dirty_ids(self):
         with self.lock:
             return [i for i, e in self.notes.items() if e.get("dirty")]
+
+    def star_dirty_ids(self):
+        """Notes whose star was toggled locally and not yet pushed. Kept apart
+        from `dirty` so a star never re-pushes (or bumps) the note body."""
+        with self.lock:
+            return [i for i, e in self.notes.items() if e.get("starDirty")]
 
     # ---------------- local mutations (UI / dictation) ----------------
 
@@ -324,6 +334,30 @@ class NoteStore:
             self._save_index()
         self._notify("rename", note_id)
         return self.get(note_id)
+
+    def set_star(self, note_id, starred):
+        """Flag/unflag a note. The star is index-only metadata (never the .txt
+        body), stamped with a local timestamp and marked to push on its own."""
+        with self.lock:
+            e = self.notes.get(note_id)
+            if not e or e.get("deletedLocally"):
+                return None
+            e["starred"] = bool(starred)
+            e["starredAt"] = _now_ms()
+            e["starDirty"] = True
+            self._save_index()
+        self._notify("star", note_id)
+        return self.get(note_id)
+
+    def mark_star_synced(self, note_id, pushed_at):
+        """The star reached the cloud — clear its pending flag, but only if no
+        newer toggle happened while the push was in flight (pushed_at is the
+        starredAt that was actually sent). Otherwise the newer star re-pushes."""
+        with self.lock:
+            e = self.notes.get(note_id)
+            if e and int(e.get("starredAt") or 0) <= int(pushed_at or 0):
+                e["starDirty"] = False
+                self._save_index()
 
     def delete(self, note_id):
         with self.lock:
@@ -402,6 +436,8 @@ class NoteStore:
                         "mtime": st.st_mtime,
                         "createdAt": int(record.get("createdAt") or _now_ms()),
                         "syncedRev": rev, "dirty": False,
+                        "starred": bool(record.get("starred")),
+                        "starredAt": int(record.get("starredAt") or 0),
                     }
                     self._materialize(self.notes[note_id], body)
                     kind = "remote_create"
@@ -426,6 +462,36 @@ class NoteStore:
         if kind:
             self._notify(kind, note_id)
         return kind
+
+    def set_remote_star(self, note_id, starred, starred_at):
+        """Merge a star that arrived from the cloud. Last-writer-wins by the
+        star's own timestamp, independent of the note body — an older remote
+        star can't unstar something we starred more recently, and vice versa. A
+        tie (equal starredAt) keeps the local value, exactly as web/js/sync.js
+        mergeStar does, so the two platforms never pick opposite winners. No-op
+        (returns '') for unknown/locally-deleted notes, ties and older stars."""
+        starred_at = int(starred_at or 0)
+        with self.lock:
+            e = self.notes.get(note_id)
+            if not e or e.get("deletedLocally"):
+                return ""
+            local_at = int(e.get("starredAt") or 0)
+            if starred_at < local_at:
+                # the cloud holds an older star than ours — a concurrent write
+                # clobbered it (RTDB can only field-merge, never compare). Mark
+                # it to re-push so every device converges on the newer star.
+                if not e.get("starDirty"):
+                    e["starDirty"] = True
+                    self._save_index()
+                return ""
+            if starred_at == local_at:
+                return ""                     # tie: keep local (echo of our push)
+            e["starred"] = bool(starred)
+            e["starredAt"] = starred_at
+            e["starDirty"] = False            # this is the cloud's value already
+            self._save_index()
+        self._notify("remote_update", note_id)
+        return "remote_update"
 
     # ---------------- local change detection ----------------
 
