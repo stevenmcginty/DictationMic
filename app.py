@@ -569,6 +569,13 @@ class ParakeetTranscriber:
             so = ort.SessionOptions()
             so.intra_op_num_threads = min(6, max(2, (os.cpu_count() or 8) // 2))
             so.inter_op_num_threads = 1
+            # ORT worker threads busy-spin between ops and keep spinning after
+            # each run by default — with a phrase transcribed every few seconds
+            # that pegs the cores continuously and starves the Tk thread (same
+            # UI-starvation as the Whisper cpu_threads fix, but hotter). Sleep
+            # instead of spin: costs microseconds at 10-22x realtime headroom.
+            so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            so.add_session_config_entry("session.inter_op.allow_spinning", "0")
             self.model = onnx_asr.load_model(
                 "nemo-" + PARAKEET_NAME, parakeet_dir(),
                 quantization="int8", sess_options=so)
