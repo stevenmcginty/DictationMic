@@ -5,7 +5,8 @@ A floating, draggable, always-on-top dictation pill. Tap RIGHT CTRL (or click
 the pill) and just talk: each phrase is transcribed locally with Whisper the
 moment you pause, and typed straight into the focused input box (or
 accumulated to the clipboard). Goes quiet for 10 s? It stops by itself.
-Hold the hotkey instead of tapping for push-to-talk. Right-click the pill to
+Hold the hotkey instead of tapping for push-to-talk. Right-click the pill
+(or Shift+click / Ctrl+click, for touchpads with a stubborn right button) to
 change the hotkey to any key you like.
 
 First run downloads the speech model (~480 MB, one time); after that it is
@@ -1719,6 +1720,10 @@ class DictationApp:
             self.settings["x"] = self.root.winfo_x()
             self.settings["y"] = self.root.winfo_y()
             save_settings(self.settings)
+        elif e.state & 0x0005:      # Shift (0x1) or Ctrl (0x4) held — open the
+            if self._mod_down:      # menu; laptop touchpads make right-click hard
+                self._mod_other = True   # modifier+click is a combo — no tap-toggle
+            self.on_right_click(e)
         else:
             self.toggle()
         self.drag_start = None
@@ -2175,7 +2180,7 @@ class DictationApp:
             "Hold + drag — move me\n"
             "Drop files, text or images on me — synced as notes\n"
             "Ctrl+V over me (or middle-click) — save the clipboard\n"
-            "Right-click — options", ("Segoe UI", 9))
+            "Right-click or Shift+click — options", ("Segoe UI", 9))
 
     def hide_tooltip(self):
         if self.tooltip is not None:
