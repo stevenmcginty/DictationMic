@@ -61,6 +61,53 @@ Extras:
 - Hover over it for a reminder of the controls.
 - Only one copy runs at a time.
 
+## Speech engine
+
+Two engines, one click apart (right-click → **Speech engine**):
+
+- **Whisper** — the original. `small.en` for live dictation, `medium.en`
+  fetched quietly the first time a phone voice note needs it.
+- **Parakeet** — NVIDIA's Parakeet TDT 0.6B, run locally through
+  [onnx-asr](https://github.com/istupakov/onnx-asr). One ~660 MB one-time
+  fetch, then it does **both** jobs — live dictation *and* phone voice
+  notes — so there's no second model to download or hold in RAM. It sits
+  above `whisper medium.en` on the open English leaderboards and runs far
+  faster on CPU: on this machine an 88-second voice note transcribes in
+  ~4 s (Parakeet) vs ~19 s (medium.en), and long recordings are chunked at
+  their quietest instant so nothing is lost at the seams.
+
+Switching is instant if the files are already on disk, and shows the usual
+download ring if not. Everything stays on-device either way. If an engine
+ever fails to load, the pill says so — right-click and switch back.
+Benchmark your own machine any time:
+
+```
+venv\Scripts\python.exe bench_stt.py clip.wav [clip.txt with the true words]
+```
+
+## Claude / MCP
+
+`mcp_server.py` serves your notes over the
+[Model Context Protocol](https://modelcontextprotocol.io), so Claude Code
+(or any MCP client) can work with what you dictate — entirely through the
+`notes\` folder, no cloud involved:
+
+- `latest_note` — "read my latest note and do what it says" straight after
+  you dictate something.
+- `search_notes` / `list_notes` / `read_note` — everything you've ever
+  dictated, searchable from a chat.
+- `create_note` — Claude writes a note; the pill adopts it and it's on
+  your phone moments later.
+
+Run Claude Code inside this folder and it's already wired up (`.mcp.json`).
+To have it everywhere:
+
+```
+claude mcp add --scope user dictationmic -- ^
+  C:\Users\steve\Desktop\DictationMic\venv\Scripts\python.exe ^
+  C:\Users\steve\Desktop\DictationMic\mcp_server.py
+```
+
 ## Sharing it
 
 Send someone `DictationMic-Windows.zip`. They just:
@@ -81,6 +128,7 @@ Windows only — the Mac needs a separately built app.
 | `auto_stop_seconds` | stop after this much silence (0 = never)    |
 | `size`              | pill width in pixels, default 84            |
 | `beeps`             | `true`/`false` — start/stop sounds          |
+| `engine`            | `"whisper"` (default) or `"parakeet"`       |
 | `model`             | folder under `models\`, default `small.en`  |
 
 ## Tech

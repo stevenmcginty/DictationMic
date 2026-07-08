@@ -102,6 +102,7 @@ def dbg(msg):
 DEFAULT_SETTINGS = {
     "mode": "type",            # "type" -> types into focused box, "clipboard" -> copies
     "hotkeys": ["ctrl", "f8"],         # tap = start/stop, hold = push-to-talk
+    "engine": "whisper",       # "whisper" or "parakeet" (see ParakeetTranscriber)
     "model": "small.en",
     "voice_model": "medium.en",  # phone voice notes: transcribed in the
                                  # background, so a bigger, more accurate
@@ -141,6 +142,8 @@ def load_settings():
     # left/right modifier variants can't be told apart reliably -> use the family
     s["hotkeys"] = [("ctrl" if isinstance(hk, str) and hk.endswith("ctrl") else hk)
                     for hk in s["hotkeys"]]
+    if s.get("engine") not in ("whisper", "parakeet"):
+        s["engine"] = "whisper"
     return s
 
 def save_settings(s):
@@ -444,6 +447,171 @@ class Transcriber:
                 "you", "thank you", "thanks for watching", "bye", "uh", "um"):
             return ""
         return text
+
+# ----------------------------------------------------------------------------
+# Parakeet engine (optional) — NVIDIA's Parakeet TDT 0.6B via onnx-asr.
+# Tops the open English ASR leaderboard (ahead of whisper medium.en) while
+# running faster than small.en on CPU, so words land sooner AND read better.
+# One model serves live dictation and phone voice notes; Whisper stays the
+# default until it's proven on this machine (right-click menu to switch).
+# ----------------------------------------------------------------------------
+
+PARAKEET_NAME = "parakeet-tdt-0.6b-v2"
+PARAKEET_SIZE_HINT = "~660 MB"
+_PARAKEET_BASE = ("https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx"
+                  "/resolve/main/")
+# file -> minimum plausible size, so a stray HTML error page can never pass
+# for a model file (same guard model_files_ready applies to model.bin)
+PARAKEET_FILES = {
+    "config.json": 50,             # 97 B
+    "vocab.txt": 5_000,            # 9.4 KB
+    "decoder_joint-model.int8.onnx": 5_000_000,    # 9 MB
+    "encoder-model.int8.onnx": 500_000_000,        # 652 MB
+}
+
+def parakeet_dir():
+    return model_dir(PARAKEET_NAME)
+
+def parakeet_files_ready():
+    d = parakeet_dir()
+    try:
+        return all(os.path.getsize(os.path.join(d, n)) >= size
+                   for n, size in PARAKEET_FILES.items())
+    except OSError:
+        return False
+
+def fetch_resumable(url, part, progress=None):
+    """One HTTP fetch into a .part file, resuming what a previous attempt
+    left behind (module-level so scripts can reuse it; the pill's _fetch
+    wraps it to drive the download % on the pill)."""
+    existing = os.path.getsize(part) if os.path.isfile(part) else 0
+    headers = {"User-Agent": "DictationMic/1.0"}
+    if existing:
+        headers["Range"] = f"bytes={existing}-"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        if existing and getattr(r, "status", 200) != 206:
+            existing = 0                    # server ignored resume
+        total = existing + int(r.headers.get("Content-Length") or 0)
+        done = existing
+        with open(part, "ab" if existing else "wb") as f:
+            while True:
+                chunk = r.read(262144)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(done / total)
+        if total and done < total:
+            raise IOError("incomplete download")
+
+def download_parakeet(progress=None, notify=None):
+    """Fetch the Parakeet model into models\\ with the same wait-for-internet
+    patience as the Whisper downloader. progress(frac) follows the big
+    encoder file; notify(msg) surfaces one-time status toasts."""
+    d = parakeet_dir()
+    os.makedirs(d, exist_ok=True)
+    warned = False
+    for name, min_size in PARAKEET_FILES.items():
+        dest = os.path.join(d, name)
+        if os.path.isfile(dest) and os.path.getsize(dest) >= min_size:
+            continue
+        part = dest + ".part"
+        big = name.startswith("encoder")
+        while True:
+            try:
+                fetch_resumable(_PARAKEET_BASE + name,
+                                part, progress if big else None)
+                os.replace(part, dest)
+                break
+            except urllib.error.HTTPError as ex:
+                if ex.code == 416:          # ranged past the end -> complete
+                    os.replace(part, dest)
+                    break
+                if notify:
+                    notify(f"Couldn't fetch the Parakeet model (HTTP {ex.code})")
+                return False
+            except Exception:
+                if not warned:
+                    warned = True
+                    if notify:
+                        notify("Fetching the Parakeet speech model (one-time, "
+                               f"{PARAKEET_SIZE_HINT}).\nWaiting for internet…")
+                time.sleep(4)
+        if os.path.getsize(dest) < min_size:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            if notify:
+                notify("The Parakeet download came back broken — try again")
+            return False
+    return True
+
+class ParakeetTranscriber:
+    """Drop-in Transcriber built on onnx-asr instead of faster-whisper.
+    Same load()/transcribe()/model/error shape, so the worker, warm-up and
+    voice-note paths never care which engine sits behind them."""
+
+    def __init__(self, settings, model_key="model"):
+        self.settings = settings
+        self.model = None
+        self.error = None
+
+    def load(self):
+        try:
+            import onnxruntime as ort
+            import onnx_asr
+            # same budget as Whisper: half the cores keeps the pill's meter,
+            # animation and keypress handling snappy while we transcribe
+            so = ort.SessionOptions()
+            so.intra_op_num_threads = min(6, max(2, (os.cpu_count() or 8) // 2))
+            so.inter_op_num_threads = 1
+            self.model = onnx_asr.load_model(
+                "nemo-" + PARAKEET_NAME, parakeet_dir(),
+                quantization="int8", sess_options=so)
+        except Exception as e:
+            self.error = str(e)
+
+    # the ONNX export runs full attention, so a 10-minute voice note in one
+    # piece would eat RAM for no accuracy win — cut long audio at its
+    # quietest instant, the same trick the live recorder uses for forced cuts
+    CHUNK_S = 60
+
+    def _pieces(self, audio):
+        max_n = self.CHUNK_S * SAMPLE_RATE
+        while len(audio) > max_n:
+            win = audio[max_n - 10 * SAMPLE_RATE:max_n]
+            cut = max_n - 10 * SAMPLE_RATE + int(np.argmin(np.abs(win)))
+            yield audio[:cut]
+            audio = audio[cut:]
+        yield audio
+
+    def transcribe(self, audio, context="", long=False):
+        if self.model is None:
+            return ""
+        parts = []
+        for piece in self._pieces(np.ascontiguousarray(audio, dtype=np.float32)):
+            parts.append((self.model.recognize(piece) or "").strip())
+        text = " ".join(p for p in parts if p)
+        text = re.sub(r"\.{2,}|…", "", text)
+        text = re.sub(r"\s{2,}", " ", text).strip()
+        # breath-chunk hallucinations, same guard as Whisper's
+        if text.lower().strip(" .,!?") in (
+                "you", "thank you", "thanks for watching", "bye", "uh", "um"):
+            return ""
+        return text
+
+def make_transcriber(settings, model_key="model"):
+    if settings.get("engine") == "parakeet":
+        return ParakeetTranscriber(settings, model_key)
+    return Transcriber(settings, model_key)
+
+def engine_ready(settings):
+    if settings.get("engine") == "parakeet":
+        return parakeet_files_ready()
+    return model_ready(settings)
 
 # ----------------------------------------------------------------------------
 # Typing helper: don't type while a modifier is physically held, or the held
@@ -884,7 +1052,7 @@ class DictationApp:
         self.events = queue.Queue()     # UI events
         self.work = queue.Queue()       # audio phrases -> transcriber worker
         self.recorder = LiveRecorder(self.work)
-        self.transcriber = Transcriber(self.settings)
+        self.transcriber = make_transcriber(self.settings)
         self.voice_transcriber = None     # bigger model for phone notes (lazy)
         self._voice_state = "idle"        # idle | preparing | ready | fallback
         self._voice_lock = threading.Lock()
@@ -892,6 +1060,7 @@ class DictationApp:
         self.context = ""
         self.session_start = 0.0
         self.dl_frac = 0.0
+        self._announce_engine = ""        # toast this name when its load lands
 
         self.root = tk.Tk() if TkinterDnD is None else TkinterDnD.Tk()
         self.root.title("DictationMic")
@@ -956,7 +1125,7 @@ class DictationApp:
                       or self.root.winfo_id())
         self._paste_t = 0.0
 
-        if model_ready(self.settings):
+        if engine_ready(self.settings):
             self.state = LOADING
             threading.Thread(target=self._load_model, daemon=True).start()
         else:
@@ -1209,6 +1378,20 @@ class DictationApp:
             items.append({"kind": "item", "text": "Set up phone sync…",
                           "hint": "your notes, on your phone",
                           "command": self.sync_dialog})
+        eng = s.get("engine") or "whisper"
+        items += [
+            {"kind": "sep"},
+            {"kind": "header", "text": "Speech engine"},
+            {"kind": "item", "text": "Whisper — the original",
+             "hint": "small.en live · medium.en for notes",
+             "radio": eng != "parakeet",
+             "command": lambda: self.set_engine("whisper")},
+            {"kind": "item", "text": "Parakeet — faster and sharper",
+             "hint": ("already on this PC" if parakeet_files_ready()
+                      else f"one-time {PARAKEET_SIZE_HINT} fetch"),
+             "radio": eng == "parakeet",
+             "command": lambda: self.set_engine("parakeet")},
+        ]
         items += [
             {"kind": "sep"},
             {"kind": "header", "text": f"Talk key — {self.hotkey_label()}"},
@@ -1228,6 +1411,31 @@ class DictationApp:
         self.show_toast("Words will be typed where your cursor is"
                         if mode == "type"
                         else "Words will be copied to the clipboard", 2200)
+
+    def set_engine(self, engine):
+        if engine == (self.settings.get("engine") or "whisper"):
+            return
+        if self.state != IDLE:
+            self.show_toast("Let me finish what I'm doing, then switch", 2600)
+            return
+        self.settings["engine"] = engine
+        save_settings(self.settings)
+        # voice notes must follow the engine too — drop the old big model
+        self.voice_transcriber = None
+        self._voice_state = "idle"
+        self.transcriber = make_transcriber(self.settings)
+        self._announce_engine = "Parakeet" if engine == "parakeet" else "Whisper"
+        if engine_ready(self.settings):
+            self.state = LOADING
+            self.show_toast(f"Switching to {self._announce_engine}…", 2200)
+            threading.Thread(target=self._load_model, daemon=True).start()
+        else:
+            self.state = DOWNLOADING
+            self.dl_frac = 0.0
+            self.show_toast("Fetching Parakeet (one-time, "
+                            f"{PARAKEET_SIZE_HINT}) — watch my progress ring",
+                            3200)
+            threading.Thread(target=self._download_model, daemon=True).start()
 
     def toggle_save_notes(self):
         self.settings["save_notes"] = not self.settings.get("save_notes", True)
@@ -1252,7 +1460,14 @@ class DictationApp:
     # ---------------- model download (first run only) ----------------
 
     def _download_model(self):
-        if self._download_files(self.settings["model"], primary=True):
+        if self.settings.get("engine") == "parakeet":
+            def frac(f):
+                self.dl_frac = f
+            ok = download_parakeet(
+                progress=frac, notify=lambda m: self.events.put(("toast", m)))
+        else:
+            ok = self._download_files(self.settings["model"], primary=True)
+        if ok:
             self.events.put(("dl_done", None))
 
     def _download_files(self, mdl, primary):
@@ -1295,27 +1510,9 @@ class DictationApp:
         return True
 
     def _fetch(self, url, part, big=False):
-        existing = os.path.getsize(part) if os.path.isfile(part) else 0
-        headers = {"User-Agent": "DictationMic/1.0"}
-        if existing:
-            headers["Range"] = f"bytes={existing}-"
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as r:
-            if existing and getattr(r, "status", 200) != 206:
-                existing = 0                    # server ignored resume
-            total = existing + int(r.headers.get("Content-Length") or 0)
-            done = existing
-            with open(part, "ab" if existing else "wb") as f:
-                while True:
-                    chunk = r.read(262144)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    done += len(chunk)
-                    if big and total:
-                        self.dl_frac = done / total
-            if total and done < total:
-                raise IOError("incomplete download")
+        def frac(f):
+            self.dl_frac = f
+        fetch_resumable(url, part, frac if big else None)
 
     # ---------------- background: model + transcription worker ----------------
 
@@ -1376,7 +1573,13 @@ class DictationApp:
         if name == "model_loaded":
             self.state = IDLE
             if self.transcriber.error:
-                self.show_toast("Speech model failed to load — check the models folder", 4000)
+                dbg(f"model load error: {self.transcriber.error}")
+                self.show_toast("Speech model failed to load — right-click me "
+                                "to try the other engine", 4000)
+            elif self._announce_engine:
+                self.show_toast(f"{self._announce_engine} is ready — talk away",
+                                2600)
+            self._announce_engine = ""
         elif name == "dl_done":
             self.state = LOADING
             threading.Thread(target=self._load_model, daemon=True).start()
@@ -1735,6 +1938,10 @@ class DictationApp:
         """The Transcriber for voice notes: the dedicated voice_model once
         it's fetched and loaded, the live-dictation model when they're the
         same or the big one can't load. None while still preparing."""
+        if self.settings.get("engine") == "parakeet":
+            # one Parakeet model serves both jobs — it already out-hears
+            # medium.en, so there is no bigger model worth fetching
+            return self.transcriber
         name = self.settings.get("voice_model") or self.settings["model"]
         if name == self.settings["model"] or self._voice_state == "fallback":
             return self.transcriber
