@@ -1,6 +1,7 @@
 # secrets & personal data — never commit these
 settings.json
 notes/
+shots/
 debug.log
 
 # python runtime & build outputs

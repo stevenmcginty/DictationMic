@@ -22,6 +22,7 @@ import math
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -36,6 +37,8 @@ import keyboard
 import pyperclip
 import winsound
 from PIL import Image, ImageDraw, ImageFont
+
+import shots
 
 # OS drag-and-drop onto the pill (tkdnd). Optional: if the package or its
 # native DLL is unavailable (Smart App Control has blocked stranger things),
@@ -113,6 +116,9 @@ DEFAULT_SETTINGS = {
     "save_notes": True,        # keep a copy of every dictation in notes\
     "auto_stop_seconds": 10,   # stop listening after this much silence (0 = never)
     "size": 84,                # pill width in px (height follows)
+    "catch_shots": True,       # screenshots/copied images pin to the shelf
+    "shots_keep": 12,          # how many pinned shots to keep (oldest pruned)
+    "shots_to_notes": True,    # caught screenshots also saved as image notes
     "seen_intro": False,
     "seen_intro2": False,
     "x": None,
@@ -664,26 +670,99 @@ def wait_modifiers_up(timeout=30.0):
         time.sleep(0.05)
 
 # ----------------------------------------------------------------------------
-# Rendering (Pillow, supersampled) — dark capsule, lime voice meter
+# Rendering (Pillow, supersampled) — "Obsidian Capsule" (see DESIGN-DESKTOP.md):
+# lacquered obsidian pebble, bone ink, one volt-lime accent.
 # ----------------------------------------------------------------------------
 
 SS = 3  # supersampling factor
 
 C_TRANSPARENT = (1, 2, 3, 255)
 
-BODY_TOP = (28, 29, 33)                  # capsule gradient, top -> bottom
-BODY_BOT = (16, 17, 20)
-EDGE_IDLE = (255, 255, 255, 30)          # hairline rim
-EDGE_HOVER = (255, 255, 255, 58)
-EDGE_DIM = (255, 255, 255, 16)
-LIME = (163, 230, 53)                    # the voice meter
+BODY_TOP = (31, 34, 32)                  # lacquer gradient, top -> bottom
+BODY_BOT = (14, 16, 14)                  # (green undertone, like the web app)
+EDGE_IDLE = (236, 238, 231, 26)          # hairline rim, bone ink
+EDGE_DIM = (236, 238, 231, 14)
+LIME = (182, 238, 63)                    # volt — THE accent (#B6EE3F)
 ICE = (86, 197, 255)                     # "caught it" flash after a drop/paste
-NUB_IDLE = (94, 100, 108, 255)           # sleeping meter dots
-NUB_HOVER = (130, 138, 148, 255)
-NUB_DIM = (64, 69, 76, 255)
-DOT_THINK = (208, 213, 220, 255)         # "finishing" dots
-TEXT_SOFT = (225, 229, 235, 255)
+INK = (236, 238, 231)                    # bone white
+DOT_SLEEP = INK + (77,)                  # 3 sleeping dots at rest
+DOT_SLEEP_HOVER = INK + (140,)
+DOT_SLEEP_DIM = INK + (46,)
+DOT_THINK = LIME + (200,)                # "your words are coming" dots
+TEXT_SOFT = INK + (255,)
 TRACK = (255, 255, 255, 34)              # download progress track
+
+
+def pil_font(px, names=("seguisb.ttf", "segoeuib.ttf", "segoeui.ttf",
+                        "arialbd.ttf")):
+    """A Windows font at px height for PIL drawing, or None."""
+    for name in names:
+        try:
+            return ImageFont.truetype(
+                os.path.join(os.environ.get("WINDIR", r"C:\Windows"),
+                             "Fonts", name), int(px))
+        except Exception:
+            continue
+    return None
+
+
+def round_corners(win):
+    """Ask DWM for rounded corners on a Toplevel (Windows 11)."""
+    try:
+        win.update_idletasks()
+        hwnd = (ctypes.windll.user32.GetParent(win.winfo_id())
+                or win.winfo_id())
+        pref = ctypes.c_int(2)            # DWMWCP_ROUND
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, 33, ctypes.byref(pref), 4)
+    except Exception:
+        pass
+
+
+def fade_in(win, steps=5, ms=16):
+    """~110ms alpha ramp — the only entrance motion any card gets."""
+    try:
+        win.attributes("-alpha", 1.0 / steps)
+    except Exception:
+        return
+
+    def step(i=2):
+        try:
+            win.attributes("-alpha", min(1.0, i / steps))
+            if i < steps:
+                win.after(ms, step, i + 1)
+        except Exception:
+            pass
+    win.after(ms, step)
+
+
+def spaced(text):
+    """'Shots' -> 'S H O T S' — mono eyebrows, Tk has no letter-spacing."""
+    return " ".join(text.upper())
+
+
+# Tk font families — resolved once a root exists (pick_ui_fonts); the
+# Variable/Cascadia families ship with Windows 11 and echo the web app's
+# Space Grotesk / JetBrains Mono without bundling a single font file.
+UI_FAMILY = "Segoe UI"
+MONO_FAMILY = "Consolas"
+
+
+def pick_ui_fonts(root):
+    global UI_FAMILY, MONO_FAMILY
+    try:
+        import tkinter.font as tkfont
+        fams = set(tkfont.families(root))
+        for cand in ("Segoe UI Variable Text", "Segoe UI Variable Display"):
+            if cand in fams:
+                UI_FAMILY = cand
+                break
+        for cand in ("Cascadia Mono", "Cascadia Code"):
+            if cand in fams:
+                MONO_FAMILY = cand
+                break
+    except Exception:
+        pass
 
 
 class PillRenderer:
@@ -735,6 +814,16 @@ class PillRenderer:
         ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, fill=255)
         body = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
         body.paste(grad, (0, 0), mask)
+        # the lacquer: a soft top sheen + a bottom inner shade, clipped to
+        # the capsule, give the flat gradient its "polished pebble" depth
+        lac = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(lac)
+        ld.ellipse([-sw * 0.25, -sh * 0.95, sw * 1.25, sh * 0.52],
+                   fill=(255, 255, 255, 23))
+        ld.rectangle([0, sh * 0.72, sw, sh], fill=(0, 0, 0, 30))
+        lac.putalpha(Image.composite(
+            lac.getchannel("A"), Image.new("L", (sw, sh), 0), mask))
+        body.alpha_composite(lac)
         d = ImageDraw.Draw(body)
         d.rounded_rectangle(box, radius=radius, outline=edge_rgba, width=self.edge_w)
         self._bodies[key] = body
@@ -742,14 +831,35 @@ class PillRenderer:
 
     # ---- shared meter ----
 
-    def _bars(self, d, vals, color):
+    def _bars(self, d, vals, color, glow=None):
         cy = self.sh / 2
+        if glow:                            # volt under-glow, drawn first
+            x = self.bar_x0
+            gx = self.bar_w * 0.45
+            for v in vals:
+                half = self.nub_half + (self.max_half - self.nub_half) \
+                    * max(0.0, min(1.0, v))
+                d.rounded_rectangle(
+                    [x - gx, cy - half - gx, x + self.bar_w + gx,
+                     cy + half + gx],
+                    radius=self.bar_w / 2 + gx, fill=glow)
+                x += self.bar_w + self.bar_gap
         x = self.bar_x0
         for v in vals:
             half = self.nub_half + (self.max_half - self.nub_half) * max(0.0, min(1.0, v))
             d.rounded_rectangle([x, cy - half, x + self.bar_w, cy + half],
                                 radius=self.bar_w / 2, fill=color)
             x += self.bar_w + self.bar_gap
+
+    def _sleep_dots(self, body, color):
+        """The brand mark at rest: 3 dots, blended onto the lacquer."""
+        d = ImageDraw.Draw(body, "RGBA")
+        cy = self.sh / 2
+        r = self.sh * 0.058
+        gap = self.sh * 0.36
+        for i in (-1, 0, 1):
+            x = self.sw / 2 + i * gap
+            d.ellipse([x - r, cy - r, x + r, cy + r], fill=color)
 
     # ---- frames (pure PIL) ----
 
@@ -761,27 +871,35 @@ class PillRenderer:
     def _finish(self, img):
         return tk_photo(self._compose(img))
 
+    def _finish_fast(self, img):
+        """Animated frames: raw PPM into Tk — no PNG deflate, no base64,
+        no PNG decode. ~10x cheaper per frame at 30fps than _finish."""
+        rgb = self._compose(img).convert("RGB")
+        data = b"P6\n%d %d\n255\n" % rgb.size + rgb.tobytes()
+        return tk.PhotoImage(data=data, format="ppm")
+
     def frame_idle(self, hover, dim=False):
         if dim:
-            body, nub = self._body("dim", EDGE_DIM).copy(), NUB_DIM
+            body, dot = self._body("dim", EDGE_DIM).copy(), DOT_SLEEP_DIM
         elif hover:
-            # lime rim the moment the pointer touches the pill: it's armed —
+            # volt rim the moment the pointer touches the pill: it's armed —
             # a click talks, Ctrl+V / middle-click pastes, a drag drops in
-            body, nub = self._body("hover", LIME + (120,)).copy(), NUB_HOVER
+            body, dot = self._body("hover", LIME + (140,)).copy(), DOT_SLEEP_HOVER
         else:
-            body, nub = self._body("idle", EDGE_IDLE).copy(), NUB_IDLE
-        self._bars(ImageDraw.Draw(body), [0.0] * self.nbars, nub)
+            body, dot = self._body("idle", EDGE_IDLE).copy(), DOT_SLEEP
+        self._sleep_dots(body, dot)
         return body
 
     def frame_listening(self, vals, pulse):
         step = min(3, int(max(0.0, pulse) * 4))     # quantized so bodies cache
         body = self._body(("listen", step), LIME + (95 + step * 16,)).copy()
-        self._bars(ImageDraw.Draw(body), vals, LIME + (255,))
+        self._bars(ImageDraw.Draw(body, "RGBA"), vals, LIME + (255,),
+                   glow=LIME + (52,))
         return body
 
     def frame_dots(self, phase):
         body = self._body("idle", EDGE_IDLE).copy()
-        d = ImageDraw.Draw(body)
+        d = ImageDraw.Draw(body, "RGBA")
         cy = self.sh / 2
         r0 = self.sh * 0.065
         gap = self.sh * 0.40
@@ -870,34 +988,35 @@ class PillRenderer:
         return self._static["flash"]
 
     def listening(self, vals, pulse):
-        return self._finish(self.frame_listening(vals, pulse))
+        return self._finish_fast(self.frame_listening(vals, pulse))
 
     def dots(self, phase):
-        return self._finish(self.frame_dots(phase))
+        return self._finish_fast(self.frame_dots(phase))
 
     def downloading(self, frac):
-        return self._finish(self.frame_downloading(frac))
+        return self._finish_fast(self.frame_downloading(frac))
 
 
 # ----------------------------------------------------------------------------
-# Right-click menu — a dark, rounded popup that matches the pill.
-# (tk.Menu draws like Windows 95 and can't be styled on Windows.)
+# Right-click menu — the "command card": a matte obsidian card cut from the
+# same stone as the pill. (tk.Menu draws like Windows 95 and can't be styled.)
 # ----------------------------------------------------------------------------
 
-MENU_BG = "#17181C"
-MENU_EDGE = "#31343C"
-MENU_HOVER = "#242833"
-MENU_FG = "#E8EAEE"
-MENU_SUB = "#9AA1AC"
-MENU_DIM = "#6B7280"
+MENU_BG = "#131512"
+MENU_EDGE = "#23251F"
+MENU_HOVER = "#1A1D18"
+MENU_FG = "#ECEEE7"
+MENU_SUB = "#878C7F"
+MENU_DIM = "#5C6156"
 MENU_LIME = "#B6EE3F"
 MENU_RED = "#FF5C48"
-MENU_GREEN = "#3FD68C"
+MENU_GREEN = "#B6EE3F"       # "on" is an accent state — volt, not a 2nd green
 
 
 class PopupMenu:
     """items is a list of dicts:
-      {"kind": "header", "text": ...}                       section label
+      {"kind": "hero", "text": ..., "hint": ..., "command": fn}   volt capsule
+      {"kind": "header", "text": ...}                       mono eyebrow label
       {"kind": "sep"}                                       hairline
       {"kind": "status", "text": ..., "bullet": "#hex",
        "hint": ...}                                         non-clickable info
@@ -912,6 +1031,8 @@ class PopupMenu:
         self._root = parent
         self.on_close = on_close
         self.closed = False
+        self._hero_photos = []        # PhotoImage refs must stay alive
+        self._heroes = []             # (placeholder label, item) — sized late
         self.win = tk.Toplevel(parent, bg=MENU_BG)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
@@ -923,6 +1044,7 @@ class PopupMenu:
         body.pack(fill="both", expand=True, pady=7)
         for it in items:
             self._add(body, it)
+        self._finish_heroes(body)
         self.win.bind("<Escape>", lambda e: self.close())
         self.win.bind("<FocusOut>", lambda e: self.close())
 
@@ -932,9 +1054,14 @@ class PopupMenu:
             tk.Frame(body, bg=MENU_EDGE, height=1).pack(
                 fill="x", padx=10, pady=6)
             return
+        if kind == "hero":
+            lab = tk.Label(body, bg=MENU_BG, bd=0, cursor="hand2")
+            lab.pack(padx=10, pady=(2, 6))
+            self._heroes.append((lab, it))
+            return
         if kind == "header":
-            tk.Label(body, text=it["text"].upper(), bg=MENU_BG, fg=MENU_DIM,
-                     font=("Segoe UI Semibold", 8), anchor="w"
+            tk.Label(body, text=spaced(it["text"]), bg=MENU_BG, fg=MENU_DIM,
+                     font=(MONO_FAMILY, 7), anchor="w"
                      ).pack(fill="x", padx=self.PAD_X, pady=(5, 1))
             return
         row = tk.Frame(body, bg=MENU_BG)
@@ -950,17 +1077,17 @@ class PopupMenu:
             lead_txt, lead_fg = "●", it["bullet"]
         widgets = [row]
         lead = tk.Label(row, text=lead_txt, width=2, bg=MENU_BG, fg=lead_fg,
-                        font=("Segoe UI", 10), anchor="w")
+                        font=(UI_FAMILY, 10), anchor="w")
         lead.pack(side="left", padx=(self.PAD_X - 6, 0), pady=4)
         widgets.append(lead)
         fg = (MENU_RED if it.get("danger")
               else MENU_SUB if kind == "status" else MENU_FG)
         lab = tk.Label(row, text=it["text"], bg=MENU_BG, fg=fg,
-                       font=("Segoe UI", 10), anchor="w")
+                       font=(UI_FAMILY, 10), anchor="w")
         lab.pack(side="left", pady=4)
         widgets.append(lab)
         tail = tk.Label(row, text=it.get("hint", ""), bg=MENU_BG, fg=MENU_DIM,
-                        font=("Segoe UI", 8), anchor="e")
+                        font=(MONO_FAMILY, 7), anchor="e")
         tail.pack(side="right", padx=(24, self.PAD_X), pady=4)
         widgets.append(tail)
         cmd = it.get("command") if kind == "item" else None
@@ -973,6 +1100,49 @@ class PopupMenu:
                 w.bind("<Enter>", lambda e: set_bg(MENU_HOVER))
                 w.bind("<Leave>", lambda e: set_bg(MENU_BG))
                 w.bind("<ButtonRelease-1>", lambda e, c=cmd: self._invoke(c))
+
+    # ---- the hero: a PIL-drawn volt capsule button, sized to the card ----
+
+    def _hero_frame(self, w, h, text, hint, hover):
+        s = SS
+        img = Image.new("RGB", (w * s, h * s), (19, 21, 18))   # MENU_BG
+        d = ImageDraw.Draw(img, "RGBA")
+        box = [s, s, w * s - s, h * s - s]
+        rad = (h * s - 2 * s) / 2
+        d.rounded_rectangle(box, radius=rad,
+                            fill=LIME + (46 if hover else 26,),
+                            outline=LIME + (220 if hover else 120,),
+                            width=max(2, round(s * 1.1)))
+        f_main = pil_font(h * s * 0.34)
+        f_hint = pil_font(h * s * 0.20, names=("CascadiaMono.ttf",
+                                               "CascadiaCode.ttf",
+                                               "consola.ttf", "segoeui.ttf"))
+        cx = w * s / 2
+        if hint and f_hint is not None:
+            d.text((cx, h * s * 0.36), text, font=f_main,
+                   fill=LIME + (255,), anchor="mm")
+            d.text((cx, h * s * 0.70), spaced(hint), font=f_hint,
+                   fill=INK + (120,), anchor="mm")
+        else:
+            d.text((cx, h * s / 2), text, font=f_main,
+                   fill=LIME + (255,), anchor="mm")
+        return tk_photo(img.resize((w, h), Image.LANCZOS))
+
+    def _finish_heroes(self, body):
+        if not self._heroes:
+            return
+        body.update_idletasks()
+        w = max(240, body.winfo_reqwidth() - 20)
+        for lab, it in self._heroes:
+            h = 44 if it.get("hint") else 34
+            normal = self._hero_frame(w, h, it["text"], it.get("hint"), False)
+            hover = self._hero_frame(w, h, it["text"], it.get("hint"), True)
+            self._hero_photos += [normal, hover]
+            lab.configure(image=normal)
+            lab.bind("<Enter>", lambda e, l=lab, p=hover: l.configure(image=p))
+            lab.bind("<Leave>", lambda e, l=lab, p=normal: l.configure(image=p))
+            lab.bind("<ButtonRelease-1>",
+                     lambda e, c=it.get("command"): c and self._invoke(c))
 
     def _invoke(self, cmd):
         root = self._root
@@ -999,24 +1169,14 @@ class PopupMenu:
         x = max(8, min(x, sw - w - 8))
         y = max(8, min(y, sh - h - 8))
         self.win.geometry(f"+{x}+{y}")
-        self._round_corners()
+        round_corners(self.win)
+        fade_in(self.win)
         self.win.lift()
         try:
             self.win.focus_force()
         except Exception:
             pass
         self._watch_outside_click()
-
-    def _round_corners(self):
-        try:
-            self.win.update_idletasks()
-            hwnd = (ctypes.windll.user32.GetParent(self.win.winfo_id())
-                    or self.win.winfo_id())
-            pref = ctypes.c_int(2)    # DWMWCP_ROUND
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 33, ctypes.byref(pref), 4)
-        except Exception:
-            pass
 
     def _watch_outside_click(self):
         """Win32 backstop: a fresh mouse press outside the menu closes it —
@@ -1041,6 +1201,336 @@ class PopupMenu:
             self.win.after(80, self._watch_outside_click)
         except tk.TclError:
             pass                  # window already gone (app exiting)
+
+
+# ----------------------------------------------------------------------------
+# Screenshot shelf UI — the badge on the pill's shoulder + the thumbnail
+# tray it opens. The plumbing (folder, clipboard, OLE drag-out) is shots.py.
+# ----------------------------------------------------------------------------
+
+MENU_BG_RGB = (19, 21, 18)               # PIL twin of MENU_BG "#131512"
+
+
+class ShotBadge:
+    """The little button that appears on the pill's shoulder the moment a
+    screenshot is pinned: a dark disc with the count. Lime ring while
+    there's something you haven't looked at; settles to grey once the
+    shelf has been opened. Click = open / close the shelf."""
+
+    def __init__(self, app):
+        self.app = app
+        self.d = max(20, round(app.height * 0.74))
+        self.win = tk.Toplevel(app.root, bg=TRANSPARENT_HEX)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-transparentcolor", TRANSPARENT_HEX)
+        self.label = tk.Label(self.win, bg=TRANSPARENT_HEX, bd=0,
+                              cursor="hand2")
+        self.label.pack()
+        for seq in ("<ButtonRelease-1>", "<ButtonRelease-3>"):
+            self.label.bind(seq, lambda e: app.toggle_shots_window())
+        self._frames = {}
+        self._photo = None
+        self._font = None
+        self.visible = False
+        self.win.withdraw()
+        self.win.update_idletasks()
+        make_non_activating(self.win)
+
+    def _frame(self, count, fresh):
+        key = (count, fresh)
+        if key in self._frames:
+            return self._frames[key]
+        s = self.d * SS
+        img = Image.new("RGBA", (s, s), C_TRANSPARENT)
+        d = ImageDraw.Draw(img)
+        ring = LIME + (235,) if fresh else INK + (64,)
+        d.ellipse([SS, SS, s - SS, s - SS], fill=MENU_BG_RGB + (255,),
+                  outline=ring, width=max(2, round(SS * 1.3)))
+        txt = "9+" if count > 9 else str(count)
+        if self._font is None:
+            self._font = pil_font(s * 0.42, names=(
+                "CascadiaMono.ttf", "CascadiaCode.ttf", "consola.ttf",
+                "seguisb.ttf", "segoeui.ttf"))
+        fill = LIME + (255,) if fresh else INK + (190,)
+        d.text((s / 2, s / 2 + SS * 0.3), txt, font=self._font,
+               fill=fill, anchor="mm")
+        ph = tk_photo(img.resize((self.d, self.d), Image.LANCZOS))
+        self._frames[key] = ph
+        return ph
+
+    def place(self):
+        """Sit on the pill's top-right shoulder, wherever the pill goes."""
+        r = self.app.root
+        x = r.winfo_x() + self.app.width - round(self.d * 0.60)
+        y = r.winfo_y() - round(self.d * 0.42)
+        x = max(0, min(x, r.winfo_screenwidth() - self.d))
+        y = max(0, min(y, r.winfo_screenheight() - self.d))
+        self.win.geometry(f"{self.d}x{self.d}+{x}+{y}")
+
+    def refresh(self):
+        count = self.app.shots.count()
+        if count <= 0:
+            if self.visible:
+                self.win.withdraw()
+                self.visible = False
+            return
+        self._photo = self._frame(count, self.app.shots_fresh)
+        self.label.configure(image=self._photo)
+        self.place()
+        if not self.visible:
+            self.win.deiconify()
+            self.visible = True
+        self.win.lift()
+
+
+class ShotsWindow:
+    """The shelf, popped open: recent screenshots as thumbnails. Drag one
+    straight into Claude Code / a chat / an email — a real OLE file drag —
+    or click it to copy (file + bitmap both land on the clipboard, so
+    Ctrl+V pastes whichever the target prefers). Hover ✕ removes."""
+
+    COLS = 4
+    TW, TH = 96, 72
+
+    # thumbnails cache across opens, keyed (path, mtime) — opening the shelf
+    # must never re-render a tile it has already drawn (that was the lag)
+    _thumb_cache = {}
+
+    def __init__(self, app, on_close=None):
+        self.app = app
+        self.on_close = on_close
+        self.closed = False
+        self._drag_active = False
+        self._prev_buttons = True     # swallow the click that opened us
+        self._photos = []             # PhotoImage refs must stay alive
+        self.win = tk.Toplevel(app.root, bg=MENU_BG)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(highlightthickness=1,
+                           highlightbackground=MENU_EDGE,
+                           highlightcolor=MENU_EDGE)
+        self.body = tk.Frame(self.win, bg=MENU_BG)
+        self.body.pack(fill="both", expand=True, padx=10, pady=(10, 8))
+        self.win.bind("<Escape>", lambda e: self.close())
+        self.win.bind("<FocusOut>", lambda e: self.close())
+        self.rebuild()
+
+    # ---- thumbnails ----
+
+    def _thumbs(self, path):
+        """(normal, hover, copied) PhotoImages for one shot — cover-cropped,
+        rounded; hover adds the lime ring + ✕, copied flashes ice-blue."""
+        tw, th = self.TW * SS, self.TH * SS
+        img = Image.open(path)
+        img.load()
+        scale = max(tw / img.width, th / img.height)
+        img = img.convert("RGB").resize(
+            (max(tw, round(img.width * scale)),
+             max(th, round(img.height * scale))), Image.LANCZOS)
+        left, top = (img.width - tw) // 2, (img.height - th) // 2
+        img = img.crop((left, top, left + tw, top + th))
+        base = Image.new("RGBA", (tw, th), MENU_BG_RGB + (255,))
+        mask = Image.new("L", (tw, th), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, tw - 1, th - 1], radius=9 * SS, fill=255)
+        base.paste(img, (0, 0), mask)
+
+        def ringed(color, cross):
+            im = base.copy()
+            d = ImageDraw.Draw(im)
+            d.rounded_rectangle([1, 1, tw - 2, th - 2], radius=9 * SS,
+                                outline=color, width=SS * 2)
+            if cross:                        # ✕ disc, top-right of the tile
+                cx, cy, r = tw - 12 * SS, 12 * SS, 8 * SS
+                d.ellipse([cx - r, cy - r, cx + r, cy + r],
+                          fill=(12, 13, 16, 235))
+                a = r * 0.42
+                for sx in (-1, 1):
+                    d.line([(cx - a * sx, cy - a), (cx + a * sx, cy + a)],
+                           fill=(235, 238, 242, 255), width=SS)
+            return tk_photo(im.resize((self.TW, self.TH), Image.LANCZOS))
+
+        return (ringed(INK + (38,), False),
+                ringed(LIME + (220,), True),
+                ringed(ICE + (235,), False))
+
+    def _thumbs_cached(self, path):
+        key = (path, os.path.getmtime(path))
+        got = self._thumb_cache.get(key)
+        if got is None:
+            got = self._thumbs(path)
+            if len(self._thumb_cache) > 96:      # stale keys from pruned shots
+                self._thumb_cache.clear()
+            self._thumb_cache[key] = got
+        return got
+
+    def rebuild(self):
+        if self.closed:
+            return
+        for w in self.body.winfo_children():
+            w.destroy()
+        self._photos.clear()
+        paths = self.app.shots.paths()
+        head = tk.Frame(self.body, bg=MENU_BG)
+        head.pack(fill="x", pady=(0, 6))
+        tk.Label(head, text=spaced("Shots"), bg=MENU_BG, fg=MENU_DIM,
+                 font=(MONO_FAMILY, 7)).pack(side="left")
+        tk.Label(head, text=f"· {len(paths)}", bg=MENU_BG, fg=MENU_SUB,
+                 font=(MONO_FAMILY, 7)).pack(side="left", padx=(6, 0))
+        if not paths:
+            tk.Label(self.body, text="Nothing pinned — take a screenshot",
+                     bg=MENU_BG, fg=MENU_DIM,
+                     font=(UI_FAMILY, 10)).pack(padx=16, pady=12)
+        else:
+            grid = tk.Frame(self.body, bg=MENU_BG)
+            grid.pack()
+            for i, p in enumerate(paths):
+                self._tile(grid, p, i)
+        foot = tk.Frame(self.body, bg=MENU_BG)
+        foot.pack(fill="x", pady=(8, 0))
+        tk.Label(foot, text="drag out · click = copy",
+                 bg=MENU_BG, fg=MENU_DIM,
+                 font=(MONO_FAMILY, 7)).pack(side="left")
+        if paths:
+            self._foot_btn(foot, "Clear all", MENU_RED, self._clear)
+            self._foot_btn(foot, "Open folder", MENU_SUB, self._open_folder)
+        self.win.update_idletasks()
+
+    def _foot_btn(self, foot, text, fg, cmd):
+        b = tk.Label(foot, text=text, bg=MENU_BG, fg=fg,
+                     font=(MONO_FAMILY, 7), cursor="hand2")
+        b.pack(side="right", padx=(14, 0))
+        b.bind("<Enter>", lambda e: b.configure(fg=MENU_FG))
+        b.bind("<Leave>", lambda e: b.configure(fg=fg))
+        b.bind("<ButtonRelease-1>", lambda e: cmd())
+
+    def _tile(self, grid, path, i):
+        try:
+            normal, hover, copied = self._thumbs_cached(path)
+        except Exception:
+            return                       # unreadable file — skip the tile
+        self._photos += [normal, hover, copied]
+        lab = tk.Label(grid, image=normal, bg=MENU_BG, bd=0, cursor="hand2")
+        lab.grid(row=i // self.COLS, column=i % self.COLS, padx=4, pady=4)
+        state = {"press": None, "dragged": False}
+
+        def on_enter(e):
+            lab.configure(image=hover)
+
+        def on_leave(e):
+            lab.configure(image=normal)
+
+        def on_press(e):
+            state["press"] = (e.x_root, e.y_root)
+            state["dragged"] = False
+
+        def on_motion(e):
+            if state["press"] is None or state["dragged"]:
+                return
+            dx = e.x_root - state["press"][0]
+            dy = e.y_root - state["press"][1]
+            if abs(dx) > 5 or abs(dy) > 5:
+                state["dragged"] = True
+                self._drag_active = True
+                try:
+                    shots.drag_shots([path], dbg)
+                finally:
+                    self._drag_active = False
+                    self.app.note_own_clipboard()
+
+        def on_release(e):
+            if state["press"] is None or state["dragged"]:
+                state["press"] = None
+                return
+            state["press"] = None
+            if e.x > self.TW - 24 and e.y < 24:      # the hover ✕
+                self.app.shots.remove(path)
+                self.app.refresh_shot_badge()
+                self.rebuild()
+                return
+            if shots.copy_shots([path]):
+                self.app.note_own_clipboard()
+                lab.configure(image=copied)
+                lab.after(450, lambda: lab.configure(image=normal))
+                self.app.show_toast(
+                    "Copied — Ctrl+V pastes the image (or the file)", 2200)
+            else:
+                self.app.show_toast("Couldn't copy that — clipboard busy",
+                                    2200)
+
+        lab.bind("<Enter>", on_enter)
+        lab.bind("<Leave>", on_leave)
+        lab.bind("<ButtonPress-1>", on_press)
+        lab.bind("<B1-Motion>", on_motion)
+        lab.bind("<ButtonRelease-1>", on_release)
+
+    # ---- footer actions ----
+
+    def _clear(self):
+        self.app.shots.clear()
+        self.app.refresh_shot_badge()
+        self.close()
+
+    def _open_folder(self):
+        os.makedirs(self.app.shots.folder, exist_ok=True)
+        os.startfile(self.app.shots.folder)
+
+    # ---- window plumbing (same patterns as PopupMenu) ----
+
+    def close(self):
+        if self.closed or self._drag_active:
+            return
+        self.closed = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        if self.on_close:
+            self.on_close()
+
+    def show(self):
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        r = self.app.root
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        x = r.winfo_x() + self.app.width - w        # right edges aligned
+        y = r.winfo_y() - h - 10                    # prefer above the pill
+        if y < 8:
+            y = r.winfo_y() + self.app.height + 10
+        x = max(8, min(x, sw - w - 8))
+        y = max(8, min(y, sh - h - 8))
+        self.win.geometry(f"+{x}+{y}")
+        round_corners(self.win)
+        fade_in(self.win)
+        self.win.lift()
+        try:
+            self.win.focus_force()
+        except Exception:
+            pass
+        self._watch_outside_click()
+
+    def _watch_outside_click(self):
+        if self.closed:
+            return
+        try:
+            down = any(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                       for vk in (0x01, 0x02, 0x04))
+            if down and not self._prev_buttons and not self._drag_active:
+                pt = ctypes.wintypes.POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                x0, y0 = self.win.winfo_rootx(), self.win.winfo_rooty()
+                if not (x0 <= pt.x < x0 + self.win.winfo_width()
+                        and y0 <= pt.y < y0 + self.win.winfo_height()):
+                    self.close()
+                    return
+            self._prev_buttons = down
+        except Exception:
+            pass
+        try:
+            self.win.after(80, self._watch_outside_click)
+        except tk.TclError:
+            pass
 
 
 # ----------------------------------------------------------------------------
@@ -1071,6 +1561,7 @@ class DictationApp:
         self._announce_engine = ""        # toast this name when its load lands
 
         self.root = tk.Tk() if TkinterDnD is None else TkinterDnD.Tk()
+        pick_ui_fonts(self.root)
         self.root.title("DictationMic")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -1120,6 +1611,16 @@ class DictationApp:
         self.label.bind("<Leave>", self.on_leave)
         self._install_drop_targets()
 
+        # screenshot shelf: real PNGs in shots\, watched off the clipboard
+        self.shots = shots.ShotShelf(os.path.join(APP_DIR, "shots"),
+                                     keep=self.settings.get("shots_keep"))
+        self.shots_fresh = False
+        self._shots_win = None
+        self._clip_seq = shots.clip_seq()
+        self._clip_last_check = 0.0
+        self._clip_busy = False
+        self._frame_key = None         # draw() skips repaints of the same frame
+
         self.local_server = None
         self.cloud = None
         self._menu = None
@@ -1132,6 +1633,9 @@ class DictationApp:
         self._hwnd = (ctypes.windll.user32.GetParent(self.root.winfo_id())
                       or self.root.winfo_id())
         self._paste_t = 0.0
+
+        self._badge = ShotBadge(self)
+        self.root.after(400, self._badge.refresh)   # once geometry settles
 
         if engine_ready(self.settings):
             self.state = LOADING
@@ -1338,6 +1842,10 @@ class DictationApp:
     def _menu_items(self):
         s = self.settings
         items = [
+            {"kind": "hero", "text": "Open DictationMic",
+             "hint": "notes · shots · full screen",
+             "command": self.open_app},
+            {"kind": "sep"},
             {"kind": "header", "text": "Output"},
             {"kind": "item", "text": "Type into the box I'm working in",
              "radio": s["mode"] == "type",
@@ -1348,7 +1856,7 @@ class DictationApp:
             {"kind": "sep"},
             {"kind": "header", "text": "Notes"},
             {"kind": "item", "text": "My notes",
-             "hint": "everything you've dictated",
+             "hint": "in your web browser",
              "command": self.open_notes},
             {"kind": "item", "text": "My files",
              "hint": "PDFs, docs & photos as real files",
@@ -1359,6 +1867,19 @@ class DictationApp:
             {"kind": "item", "text": "Keep a copy of each dictation",
              "check": bool(s.get("save_notes", True)),
              "command": self.toggle_save_notes},
+            {"kind": "sep"},
+            {"kind": "header", "text": "Screenshots"},
+            {"kind": "item",
+             "text": f"Pinned shots ({self.shots.count()})",
+             "hint": "drag them into anything",
+             "command": self.toggle_shots_window},
+            {"kind": "item", "text": "Catch screenshots & copied images",
+             "check": bool(s.get("catch_shots", True)),
+             "command": self.toggle_catch_shots},
+            {"kind": "item", "text": "Save caught screenshots to my notes",
+             "hint": "they sync like any note",
+             "check": bool(s.get("shots_to_notes", True)),
+             "command": self.toggle_shots_to_notes},
             {"kind": "sep"},
             {"kind": "header", "text": "Phone sync"},
         ]
@@ -1614,6 +2135,21 @@ class DictationApp:
             self.show_toast(f"Mic error: {payload}", 3000)
         elif name == "flash":
             self.flash_until = time.time() + 1.1
+        elif name == "shot":
+            self.flash_until = time.time() + 0.9
+            self.refresh_shot_badge(fresh=True)
+            if self._shots_win is not None:
+                self._shots_win.rebuild()
+            if not self.settings.get("seen_shots_hint"):
+                self.settings["seen_shots_hint"] = True
+                save_settings(self.settings)
+                self.show_toast(
+                    "Screenshot pinned to my shoulder — click the badge,\n"
+                    "then drag it into Claude Code or click it to copy", 6000)
+        elif name == "shots_changed":
+            self.refresh_shot_badge(fresh=True)
+            if self._shots_win is not None:
+                self._shots_win.rebuild()
         elif name == "toast":
             self.show_toast(payload, 3500)
         elif name == "sync_status":
@@ -1718,9 +2254,13 @@ class DictationApp:
         dx = e.x_root - self.drag_start[0]
         dy = e.y_root - self.drag_start[1]
         if abs(dx) > 4 or abs(dy) > 4:
+            if not self.dragging and self._shots_win is not None:
+                self._shots_win.close()     # shelf doesn't chase the pill
             self.dragging = True
         if self.dragging:
             self.root.geometry(f"+{self.drag_start[2] + dx}+{self.drag_start[3] + dy}")
+            if self._badge.visible:
+                self._badge.place()         # the badge rides the shoulder
 
     def on_release(self, e):
         if self.dragging:
@@ -1804,6 +2344,15 @@ class DictationApp:
     def _ingest_paths(self, paths):
         import dropnotes
         saved_title, saved, real = "", 0, False
+        pinned = False
+        for p in paths[:10]:
+            # images thrown at the pill also land on the shelf, ready to
+            # drag back out — independent of whether the note saves
+            if (os.path.splitext(str(p))[1].lower() in shots.IMAGE_EXTS
+                    and self.shots.pin_file(str(p))):
+                pinned = True
+        if pinned:
+            self.events.put(("shots_changed", None))
         for p in paths[:10]:
             try:
                 title, body = dropnotes.note_from_path(p)
@@ -1863,6 +2412,8 @@ class DictationApp:
                     body = dropnotes.compress_image(clip)
                     title = dropnotes.photo_title("Clipboard image")
                     get_store().create(title, body)
+                    if self.shots.pin_image(clip):   # shelf too (dedupes if
+                        self.events.put(("shots_changed", None))  # caught)
                     self._saved_toast(title)
                     return
                 if isinstance(clip, list) and clip:
@@ -1890,6 +2441,73 @@ class DictationApp:
                 self.events.put(("toast", f"Couldn't save that — {ex}"))
         threading.Thread(target=work, daemon=True).start()
 
+    # ---------------- screenshot shelf ----------------
+
+    def _grab_clip(self):
+        """The clipboard changed while 'catch screenshots' is on: if it's a
+        bitmap (Win+Shift+S, PrtScn, any copied image) pin it to the shelf.
+        Copied *files* are ignored here — throwing files at the pill stays
+        a deliberate act (drop or middle-click)."""
+        try:
+            from PIL import ImageGrab
+            clip = ImageGrab.grabclipboard()
+            if isinstance(clip, Image.Image):
+                path = self.shots.pin_image(clip)
+                if path:
+                    self.events.put(("shot", path))
+                    # ... and into the main app: an image note, synced like
+                    # any other (pin_image already deduped the double-fire)
+                    if self.settings.get("shots_to_notes", True):
+                        try:
+                            import dropnotes
+                            get_store().create(
+                                dropnotes.photo_title("Screenshot"),
+                                dropnotes.compress_image(clip))
+                        except Exception as ex:
+                            dbg(f"shot->note failed: {ex!r}")
+        except Exception as ex:
+            dbg(f"clip catch failed: {ex!r}")
+        finally:
+            self._clip_busy = False
+
+    def note_own_clipboard(self):
+        """We just wrote the clipboard ourselves (copy / drag bookkeeping) —
+        don't let the watcher catch our own copy as a new screenshot."""
+        self._clip_seq = shots.clip_seq()
+
+    def refresh_shot_badge(self, fresh=None):
+        if fresh is not None:
+            self.shots_fresh = fresh
+        self._badge.refresh()
+
+    def toggle_shots_window(self):
+        if self._shots_win is not None:
+            self._shots_win.close()
+            return
+        self.refresh_shot_badge(fresh=False)     # looked at — lime settles
+        self._shots_win = ShotsWindow(
+            self, on_close=lambda: setattr(self, "_shots_win", None))
+        self._shots_win.show()
+
+    def toggle_catch_shots(self):
+        on = not self.settings.get("catch_shots", True)
+        self.settings["catch_shots"] = on
+        save_settings(self.settings)
+        if on:
+            self._clip_seq = shots.clip_seq()    # don't swallow an old copy
+            self.show_toast("Catching screenshots — Win+Shift+S pins "
+                            "to my shoulder", 2600)
+        else:
+            self.show_toast("Not catching screenshots", 1800)
+
+    def toggle_shots_to_notes(self):
+        on = not self.settings.get("shots_to_notes", True)
+        self.settings["shots_to_notes"] = on
+        save_settings(self.settings)
+        self.show_toast("Caught screenshots also land in your notes"
+                        if on else
+                        "Screenshots stay on the shelf only", 2400)
+
     def _sync_status(self):
         cloud = getattr(self, "cloud", None)
         if cloud is None:
@@ -1903,22 +2521,70 @@ class DictationApp:
         os.makedirs(d, exist_ok=True)
         os.startfile(d)
 
-    def open_notes(self):
-        import webbrowser
+    def _notes_url(self):
         # With phone sync on, the hosted app is the one source of truth for
-        # every device — open it instead of the localhost viewer.
+        # every device — use it instead of the localhost viewer.
         if (self.settings.get("sync_enabled")
                 and self.settings.get("sync_refresh_token")):
-            webbrowser.open("https://dictationmic-sync.web.app/")
-            return
+            return "https://dictationmic-sync.web.app/"
         if self.local_server is None:
             from localserver import LocalServer
             self.local_server = LocalServer(get_store(),
                                             status_fn=self._sync_status, dbg=dbg)
         if not self.local_server.start():
+            return None
+        return self.local_server.url()
+
+    def open_notes(self):
+        import webbrowser
+        url = self._notes_url()
+        if url is None:
             self.show_toast("Couldn't open your notes — try again", 3000)
             return
-        webbrowser.open(self.local_server.url())
+        webbrowser.open(url)
+
+    @staticmethod
+    def _edge_path():
+        """msedge.exe, or None. Edge app-mode is how the full app gets a
+        chromeless native window with zero new dependencies."""
+        try:
+            import winreg
+            with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                    r"\App Paths\msedge.exe") as k:
+                p = winreg.QueryValue(k, None)
+            if p and os.path.isfile(p):
+                return p
+        except OSError:
+            pass
+        for base in (os.environ.get("ProgramFiles(x86)"),
+                     os.environ.get("ProgramFiles")):
+            if base:
+                p = os.path.join(base, "Microsoft", "Edge",
+                                 "Application", "msedge.exe")
+                if os.path.isfile(p):
+                    return p
+        return None
+
+    def open_app(self):
+        """The full-screen DictationMic app: the notes UI (text, image and
+        file entries) in its own maximized app window — the hosted app when
+        phone sync is on, the token-gated localhost viewer otherwise."""
+        url = self._notes_url()
+        if url is None:
+            self.show_toast("Couldn't open the app — try again", 3000)
+            return
+        edge = self._edge_path()
+        if edge:
+            try:
+                subprocess.Popen([edge, "--app=" + url, "--start-maximized"],
+                                 close_fds=True)
+                return
+            except Exception as ex:
+                dbg(f"edge app launch failed: {ex!r}")
+        import webbrowser
+        webbrowser.open(url)
 
     # ---------------- phone sync ----------------
 
@@ -2129,6 +2795,9 @@ class DictationApp:
     def assert_topmost(self):
         try:
             self.root.attributes("-topmost", True)
+            if self._badge.visible:
+                self._badge.win.attributes("-topmost", True)
+                self._badge.win.lift()
         except Exception:
             pass
         self.root.after(2000, self.assert_topmost)
@@ -2140,15 +2809,18 @@ class DictationApp:
             threading.Thread(target=winsound.Beep, args=(freq, ms),
                              daemon=True).start()
 
-    def _popup(self, text, font=("Segoe UI", 10)):
-        t = tk.Toplevel(self.root)
+    def _popup(self, text, font=None):
+        t = tk.Toplevel(self.root, bg=MENU_BG)
         t.overrideredirect(True)
         try:
             t.title("DM|" + text.split("\n")[0][:80])
         except Exception:
             pass
         t.attributes("-topmost", True)
-        tk.Label(t, text=text, bg="#141519", fg="#eceef2", font=font,
+        t.configure(highlightthickness=1, highlightbackground=MENU_EDGE,
+                    highlightcolor=MENU_EDGE)
+        tk.Label(t, text=text, bg=MENU_BG, fg=MENU_FG,
+                 font=font or (UI_FAMILY, 10),
                  padx=14, pady=8, justify="left").pack()
         t.update_idletasks()
         x = self.root.winfo_x() + self.width // 2 - t.winfo_width() // 2
@@ -2157,6 +2829,8 @@ class DictationApp:
             y = self.root.winfo_y() + self.height + 10
         x = max(0, min(x, self.root.winfo_screenwidth() - t.winfo_width()))
         t.geometry(f"+{x}+{y}")
+        round_corners(t)
+        fade_in(t)
         make_non_activating(t)
         return t
 
@@ -2187,7 +2861,9 @@ class DictationApp:
             "Hold + drag — move me\n"
             "Drop files, text or images on me — synced as notes\n"
             "Ctrl+V over me (or middle-click) — save the clipboard\n"
-            "Right-click or Shift+click — options", ("Segoe UI", 9))
+            "Screenshots pin to my shoulder — click the badge\n"
+            "Right-click or Shift+click — menu & the full app",
+            (UI_FAMILY, 9))
 
     def hide_tooltip(self):
         if self.tooltip is not None:
@@ -2219,20 +2895,47 @@ class DictationApp:
                         self.show_toast("Stopped listening (it went quiet)", 2200)
             else:
                 self.level_hist.append(0.0)
+            # screenshot watcher: a cheap sequence-number poll twice a second
+            # (no clipboard open, no message pump) — grabbing the actual
+            # bitmap happens off-thread only when the number moves
+            now = time.time()
+            if (now - self._clip_last_check >= 0.5 and not self._clip_busy
+                    and self.settings.get("catch_shots", True)):
+                self._clip_last_check = now
+                seq = shots.clip_seq()
+                if seq != self._clip_seq:
+                    self._clip_seq = seq
+                    self._clip_busy = True
+                    threading.Thread(target=self._grab_clip,
+                                     daemon=True).start()
             self.draw()
         except Exception:
             pass
-        self.root.after(33, self.tick)
+        # 30fps only while something on the pill is actually moving (or a
+        # held modifier needs tight push-to-talk timing); a sleeping pill
+        # ticks at 10Hz and draw() below is a no-op repaint-wise
+        animating = (self.state in (LISTENING, STARTING, FINISHING,
+                                    DOWNLOADING)
+                     or self.drop_hover or self._mod_down
+                     or time.time() < self.flash_until)
+        self.root.after(33 if animating else 100, self.tick)
+
+    def _set_frame(self, key, maker):
+        """Repaint only when the frame identity changed — a sleeping pill
+        must not touch Tk at all. key=None means 'always animating'."""
+        if key is not None and key == self._frame_key:
+            return
+        self._frame_key = key
+        self._photo = maker()
+        self.label.configure(image=self._photo)
 
     def draw(self):
         r = self.renderer
         if self.drop_hover:                 # a drag is over us — outrank all
-            self._photo = r.drop()
-            self.label.configure(image=self._photo)
+            self._set_frame(("drop",), r.drop)
             return
         if time.time() < self.flash_until:  # just caught a drop/paste
-            self._photo = r.flash()
-            self.label.configure(image=self._photo)
+            self._set_frame(("flash",), r.flash)
             return
         if self.state in (LISTENING, STARTING):
             hist = list(self.level_hist)[-r.nbars:]
@@ -2241,16 +2944,16 @@ class DictationApp:
                 breathe = 0.05 + 0.04 * math.sin(self.phase * 1.7 + i * 0.7)
                 bars.append(max(breathe, min(1.0, v * 1.8)))
             pulse = 0.5 + 0.5 * math.sin(self.phase * 0.9)
-            self._photo = r.listening(bars, pulse)
+            self._set_frame(None, lambda: r.listening(bars, pulse))
         elif self.state == FINISHING:
-            self._photo = r.dots(self.phase)
+            self._set_frame(None, lambda: r.dots(self.phase))
         elif self.state == DOWNLOADING:
-            self._photo = r.downloading(self.dl_frac)
+            self._set_frame(None, lambda: r.downloading(self.dl_frac))
         elif self.state == LOADING:
-            self._photo = r.idle(False, dim=True)
+            self._set_frame(("loading",), lambda: r.idle(False, dim=True))
         else:
-            self._photo = r.idle(self.hover)
-        self.label.configure(image=self._photo)
+            self._set_frame(("idle", self.hover),
+                            lambda: r.idle(self.hover))
 
     def run(self):
         self.root.mainloop()

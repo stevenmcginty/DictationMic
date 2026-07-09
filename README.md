@@ -14,8 +14,10 @@ first run, nothing leaves your computer.
    is in.
 4. Tap again to stop — or say nothing for 10 seconds and it stops itself.
 5. **Hold** the hotkey instead of tapping for push-to-talk.
-6. **Right-click** the pill for options — including **Change hotkey…**
-   (press any key you like) and clipboard mode.
+6. **Right-click** the pill for the menu — the big volt button at the top,
+   **Open DictationMic**, opens the full-screen app (all your notes, image
+   entries and files in one window); below it live the options, including
+   **Change hotkey…** (press any key you like) and clipboard mode.
 
 What the pill means:
 - **Dark with a row of sleeping grey dots** — idle, ready when you are.
@@ -36,6 +38,28 @@ nothing leaves your machine):
 - Notes are just text files — back them up, sync them, open them anywhere.
 - Don't want copies kept? Untick **Keep a copy of each dictation** in the
   right-click menu.
+
+## Screenshots — the shelf
+
+Take a screenshot (**Win+Shift+S**, PrtScn) or copy any image and the pill
+catches it: a little badge appears on the pill's shoulder with a count,
+lime until you've looked. The shot is kept as a real PNG in `shots\`
+(newest 12, oldest pruned automatically).
+
+Click the badge and the shelf pops open as thumbnails:
+
+- **Drag one out** — a real file drag, straight into Claude Code, a chat
+  box, an email, Explorer… anywhere that takes a file.
+- **Click one** — copies it as a file *and* as a bitmap, so **Ctrl+V**
+  pastes whichever the target app prefers (Claude Code pastes the image).
+- Hover **✕** removes a shot; **Clear all** / **Open folder** live in the
+  footer. Images dropped on the pill land on the shelf too.
+
+Don't want it? Untick **Catch screenshots & copied images** in the
+right-click menu. The shelf itself is a local scratch tray (newest 12,
+nothing syncs from it) — but caught screenshots are **also saved as image
+notes** so they show up in the full app and on your phone; untick
+**Save caught screenshots to my notes** to keep them shelf-only.
 
 ## Phone sync
 
@@ -127,6 +151,9 @@ Windows only — the Mac needs a separately built app.
 | `hotkeys`           | list of global hotkeys                      |
 | `auto_stop_seconds` | stop after this much silence (0 = never)    |
 | `size`              | pill width in pixels, default 84            |
+| `catch_shots`       | pin screenshots/copied images to the shelf  |
+| `shots_keep`        | how many pinned shots to keep, default 12   |
+| `shots_to_notes`    | caught screenshots also saved as image notes|
 | `beeps`             | `true`/`false` — start/stop sounds          |
 | `engine`            | `"whisper"` (default) or `"parakeet"`       |
 | `model`             | folder under `models\`, default `small.en`  |
@@ -151,6 +178,8 @@ venv\Scripts\pyinstaller --noconsole --name DictationMic --icon icon.ico ^
 Run from source instead: `venv\Scripts\pythonw.exe app.py`
 
 Source layout: `app.py` (pill + dictation), `notestore.py` (notes folder +
-sync index), `localserver.py` (localhost API for the notes UI),
+sync index), `shots.py` (screenshot shelf: clipboard watch, copy, OLE
+drag-out), `localserver.py` (localhost API for the notes UI),
 `cloudsync.py` (Firebase sync), `web\` (notes UI + phone PWA — deploy with
-`firebase deploy --only hosting`).
+`firebase deploy --only hosting`). The desktop look (pill, menu, shelf,
+toasts) is specced in `DESIGN-DESKTOP.md`; the web app's in `web\DESIGN.md`.
