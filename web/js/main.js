@@ -35,6 +35,26 @@ async function wireAccountPop() {
   });
 }
 
+// Screenshots shared in from Android's share sheet (sw.js stashed them in
+// the "dictmic-shared" cache). Claim each entry (delete) as it's read so a
+// mid-boot reload — e.g. a new SW taking over — can never save it twice.
+async function drainSharedFiles(app) {
+  if (!("caches" in window)) return;
+  try {
+    const cache = await caches.open("dictmic-shared");
+    const files = [];
+    for (const req of await cache.keys()) {
+      const res = await cache.match(req);
+      await cache.delete(req);
+      if (!res) continue;
+      const blob = await res.blob();
+      const name = decodeURIComponent(res.headers.get("X-Shared-Name") || "");
+      files.push(new File([blob], name, { type: blob.type || "image/png" }));
+    }
+    if (files.length) await app.saveAnyFiles(files);
+  } catch { /* never block boot on a share drop */ }
+}
+
 function fail(msg) {
   $("noteList").textContent = "";
   $("emptyState").hidden = false;
@@ -71,6 +91,7 @@ async function boot() {
       const app = new App(adapter, { showMic: micAvailable(), openMic });
       await app.start();
       wireAccountPop();
+      drainSharedFiles(app);
     }
   } catch (e) {
     fail(e.message || "Something went wrong.");
