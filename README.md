@@ -69,8 +69,8 @@ Android phone open **https://dictationmic-sync.web.app**, sign in with the
 same details, and use Chrome's ⋮ → *Add to Home screen* to install it.
 
 - Dictate on the phone (big mic button — records silently, no beeps; the
-  computer's Whisper writes it into text within seconds of seeing it) and
-  the note lands in `notes\` on the computer.
+  computer writes it into text within seconds of seeing it) and the note
+  lands in `notes\` on the computer.
 - Works the other way too: everything you dictate at the computer shows up
   on the phone, and edits, renames and deletes flow both directions.
 - No signal? Notes queue on the phone (even if you close the app) and port
@@ -87,22 +87,14 @@ Extras:
 
 ## Speech engine
 
-Two engines, one click apart (right-click → **Speech engine**):
-
-- **Whisper** — the original. `small.en` for live dictation, `medium.en`
-  fetched quietly the first time a phone voice note needs it.
-- **Parakeet** — NVIDIA's Parakeet TDT 0.6B, run locally through
-  [onnx-asr](https://github.com/istupakov/onnx-asr). One ~660 MB one-time
-  fetch, then it does **both** jobs — live dictation *and* phone voice
-  notes — so there's no second model to download or hold in RAM. It sits
-  above `whisper medium.en` on the open English leaderboards and runs far
-  faster on CPU: on this machine an 88-second voice note transcribes in
-  ~4 s (Parakeet) vs ~19 s (medium.en), and long recordings are chunked at
-  their quietest instant so nothing is lost at the seams.
-
-Switching is instant if the files are already on disk, and shows the usual
-download ring if not. Everything stays on-device either way. If an engine
-ever fails to load, the pill says so — right-click and switch back.
+**Parakeet** — NVIDIA's Parakeet TDT 0.6B, run locally through
+[onnx-asr](https://github.com/istupakov/onnx-asr). One ~660 MB one-time
+fetch, then it does **both** jobs — live dictation *and* phone voice
+notes — so there's no second model to download or hold in RAM. It sits
+above `whisper medium.en` on the open English leaderboards and runs far
+faster on CPU: on this machine an 88-second voice note transcribes in
+~4 s, and long recordings are chunked at their quietest instant so nothing
+is lost at the seams. Everything stays on-device.
 Benchmark your own machine any time:
 
 ```
@@ -155,17 +147,16 @@ Windows only — the Mac needs a separately built app.
 | `shots_keep`        | how many pinned shots to keep, default 12   |
 | `shots_to_notes`    | caught screenshots also saved as image notes|
 | `beeps`             | `true`/`false` — start/stop sounds          |
-| `engine`            | `"whisper"` (default) or `"parakeet"`       |
-| `model`             | folder under `models\`, default `small.en`  |
 
 ## Tech
 
-- Speech recognition: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-  running Whisper `small.en` locally on the CPU (int8) with voice-activity
-  detection; speech is chunked into phrases at natural pauses so text appears
-  live while you keep talking.
+- Speech recognition: NVIDIA Parakeet TDT 0.6B via
+  [onnx-asr](https://github.com/istupakov/onnx-asr) locally on the CPU
+  (int8); speech is chunked into phrases at natural pauses so text appears
+  live while you keep talking. faster-whisper stays installed only for its
+  `decode_audio` helper (phone voice-note containers → PCM).
 - Model auto-downloads from Hugging Face on first run (with resume + retry),
-  then lives in `models\small.en`.
+  then lives in `models\parakeet-tdt-0.6b-v2`.
 
 ## Rebuilding from source
 

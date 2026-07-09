@@ -2,14 +2,14 @@
 DictationMic — on-device live dictation for Windows.
 
 A floating, draggable, always-on-top dictation pill. Tap RIGHT CTRL (or click
-the pill) and just talk: each phrase is transcribed locally with Whisper the
-moment you pause, and typed straight into the focused input box (or
-accumulated to the clipboard). Goes quiet for 10 s? It stops by itself.
-Hold the hotkey instead of tapping for push-to-talk. Right-click the pill
-(or Shift+click / Ctrl+click, for touchpads with a stubborn right button) to
-change the hotkey to any key you like.
+the pill) and just talk: each phrase is transcribed locally with NVIDIA's
+Parakeet model the moment you pause, and typed straight into the focused
+input box (or accumulated to the clipboard). Goes quiet for 10 s? It stops by
+itself. Hold the hotkey instead of tapping for push-to-talk. Right-click the
+pill (or Shift+click / Ctrl+click, for touchpads with a stubborn right
+button) to change the hotkey to any key you like.
 
-First run downloads the speech model (~480 MB, one time); after that it is
+First run downloads the speech model (~660 MB, one time); after that it is
 fully offline.
 """
 
@@ -106,12 +106,6 @@ def dbg(msg):
 DEFAULT_SETTINGS = {
     "mode": "type",            # "type" -> types into focused box, "clipboard" -> copies
     "hotkeys": ["ctrl", "f8"],         # tap = start/stop, hold = push-to-talk
-    "engine": "whisper",       # "whisper" or "parakeet" (see ParakeetTranscriber)
-    "model": "small.en",
-    "voice_model": "medium.en",  # phone voice notes: transcribed in the
-                                 # background, so a bigger, more accurate
-                                 # model costs nothing in dictation latency
-    "language": "en",
     "beeps": True,
     "save_notes": True,        # keep a copy of every dictation in notes\
     "auto_stop_seconds": 10,   # stop listening after this much silence (0 = never)
@@ -150,8 +144,10 @@ def load_settings():
     # left/right modifier variants can't be told apart reliably -> use the family
     s["hotkeys"] = [("ctrl" if isinstance(hk, str) and hk.endswith("ctrl") else hk)
                     for hk in s["hotkeys"]]
-    if s.get("engine") not in ("whisper", "parakeet"):
-        s["engine"] = "whisper"
+    # Whisper is gone — Parakeet is the engine. Drop the old knobs so a
+    # stale settings.json can't resurrect them.
+    for legacy in ("engine", "model", "voice_model", "language", "beam_size"):
+        s.pop(legacy, None)
     return s
 
 def save_settings(s):
@@ -234,7 +230,7 @@ BLOCK = 1024                       # 64 ms blocks
 PAUSE_CUT_S = 1.0                  # silence gap that ends a phrase — a real
                                    # sentence pause, not a breath. Short gaps
                                    # were splitting sentences into fragments
-                                   # that Whisper punctuated as "Full. Stops."
+                                   # the engine punctuated as "Full. Stops."
 SOFT_CUT_S = 0.55                  # mid-speech dip that's enough to split at...
 SOFT_CUT_AFTER_S = 7.0             # ...once the phrase is already this long
 MIN_VOICED_BLOCKS = 2              # ~130 ms of speech before a phrase counts
@@ -301,7 +297,7 @@ class LiveRecorder:
 
         self.level = 0.55 * self.level + 0.45 * min(1.0, (rms / max(threshold, 1e-4)) * 0.35)
 
-        # software mic boost for Whisper's benefit: aim the loudest recent
+        # software mic boost for the engine's benefit: aim the loudest recent
         # audio at a healthy peak so quiet mics transcribe like loud ones.
         # Adapt ONLY while the window holds real signal (well clear of the
         # noise floor) — during silence the gain HOLDS, so a thinking pause
@@ -335,7 +331,7 @@ class LiveRecorder:
                 (pending_s > SOFT_CUT_AFTER_S and silent_for > SOFT_CUT_S)
                 or pending_s > MAX_PHRASE_S):
             # forced cut during (near-)continuous speech: never slice at
-            # "now" — that lands mid-word and Whisper drops both halves
+            # "now" — that lands mid-word and the engine drops both halves
             self._emit_at_quietest()
         elif self._voiced_blocks == 0 and pending_s > 3.0:
             # nothing but silence piling up — drop it
@@ -381,95 +377,21 @@ class LiveRecorder:
         self.out.put(("end", None))
 
 # ----------------------------------------------------------------------------
-# Transcriber (local Whisper)
+# Speech engine — NVIDIA's Parakeet TDT 0.6B via onnx-asr.
+# Tops the open English ASR leaderboard while running faster than realtime on
+# CPU, so words land sooner AND read better. One model serves live dictation
+# and phone voice notes.
 # ----------------------------------------------------------------------------
-
-MODEL_SIZES = {"tiny.en": "~75 MB", "base.en": "~140 MB", "small.en": "~480 MB",
-               "medium.en": "~1.5 GB", "large-v3": "~2.9 GB"}
 
 def model_dir(name):
     return os.path.join(APP_DIR, "models", name)
-
-def model_dir_for(settings):
-    return model_dir(settings["model"])
-
-def model_files_ready(name):
-    d = model_dir(name)
-    return (os.path.isfile(os.path.join(d, "model.bin"))
-            and os.path.getsize(os.path.join(d, "model.bin")) > 10_000_000
-            and os.path.isfile(os.path.join(d, "config.json"))
-            and os.path.isfile(os.path.join(d, "tokenizer.json")))
-
-def model_ready(settings):
-    return model_files_ready(settings["model"])
-
-class Transcriber:
-    def __init__(self, settings, model_key="model"):
-        self.settings = settings
-        self.model_key = model_key
-        self.model = None
-        self.error = None
-
-    def load(self):
-        try:
-            from faster_whisper import WhisperModel
-            name = self.settings.get(self.model_key) or self.settings["model"]
-            model_path = model_dir(name)
-            if not os.path.isdir(model_path):
-                model_path = name
-            # Use only HALF the cores so the pill's animation, the audio meter
-            # and keypress handling stay snappy WHILE Whisper transcribes. On
-            # this hybrid CPU (Lunar Lake: 4 fast P-cores + 4 slow E-cores) 6
-            # threads bought only ~9% over 4 yet pegged 6/8 cores and made the
-            # UI stutter during dictation. Half the cores is still ~7x real-time
-            # for small.en — far more than live dictation needs.
-            threads = min(6, max(2, (os.cpu_count() or 8) // 2))
-            self.model = WhisperModel(
-                model_path, device="cpu", compute_type="int8", cpu_threads=threads)
-        except Exception as e:
-            self.error = str(e)
-
-    def transcribe(self, audio, context="", long=False):
-        if self.model is None:
-            return ""
-        # live phrases are already cut at silence by the recorder; a small beam
-        # buys back accuracy now that chunks are whole sentences. Voice notes
-        # (long=True) have no latency budget: wider beam, and VAD strips the
-        # trailing auto-stop silence that makes Whisper hallucinate.
-        beam = int(self.settings.get("beam_size") or 3)
-        segments, _ = self.model.transcribe(
-            audio,
-            language=self.settings.get("language") or None,
-            beam_size=max(beam, 5) if long else beam,
-            vad_filter=long,
-            without_timestamps=True,
-            condition_on_previous_text=False,
-            initial_prompt=context[-200:] if context else None,
-        )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        # hesitations come out as "..." — never something you dictated
-        text = re.sub(r"\.{2,}|…", "", text)
-        text = re.sub(r"\s{2,}", " ", text).strip()
-        # what Whisper hears in a chunk of breath
-        if text.lower().strip(" .,!?") in (
-                "you", "thank you", "thanks for watching", "bye", "uh", "um"):
-            return ""
-        return text
-
-# ----------------------------------------------------------------------------
-# Parakeet engine (optional) — NVIDIA's Parakeet TDT 0.6B via onnx-asr.
-# Tops the open English ASR leaderboard (ahead of whisper medium.en) while
-# running faster than small.en on CPU, so words land sooner AND read better.
-# One model serves live dictation and phone voice notes; Whisper stays the
-# default until it's proven on this machine (right-click menu to switch).
-# ----------------------------------------------------------------------------
 
 PARAKEET_NAME = "parakeet-tdt-0.6b-v2"
 PARAKEET_SIZE_HINT = "~660 MB"
 _PARAKEET_BASE = ("https://huggingface.co/istupakov/parakeet-tdt-0.6b-v2-onnx"
                   "/resolve/main/")
 # file -> minimum plausible size, so a stray HTML error page can never pass
-# for a model file (same guard model_files_ready applies to model.bin)
+# for a model file
 PARAKEET_FILES = {
     "config.json": 50,             # 97 B
     "vocab.txt": 5_000,            # 9.4 KB
@@ -515,9 +437,9 @@ def fetch_resumable(url, part, progress=None):
             raise IOError("incomplete download")
 
 def download_parakeet(progress=None, notify=None):
-    """Fetch the Parakeet model into models\\ with the same wait-for-internet
-    patience as the Whisper downloader. progress(frac) follows the big
-    encoder file; notify(msg) surfaces one-time status toasts."""
+    """Fetch the Parakeet model into models\\, waiting out internet drops and
+    resuming partial files. progress(frac) follows the big encoder file;
+    notify(msg) surfaces one-time status toasts."""
     d = parakeet_dir()
     os.makedirs(d, exist_ok=True)
     warned = False
@@ -558,11 +480,10 @@ def download_parakeet(progress=None, notify=None):
     return True
 
 class ParakeetTranscriber:
-    """Drop-in Transcriber built on onnx-asr instead of faster-whisper.
-    Same load()/transcribe()/model/error shape, so the worker, warm-up and
-    voice-note paths never care which engine sits behind them."""
+    """The speech engine: load()/transcribe()/model/error, shared by the
+    live-dictation worker, the warm-up and phone voice notes."""
 
-    def __init__(self, settings, model_key="model"):
+    def __init__(self, settings):
         self.settings = settings
         self.model = None
         self.error = None
@@ -571,16 +492,16 @@ class ParakeetTranscriber:
         try:
             import onnxruntime as ort
             import onnx_asr
-            # same budget as Whisper: half the cores keeps the pill's meter,
-            # animation and keypress handling snappy while we transcribe
+            # only HALF the cores, so the pill's meter, animation and
+            # keypress handling stay snappy while we transcribe
             so = ort.SessionOptions()
             so.intra_op_num_threads = min(6, max(2, (os.cpu_count() or 8) // 2))
             so.inter_op_num_threads = 1
             # ORT worker threads busy-spin between ops and keep spinning after
             # each run by default — with a phrase transcribed every few seconds
-            # that pegs the cores continuously and starves the Tk thread (same
-            # UI-starvation as the Whisper cpu_threads fix, but hotter). Sleep
-            # instead of spin: costs microseconds at 10-22x realtime headroom.
+            # that pegs the cores continuously and starves the Tk thread.
+            # Sleep instead of spin: costs microseconds at 10-22x realtime
+            # headroom.
             so.add_session_config_entry("session.intra_op.allow_spinning", "0")
             so.add_session_config_entry("session.inter_op.allow_spinning", "0")
             self.model = onnx_asr.load_model(
@@ -612,21 +533,11 @@ class ParakeetTranscriber:
         text = " ".join(p for p in parts if p)
         text = re.sub(r"\.{2,}|…", "", text)
         text = re.sub(r"\s{2,}", " ", text).strip()
-        # breath-chunk hallucinations, same guard as Whisper's
+        # what the model hears in a chunk of breath
         if text.lower().strip(" .,!?") in (
                 "you", "thank you", "thanks for watching", "bye", "uh", "um"):
             return ""
         return text
-
-def make_transcriber(settings, model_key="model"):
-    if settings.get("engine") == "parakeet":
-        return ParakeetTranscriber(settings, model_key)
-    return Transcriber(settings, model_key)
-
-def engine_ready(settings):
-    if settings.get("engine") == "parakeet":
-        return parakeet_files_ready()
-    return model_ready(settings)
 
 # ----------------------------------------------------------------------------
 # Typing helper: don't type while a modifier is physically held, or the held
@@ -1041,11 +952,11 @@ class PopupMenu:
                            highlightbackground=MENU_EDGE,
                            highlightcolor=MENU_EDGE)
         self._prev_buttons = True     # swallow the click that opened us
-        body = tk.Frame(self.win, bg=MENU_BG)
-        body.pack(fill="both", expand=True, pady=7)
+        self._body = tk.Frame(self.win, bg=MENU_BG)
+        self._body.pack(fill="both", expand=True, pady=7)
         for it in items:
-            self._add(body, it)
-        self._finish_heroes(body)
+            self._add(self._body, it)
+        self._finish_heroes(self._body)
         self.win.bind("<Escape>", lambda e: self.close())
         self.win.bind("<FocusOut>", lambda e: self.close())
 
@@ -1161,11 +1072,30 @@ class PopupMenu:
         if self.on_close:
             self.on_close()
 
-    def show(self, x, y):
+    def _hero_center_y(self):
+        """Vertical centre of the first hero capsule, relative to the card's
+        top edge — so show() can put the capsule exactly where the pill is."""
+        if not self._heroes:
+            return None
+        lab = self._heroes[0][0]
+        return self._body.winfo_y() + lab.winfo_y() + lab.winfo_height() // 2
+
+    def show(self, x, y, anchor=None):
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        if y - h > 8:                 # pill lives near the bottom: open upward
+        if anchor:
+            # the card replaces the pill: the hero capsule opens dead on the
+            # pill's spot (the pill hides while we're open), so right-click
+            # reads as the pill unfolding into the card and folding back
+            ax, ay, aw, ah = anchor
+            x = ax + (aw - w) // 2
+            cy = self._hero_center_y()
+            if cy is not None:
+                y = ay + ah // 2 - cy
+            else:
+                y = ay - h + 2 if ay - h + 2 >= 8 else ay + ah - 2
+        elif y - h > 8:               # pill lives near the bottom: open upward
             y = y - h
         x = max(8, min(x, sw - w - 8))
         y = max(8, min(y, sh - h - 8))
@@ -1268,6 +1198,11 @@ class ShotBadge:
         x = max(0, min(x, r.winfo_screenwidth() - self.d))
         y = max(0, min(y, r.winfo_screenheight() - self.d))
         self.win.geometry(f"{self.d}x{self.d}+{x}+{y}")
+
+    def hide(self):
+        if self.visible:
+            self.win.withdraw()
+            self.visible = False
 
     def refresh(self):
         count = self.app.shots.count()
@@ -1551,15 +1486,11 @@ class DictationApp:
         self.events = queue.Queue()     # UI events
         self.work = queue.Queue()       # audio phrases -> transcriber worker
         self.recorder = LiveRecorder(self.work)
-        self.transcriber = make_transcriber(self.settings)
-        self.voice_transcriber = None     # bigger model for phone notes (lazy)
-        self._voice_state = "idle"        # idle | preparing | ready | fallback
-        self._voice_lock = threading.Lock()
+        self.transcriber = ParakeetTranscriber(self.settings)
         self.session_text = []
         self.context = ""
         self.session_start = 0.0
         self.dl_frac = 0.0
-        self._announce_engine = ""        # toast this name when its load lands
 
         self.root = tk.Tk() if TkinterDnD is None else TkinterDnD.Tk()
         pick_ui_fonts(self.root)
@@ -1641,7 +1572,7 @@ class DictationApp:
         self._badge = ShotBadge(self)
         self.root.after(400, self._badge.refresh)   # once geometry settles
 
-        if engine_ready(self.settings):
+        if parakeet_files_ready():
             self.state = LOADING
             threading.Thread(target=self._load_model, daemon=True).start()
         else:
@@ -1915,20 +1846,6 @@ class DictationApp:
             items.append({"kind": "item", "text": "Set up phone sync…",
                           "hint": "your notes, on your phone",
                           "command": self.sync_dialog})
-        eng = s.get("engine") or "whisper"
-        items += [
-            {"kind": "sep"},
-            {"kind": "header", "text": "Speech engine"},
-            {"kind": "item", "text": "Whisper — the original",
-             "hint": "small.en live · medium.en for notes",
-             "radio": eng != "parakeet",
-             "command": lambda: self.set_engine("whisper")},
-            {"kind": "item", "text": "Parakeet — faster and sharper",
-             "hint": ("already on this PC" if parakeet_files_ready()
-                      else f"one-time {PARAKEET_SIZE_HINT} fetch"),
-             "radio": eng == "parakeet",
-             "command": lambda: self.set_engine("parakeet")},
-        ]
         items += [
             {"kind": "sep"},
             {"kind": "header", "text": f"Talk key — {self.hotkey_label()}"},
@@ -1948,31 +1865,6 @@ class DictationApp:
         self.show_toast("Words will be typed where your cursor is"
                         if mode == "type"
                         else "Words will be copied to the clipboard", 2200)
-
-    def set_engine(self, engine):
-        if engine == (self.settings.get("engine") or "whisper"):
-            return
-        if self.state != IDLE:
-            self.show_toast("Let me finish what I'm doing, then switch", 2600)
-            return
-        self.settings["engine"] = engine
-        save_settings(self.settings)
-        # voice notes must follow the engine too — drop the old big model
-        self.voice_transcriber = None
-        self._voice_state = "idle"
-        self.transcriber = make_transcriber(self.settings)
-        self._announce_engine = "Parakeet" if engine == "parakeet" else "Whisper"
-        if engine_ready(self.settings):
-            self.state = LOADING
-            self.show_toast(f"Switching to {self._announce_engine}…", 2200)
-            threading.Thread(target=self._load_model, daemon=True).start()
-        else:
-            self.state = DOWNLOADING
-            self.dl_frac = 0.0
-            self.show_toast("Fetching Parakeet (one-time, "
-                            f"{PARAKEET_SIZE_HINT}) — watch my progress ring",
-                            3200)
-            threading.Thread(target=self._download_model, daemon=True).start()
 
     def toggle_save_notes(self):
         self.settings["save_notes"] = not self.settings.get("save_notes", True)
@@ -1997,59 +1889,11 @@ class DictationApp:
     # ---------------- model download (first run only) ----------------
 
     def _download_model(self):
-        if self.settings.get("engine") == "parakeet":
-            def frac(f):
-                self.dl_frac = f
-            ok = download_parakeet(
-                progress=frac, notify=lambda m: self.events.put(("toast", m)))
-        else:
-            ok = self._download_files(self.settings["model"], primary=True)
-        if ok:
-            self.events.put(("dl_done", None))
-
-    def _download_files(self, mdl, primary):
-        """Fetch one Whisper model into models\\<mdl>. primary drives the
-        pill's % readout; the voice-note model downloads quietly."""
-        d = model_dir(mdl)
-        os.makedirs(d, exist_ok=True)
-        base = f"https://huggingface.co/Systran/faster-whisper-{mdl}/resolve/main/"
-        files = ["config.json", "tokenizer.json", "vocabulary.txt", "model.bin"]
-        warned = False
-        for name in files:
-            dest = os.path.join(d, name)
-            if os.path.isfile(dest) and (name != "model.bin"
-                                         or os.path.getsize(dest) > 10_000_000):
-                continue
-            part = dest + ".part"
-            while True:
-                try:
-                    self._fetch(base + name, part,
-                                big=(name == "model.bin" and primary))
-                    os.replace(part, dest)
-                    break
-                except urllib.error.HTTPError as ex:
-                    if ex.code == 416:          # range beyond end -> already complete
-                        os.replace(part, dest)
-                        break
-                    if ex.code == 404 and name != "model.bin":
-                        break                   # optional file missing upstream
-                    self.events.put(("toast",
-                                     f"Couldn't fetch the speech model (HTTP {ex.code})"))
-                    return False
-                except Exception:
-                    if not warned:
-                        warned = True
-                        size = MODEL_SIZES.get(mdl, "several hundred MB")
-                        self.events.put(("toast",
-                                         f"Fetching the speech model (one-time, {size}).\n"
-                                         "Waiting for internet…"))
-                    time.sleep(4)
-        return True
-
-    def _fetch(self, url, part, big=False):
         def frac(f):
             self.dl_frac = f
-        fetch_resumable(url, part, frac if big else None)
+        if download_parakeet(progress=frac,
+                             notify=lambda m: self.events.put(("toast", m))):
+            self.events.put(("dl_done", None))
 
     # ---------------- background: model + transcription worker ----------------
 
@@ -2111,12 +1955,8 @@ class DictationApp:
             self.state = IDLE
             if self.transcriber.error:
                 dbg(f"model load error: {self.transcriber.error}")
-                self.show_toast("Speech model failed to load — right-click me "
-                                "to try the other engine", 4000)
-            elif self._announce_engine:
-                self.show_toast(f"{self._announce_engine} is ready — talk away",
-                                2600)
-            self._announce_engine = ""
+                self.show_toast("The speech model failed to load — "
+                                "exit and start me again", 4000)
         elif name == "dl_done":
             self.state = LOADING
             threading.Thread(target=self._load_model, daemon=True).start()
@@ -2198,6 +2038,8 @@ class DictationApp:
     # ---------------- session control ----------------
 
     def toggle(self):
+        if self._menu is not None:
+            self._menu.close()        # give the pill back before it animates
         if self.state == DOWNLOADING:
             self.show_toast(f"Fetching the speech model — {int(self.dl_frac * 100)}% "
                             "(one-time download)", 2200)
@@ -2288,9 +2130,26 @@ class DictationApp:
         self.hide_tooltip()
         if self._menu is not None:
             self._menu.close()
-        self._menu = PopupMenu(self.root, self._menu_items(),
-                               on_close=lambda: setattr(self, "_menu", None))
-        self._menu.show(e.x_root, e.y_root)
+        self._badge.hide()            # the card takes the shoulder space
+
+        def closed():
+            self._menu = None
+            try:                      # the card folds back into the pill
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+                make_non_activating(self.root)
+                self.root.lift()
+            except Exception:
+                pass
+            self._badge.refresh()
+
+        r = self.root
+        anchor = (r.winfo_x(), r.winfo_y(), self.width, self.height)
+        self._menu = PopupMenu(self.root, self._menu_items(), on_close=closed)
+        # hide the pill BEFORE the card takes focus — withdrawing after
+        # would fire the card's FocusOut and close it on arrival
+        self.root.withdraw()          # the card IS the pill while it's open
+        self._menu.show(e.x_root, e.y_root, anchor=anchor)
 
     # ---------------- throw things at the pill ----------------
     # Drag files, images or selected text onto the pill and each becomes its
@@ -2392,6 +2251,8 @@ class DictationApp:
     def _pointer_over_pill(self):
         """Win32-only hit test (safe from the keyboard-hook thread)."""
         try:
+            if not ctypes.windll.user32.IsWindowVisible(self._hwnd):
+                return False          # hidden while the card is open
             pt = ctypes.wintypes.POINT()
             rect = ctypes.wintypes.RECT()
             if not (ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
@@ -2632,67 +2493,28 @@ class DictationApp:
     # ---------------- phone sync ----------------
 
     def _voice_stt(self, audio_bytes):
-        """Turn a phone voice note (webm/mp4 bytes) into text. Notes are
-        transcribed in the background, so they get the bigger voice_model
-        (fetched on first use) — live dictation stays on the small, snappy
-        one. None = busy/not ready, cloudsync retries in a few seconds."""
+        """Turn a phone voice note (webm/mp4 bytes) into text with the same
+        Parakeet model that does live dictation. None = busy/not ready,
+        cloudsync retries in a few seconds."""
         if self.recorder.stream is not None:
             return None                    # live dictation owns the CPU
-        t = self._voice_transcriber()
-        if t is None or t.model is None:
-            return None                    # a model is still on its way
+        if self.transcriber.model is None:
+            return None                    # the model is still on its way
         from io import BytesIO
+        # faster-whisper stays installed for exactly one thing: decode_audio,
+        # a thin PyAV wrapper that turns any phone container into 16k PCM
         from faster_whisper.audio import decode_audio
         audio = decode_audio(BytesIO(audio_bytes), sampling_rate=SAMPLE_RATE)
         if len(audio) < SAMPLE_RATE * 0.3:
             return ""
         # quiet phone recordings (soft speaker, phone at arm's length) get
-        # normalised up before Whisper hears them — same cure as the live
+        # normalised up before the model hears them — same cure as the live
         # mic's software boost. Judged on the 95th percentile, not the max,
         # so one handling thump can't veto the boost for the whole note.
         body = float(np.percentile(np.abs(audio), 95))
         if 0 < body < 0.30:
             audio = np.clip(audio * min(MIC_MAX_BOOST, 0.30 / body), -1.0, 1.0)
-        return t.transcribe(audio, long=True) or ""
-
-    def _voice_transcriber(self):
-        """The Transcriber for voice notes: the dedicated voice_model once
-        it's fetched and loaded, the live-dictation model when they're the
-        same or the big one can't load. None while still preparing."""
-        if self.settings.get("engine") == "parakeet":
-            # one Parakeet model serves both jobs — it already out-hears
-            # medium.en, so there is no bigger model worth fetching
-            return self.transcriber
-        name = self.settings.get("voice_model") or self.settings["model"]
-        if name == self.settings["model"] or self._voice_state == "fallback":
-            return self.transcriber
-        if self._voice_state == "ready":
-            return self.voice_transcriber
-        with self._voice_lock:
-            if self._voice_state == "idle":
-                self._voice_state = "preparing"
-                threading.Thread(target=self._prepare_voice_model,
-                                 daemon=True).start()
-        return None
-
-    def _prepare_voice_model(self):
-        name = self.settings.get("voice_model")
-        if not model_files_ready(name):
-            self.events.put(("toast",
-                "Fetching a bigger speech model for phone notes (one-time, "
-                f"{MODEL_SIZES.get(name, 'a big download')}) — notes queue "
-                "until it's ready"))
-        if model_files_ready(name) or self._download_files(name, primary=False):
-            t = Transcriber(self.settings, model_key="voice_model")
-            t.load()
-            if t.model is not None:
-                self.voice_transcriber = t
-                self._voice_state = "ready"
-                dbg(f"voice model ready: {name}")
-                return
-            dbg(f"voice model load failed: {t.error}")
-        # can't have the big one — the live model does voice notes, as before
-        self._voice_state = "fallback"
+        return self.transcriber.transcribe(audio, long=True) or ""
 
     def _start_cloud_sync(self):
         if not (self.settings.get("sync_enabled")
@@ -2898,6 +2720,8 @@ class DictationApp:
     def show_tooltip(self):
         if self.tooltip is not None or self.state not in (IDLE, LOADING, DOWNLOADING):
             return
+        if self._menu is not None or self._shots_win is not None:
+            return                 # never float help over an open card
         self.tooltip = self._popup(
             f"Click or tap {self.hotkey_label()} — start / stop\n"
             "Hold the key — push-to-talk\n"
@@ -2909,6 +2733,9 @@ class DictationApp:
             (UI_FAMILY, 9))
 
     def hide_tooltip(self):
+        if self._tooltip_job:      # a pending hover timer would re-show it
+            self.root.after_cancel(self._tooltip_job)
+            self._tooltip_job = None
         if self.tooltip is not None:
             try:
                 self.tooltip.destroy()
@@ -3009,7 +2836,7 @@ def selftest(wav_path):
     with wave.open(wav_path, "rb") as w:
         audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
         audio = audio.astype(np.float32) / 32768.0
-    t = Transcriber(load_settings())
+    t = ParakeetTranscriber(load_settings())
     t.load()
     out = os.path.join(APP_DIR, "selftest_out.txt")
     with open(out, "w", encoding="utf-8") as f:

@@ -1,14 +1,12 @@
 """
-bench_stt — race the speech engines on this machine.
+bench_stt — time the speech engine on this machine.
 
     venv\\Scripts\\python.exe bench_stt.py clip.wav [clip.txt] [clip2.wav ...]
 
-Each wav is decoded to 16 kHz mono and pushed through every engine that has
-its model files on disk: Whisper small.en (live dictation), Whisper
-medium.en (voice notes) and Parakeet (the optional engine). A .txt with the
-same stem is treated as the reference read and scores a word error rate.
-Clips longer than 30 s run the voice-note path (long=True: VAD + wide beam
-for Whisper, chunked for Parakeet) — the same code the pill runs.
+Each wav is decoded to 16 kHz mono and pushed through Parakeet. A .txt with
+the same stem is treated as the reference read and scores a word error rate.
+Clips longer than 30 s run the voice-note path (long=True: chunked at the
+quietest instant) — the same code the pill runs.
 """
 
 import os
@@ -48,12 +46,6 @@ def wer(ref, hyp):
 
 
 def engines(settings):
-    if app.model_files_ready("small.en"):
-        s = dict(settings, model="small.en")
-        yield "whisper small.en (live)", app.Transcriber(s)
-    if app.model_files_ready("medium.en"):
-        s = dict(settings, voice_model="medium.en")
-        yield "whisper medium.en (notes)", app.Transcriber(s, model_key="voice_model")
     if app.parakeet_files_ready():
         yield "parakeet tdt-0.6b-v2", app.ParakeetTranscriber(settings)
 

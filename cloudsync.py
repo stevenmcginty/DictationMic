@@ -80,8 +80,8 @@ class CloudSync:
         self.events = events            # app event queue: ("sync_status", dict)
         self.dbg = dbg
         # voice_stt(webm_bytes) -> text: transcribe a phone voice note with
-        # the app's Whisper. Returns None when the model is busy/not loaded
-        # yet (we retry), "" when the audio held no speech.
+        # the app's speech engine. Returns None when the model is busy/not
+        # loaded yet (we retry), "" when the audio held no speech.
         self.voice_stt = voice_stt
         self._q = queue.Queue()         # remote events -> worker
         self._stt_q = queue.Queue()     # (nid, record) voice notes to text
@@ -440,7 +440,7 @@ class CloudSync:
                 and ("starred" in record or "starredAt" in record)):
             self.store.set_remote_star(nid, record.get("starred"),
                                        int(record.get("starredAt") or 0))
-        # a phone voice note still waiting for text: queue it for Whisper
+        # a phone voice note still waiting for text: queue it for the engine
         # regardless of the echo guards below — after a restart the record
         # is old news to the file store but the audio still needs doing
         if (record.get("audio") and not record.get("transcribed")
@@ -517,7 +517,7 @@ class CloudSync:
             self._purge_tombstones(snapshot or {})
 
     # ------------------------------------------------------------------
-    # phone voice notes -> Whisper -> text back to the cloud
+    # phone voice notes -> speech engine -> text back to the cloud
     # ------------------------------------------------------------------
 
     def _queue_stt(self, nid, record):
