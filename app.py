@@ -119,6 +119,7 @@ DEFAULT_SETTINGS = {
     "catch_shots": True,       # screenshots/copied images pin to the shelf
     "shots_keep": 12,          # how many pinned shots to keep (oldest pruned)
     "shots_to_notes": True,    # caught screenshots also saved as image notes
+    "phone_shots": True,       # image notes arriving from the phone pin to the shelf
     "seen_intro": False,
     "seen_intro2": False,
     "x": None,
@@ -1624,6 +1625,9 @@ class DictationApp:
         self.local_server = None
         self.cloud = None
         self._menu = None
+        # the reverse of shots_to_notes: an image note arriving from the
+        # phone is pinned to the shelf like a local screenshot
+        get_store().subscribe(self._on_remote_note)
         self._start_cloud_sync()
 
         self.root.update_idletasks()
@@ -1880,6 +1884,10 @@ class DictationApp:
              "hint": "they sync like any note",
              "check": bool(s.get("shots_to_notes", True)),
              "command": self.toggle_shots_to_notes},
+            {"kind": "item", "text": "Pin images from my phone",
+             "hint": "phone photos land like screenshots",
+             "check": bool(s.get("phone_shots", True)),
+             "command": self.toggle_phone_shots},
             {"kind": "sep"},
             {"kind": "header", "text": "Phone sync"},
         ]
@@ -2507,6 +2515,41 @@ class DictationApp:
         self.show_toast("Caught screenshots also land in your notes"
                         if on else
                         "Screenshots stay on the shelf only", 2400)
+
+    def toggle_phone_shots(self):
+        on = not self.settings.get("phone_shots", True)
+        self.settings["phone_shots"] = on
+        save_settings(self.settings)
+        self.show_toast("Images saved on your phone now pin to my shoulder"
+                        if on else
+                        "Phone images go to notes only", 2400)
+
+    # 24h: a first-sync reconcile replays the whole cloud library as remote
+    # creates — only a genuinely fresh capture belongs on the shelf
+    PHONE_SHOT_FRESH_MS = 24 * 3600 * 1000
+
+    def _on_remote_note(self, kind, nid):
+        """Store listener (sync worker thread): an image note that just
+        arrived from the phone joins the shelf, exactly like a local
+        screenshot — the reverse of shots_to_notes. Disk work only here;
+        the flash + badge happen on the Tk thread via the "shot" event."""
+        if kind != "remote_create" or not self.settings.get("phone_shots", True):
+            return
+        try:
+            store = get_store()
+            e = store.entry(nid)
+            if not e or not e.get("file"):
+                return                       # text/voice note — nothing to pin
+            if (int(time.time() * 1000) - int(e.get("createdAt") or 0)
+                    > self.PHONE_SHOT_FRESH_MS):
+                return
+            # pin_file accepts image extensions only — PDFs etc. fall through
+            path = self.shots.pin_file(
+                os.path.join(store.files_dir(), e["file"]))
+            if path:
+                self.events.put(("shot", path))
+        except Exception as ex:
+            dbg(f"phone shot pin failed: {ex!r}")
 
     def _sync_status(self):
         cloud = getattr(self, "cloud", None)
