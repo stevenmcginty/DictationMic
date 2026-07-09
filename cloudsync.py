@@ -243,12 +243,24 @@ class CloudSync:
                     r.raise_for_status()
                     backoff = 1
                     event = None
-                    # chunk_size=1: iter_lines otherwise buffers 512 bytes,
-                    # which silently swallows small SSE events forever
-                    for raw in r.iter_lines(chunk_size=1, decode_unicode=True):
+                    # Byte-at-a-time so a small live event is never stuck
+                    # waiting for a read buffer to fill — but assembled into
+                    # a bytearray ourselves: iter_lines(chunk_size=1) re-scans
+                    # its whole pending buffer on every byte (O(n²)), which
+                    # pegged the CPU for minutes on the ~1MB first snapshot
+                    # and queued every live event behind it.
+                    buf = bytearray()
+                    for ch in r.iter_content(chunk_size=1):
                         if self._stop.is_set():
                             return
-                        if raw is None or raw == "":
+                        if not ch:
+                            continue
+                        if ch != b"\n":
+                            buf += ch
+                            continue
+                        raw = buf.decode("utf-8", "replace").rstrip("\r")
+                        buf.clear()
+                        if raw == "":
                             continue
                         if raw.startswith("event:"):
                             event = raw[6:].strip()
