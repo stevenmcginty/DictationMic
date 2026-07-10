@@ -11,6 +11,7 @@ import {
 import {
   isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody, SHEET_EXT_RE,
 } from "./filenote.js";
+import { Horizon } from "./horizon.js";
 
 const $ = id => document.getElementById(id);
 
@@ -34,10 +35,14 @@ export class App {
   async start() {
     this.notes = await this.adapter.list();
     this._bind();
+    this.horizon = new Horizon($("horizon"));
+    $("horizon").hidden = false;
     this.renderList();
     this.adapter.onChange(notes => this._onRemote(notes));
     this._pollStatus();
     setInterval(() => this._pollStatus(), 3000);
+    // minute tick: "today" rolls over at midnight, finished tiles dim
+    setInterval(() => this.horizon.render(this.notes), 60000);
     if (this.opts.showMic) $("micFab").hidden = false;
     this.route();
     addEventListener("hashchange", () => this.route());
@@ -68,6 +73,7 @@ export class App {
   // ---------------- list ----------------
 
   renderList() {
+    this.horizon?.render(this.notes);   // always from all notes, never the filter
     const list = $("noteList");
     const q = this.filter.trim().toLowerCase();
     const searchText = n => {

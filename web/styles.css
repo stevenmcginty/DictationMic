@@ -36,6 +36,9 @@
   --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
   --ease: cubic-bezier(.2, .7, .2, 1);
   --topbar-h: 58px;
+  --horizon-h: 64px;
+  /* everything pinned under the chrome hangs off this one number */
+  --chrome-h: calc(var(--topbar-h) + var(--horizon-h) + env(safe-area-inset-top));
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -144,12 +147,144 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
 }
 
 /* --------------------------------------------------------------------------
+   The Horizon — next 7 days as a journey line (see js/horizon.js)
+   -------------------------------------------------------------------------- */
+
+.horizon {
+  position: fixed; left: 0; right: 0; z-index: 45;
+  top: calc(var(--topbar-h) + env(safe-area-inset-top));
+  height: var(--horizon-h);
+  background: rgba(11, 12, 10, .82);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--hairline);
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+}
+.horizon::-webkit-scrollbar { display: none; }
+
+.h-days {
+  position: relative;
+  display: flex;
+  min-width: 100%;
+  height: 100%;
+}
+
+/* the track itself — one continuous hairline the days sit on */
+.h-line {
+  position: absolute; left: 0; right: 0; bottom: 21px;
+  height: 2px; border-radius: 1px;
+  background: linear-gradient(90deg, rgba(182, 238, 63, .35), var(--hairline) 220px);
+}
+
+.h-day {
+  position: relative;
+  flex: 1 0 116px;
+  min-width: 116px;
+  display: flex; align-items: flex-end; justify-content: center;
+  padding: 7px 8px 30px;
+}
+
+/* station dot on the line, centred under its day */
+.h-dot {
+  position: absolute; bottom: 17.5px; left: 50%;
+  transform: translateX(-50%);
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid var(--faint);
+}
+.h-day.has-events .h-dot { border-color: var(--muted); }
+.h-day.today .h-dot {
+  border-color: var(--volt);
+  box-shadow: 0 0 0 3px var(--volt-dim);
+}
+
+.h-day-label {
+  position: absolute; bottom: 3px; left: 50%;
+  transform: translateX(-50%);
+  font-size: 8.5px; letter-spacing: .18em;
+  color: var(--faint);
+  white-space: nowrap;
+  cursor: default;
+}
+.h-day.today .h-day-label { color: var(--volt); }
+.h-day.has-events .h-day-label { color: var(--muted); }
+
+/* an event tile — a small capsule wearing its own hue */
+.h-tile {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 100%;
+  height: 23px; padding: 0 9px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--hue, #B6EE3F) 9%, var(--raised));
+  border: 1px solid color-mix(in srgb, var(--hue, #B6EE3F) 30%, transparent);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: transform .12s;
+}
+.h-tile:active { transform: scale(.97); }
+.h-tile time { font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em;
+  color: var(--hue, #B6EE3F); }
+.h-tile-title { overflow: hidden; text-overflow: ellipsis; color: var(--ink); }
+.h-tile.done { opacity: .38; }
+
+/* a day holding several events: the front tile sits on a hinted stack */
+.h-tile.stacked {
+  box-shadow: 3px -3px 0 -1px rgba(236, 238, 231, .10),
+              6px -6px 0 -2px rgba(236, 238, 231, .05);
+}
+.h-more {
+  align-self: flex-end;
+  margin: 0 0 14px -9px;               /* perched on the tile's shoulder */
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  font-size: 8.5px; letter-spacing: .08em;
+  color: var(--muted);
+  pointer-events: none;
+  position: relative; z-index: 1;
+}
+
+/* empty week: just the quiet track and a whisper (left-pinned so it's
+   on-screen even when the track scrolls on the phone) */
+.h-quiet {
+  position: absolute; top: 13px; left: 20px;
+  font-size: 9px; letter-spacing: .22em; text-transform: uppercase;
+  color: var(--faint);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* the popped-out day: its tiles as a column, pinned under the station */
+.horizon-pop {
+  position: fixed; z-index: 75;
+  display: flex; flex-direction: column; align-items: stretch; gap: 7px;
+  width: min(300px, calc(100vw - 16px));
+  padding: 12px 12px 13px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
+  animation: pop-in .18s var(--ease);
+}
+@keyframes pop-in { from { opacity: 0; transform: translateY(-5px); } }
+.horizon-pop-head {
+  font-size: 9px; letter-spacing: .24em; text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 2px 2px;
+}
+.horizon-pop .h-tile { height: 30px; border-radius: 15px; max-width: none; }
+.horizon-pop .h-tile-title { flex: 1; text-align: left; }
+
+/* --------------------------------------------------------------------------
    Panes
    -------------------------------------------------------------------------- */
 
 .app {
   position: fixed;
-  top: calc(var(--topbar-h) + env(safe-area-inset-top));
+  top: var(--chrome-h);
   bottom: 0; left: 0; right: 0;
   display: flex;
 }
@@ -495,7 +630,7 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
 
 .pane-mic {
   position: fixed;
-  top: calc(var(--topbar-h) + env(safe-area-inset-top));
+  top: var(--chrome-h);
   bottom: 0; left: 0; right: 0;
   z-index: 40;
   background: var(--bg);
@@ -594,7 +729,8 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
 
 /* account popover — tap the sync capsule when signed in */
 .account-pop {
-  position: fixed; top: calc(var(--topbar-h) + 8px); right: 14px; z-index: 70;
+  position: fixed; top: calc(var(--topbar-h) + env(safe-area-inset-top) + 8px);
+  right: 14px; z-index: 70;
   display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
   padding: 14px 16px;
   background: var(--raised);
@@ -638,7 +774,7 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
   .pane-list { width: 100%; border-right: 0; }
   .pane-note {
     position: fixed;
-    top: calc(var(--topbar-h) + env(safe-area-inset-top));
+    top: var(--chrome-h);
     bottom: 0; left: 0; right: 0;
     z-index: 40;
     background: var(--bg);
