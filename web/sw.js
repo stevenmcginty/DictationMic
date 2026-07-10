@@ -1,7 +1,7 @@
 // Service worker — hosted origin only (main.js never registers it on
 // localhost). App shell is precached; data traffic is always network-only.
 
-const CACHE = "dictmic-v18";
+const CACHE = "dictmic-v19";
 const SHARED = "dictmic-shared";   // Android share-sheet drops wait here for main.js
 const SHELL = [
   "./", "index.html", "styles.css", "config.js", "manifest.webmanifest",

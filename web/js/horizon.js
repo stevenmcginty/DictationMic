@@ -4,9 +4,14 @@
 // opens its note; a day holding several shows the earliest plus a "+N" badge
 // and pops the whole day out as a tile stack. Subtle by design: an empty week
 // is just the quiet track.
+//
+// It carries its own cool-graphite tint so it reads as a separate planning
+// zone, not part of the notes app. A toggle collapses it to a single greyish
+// "coming up" line — still there, just out of the way.
 
 const DAYS = 7;
 const DAY_MS = 86400000;
+const COLLAPSE_KEY = "dictmic-horizon-collapsed";
 
 // tile accents, assigned by order within a day so same-date events read apart;
 // volt stays first so a lone event wears the app's own colour
@@ -24,6 +29,15 @@ const dayLabel = (ms, i) => {
     : `${d.toLocaleDateString("en-GB", { weekday: "short" })} ${d.getDate()}`.toUpperCase();
 };
 
+// friendlier day word for the collapsed summary ("Today" / "Tomorrow" / "Mon 13")
+const dayWord = ms => {
+  const start = midnight();
+  const i = Math.round((midnight(ms) - start) / DAY_MS);
+  if (i === 0) return "Today";
+  if (i === 1) return "Tomorrow";
+  return new Date(ms).toLocaleDateString("en-GB", { weekday: "short", day: "numeric" });
+};
+
 const timeLabel = cal => cal.allDay ? "all day"
   : new Date(cal.start).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
 
@@ -35,6 +49,8 @@ export class Horizon {
     this.el = el;
     this.notes = [];
     this.pop = null;
+    this.collapsed = localStorage.getItem(COLLAPSE_KEY) === "1";
+    document.body.classList.toggle("horizon-collapsed", this.collapsed);
     el.addEventListener("click", e => this._onClick(e));
     document.addEventListener("click", e => {
       if (this.pop && !this.pop.contains(e.target) && !this.el.contains(e.target)) {
@@ -42,6 +58,14 @@ export class Horizon {
       }
     });
     addEventListener("resize", () => this._closePop());
+  }
+
+  _toggle() {
+    this.collapsed = !this.collapsed;
+    localStorage.setItem(COLLAPSE_KEY, this.collapsed ? "1" : "0");
+    document.body.classList.toggle("horizon-collapsed", this.collapsed);
+    this._closePop();
+    this.render(this.notes);
   }
 
   render(notes) {
@@ -57,7 +81,15 @@ export class Horizon {
       if (i >= 0 && i < DAYS) buckets[i].push(n);
     }
     for (const b of buckets) b.sort((a, z) => a.calendar.start - z.calendar.start);
+    this._buckets = buckets;
 
+    this.el.textContent = "";
+    this.el.append(this._track(buckets, start), this._strip(buckets), this._toggleBtn());
+  }
+
+  // -------- expanded: the full journey line --------
+
+  _track(buckets, start) {
     const row = document.createElement("div");
     row.className = "h-days";
     const line = document.createElement("div");
@@ -91,17 +123,57 @@ export class Horizon {
       row.append(day);
     });
 
-    // nothing on the whole track: say so, once, very quietly
     if (buckets.every(b => !b.length)) {
       const hint = document.createElement("span");
       hint.className = "h-quiet mono";
       hint.textContent = "next 7 days · nothing scheduled";
       row.append(hint);
     }
+    return row;
+  }
 
-    this.el.textContent = "";
-    this.el.append(row);
-    this._buckets = buckets;
+  // -------- collapsed: one quiet greyish line --------
+
+  _strip(buckets) {
+    const strip = document.createElement("div");
+    strip.className = "h-strip mono";
+    const upcoming = buckets.flat().filter(n => !isDone(n.calendar));
+    if (!upcoming.length) {
+      strip.textContent = "Next 7 days · nothing scheduled";
+      return strip;
+    }
+    const next = upcoming[0];
+    const c = next.calendar;
+    const eyebrow = document.createElement("span");
+    eyebrow.className = "h-strip-eyebrow";
+    eyebrow.textContent = "Coming up";
+    const when = document.createElement("span");
+    when.className = "h-strip-when";
+    when.textContent = `${dayWord(c.start)} · ${timeLabel(c)}`;
+    const title = document.createElement("span");
+    title.className = "h-strip-title";
+    title.textContent = next.title;
+    strip.append(eyebrow, when, title);
+    if (upcoming.length > 1) {
+      const more = document.createElement("span");
+      more.className = "h-strip-more";
+      more.textContent = `+${upcoming.length - 1} this week`;
+      strip.append(more);
+    }
+    return strip;
+  }
+
+  _toggleBtn() {
+    const btn = document.createElement("button");
+    btn.className = "h-toggle";
+    btn.setAttribute("aria-label", this.collapsed ? "Expand the week" : "Collapse the week");
+    btn.setAttribute("aria-expanded", this.collapsed ? "false" : "true");
+    btn.title = this.collapsed ? "Expand" : "Collapse";
+    // a chevron: points down to expand, up to collapse
+    btn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">`
+      + `<path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"`
+      + ` stroke-linejoin="round" d="M6 9l6 6 6-6"/></svg>`;
+    return btn;
   }
 
   _tile(n, hueIndex, stacked) {
@@ -124,6 +196,10 @@ export class Horizon {
   }
 
   _onClick(e) {
+    if (e.target.closest(".h-toggle")) { this._toggle(); return; }
+    // collapsed: any click on the strip opens the week back up
+    if (this.collapsed && e.target.closest(".h-strip")) { this._toggle(); return; }
+
     const day = e.target.closest(".h-day");
     if (!day) return;
     const bucket = this._buckets?.[Number(day.dataset.day)] || [];
