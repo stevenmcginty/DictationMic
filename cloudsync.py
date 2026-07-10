@@ -311,7 +311,8 @@ class CloudSync:
         import requests
         dirty = self.store.dirty_ids()
         star_dirty = self.store.star_dirty_ids()
-        if not dirty and not star_dirty:
+        cal_dirty = self.store.calendar_dirty_ids()
+        if not dirty and not star_dirty and not cal_dirty:
             return
         token = self._token()
         if token is None:
@@ -385,6 +386,37 @@ class CloudSync:
                 continue
             self.store.mark_star_synced(nid, pushed_at)
             self._last_sync = _now_ms()
+
+        # The calendar link rides exactly like a star: its own PATCH with no
+        # updatedAt, so linking a note to an event never reorders the list.
+        # Same first-write guard — never let it create a body-less ghost node.
+        for nid in cal_dirty:
+            e = self.store.entry(nid)
+            if e is None or e.get("deletedLocally"):
+                self.store.mark_calendar_synced(nid, _now_ms())   # gone — forget it
+                continue
+            if e.get("dirty") or int(e.get("syncedRev") or 0) <= 0:
+                continue
+            cal = e.get("calendar")
+            if not isinstance(cal, dict):
+                self.store.mark_calendar_synced(nid, _now_ms())
+                continue
+            payload = {"calendar": cal, "origin": "laptop"}
+            try:
+                r = requests.patch(self._notes_url(nid, token),
+                                   json=payload, timeout=20)
+            except Exception:
+                self._set_state("offline")
+                return                                    # retry next tick
+            if r.status_code == 401:
+                self._id_token = None
+                return
+            if r.status_code != 200:
+                self.dbg(f"cloudsync calendar push {nid}: {r.status_code} "
+                         f"{r.text[:120]}")
+                continue
+            self.store.mark_calendar_synced(nid, int(cal.get("addedAt") or 0))
+            self._last_sync = _now_ms()
         self._set_state("ok")
 
     # ------------------------------------------------------------------
@@ -440,6 +472,12 @@ class CloudSync:
                 and ("starred" in record or "starredAt" in record)):
             self.store.set_remote_star(nid, record.get("starred"),
                                        int(record.get("starredAt") or 0))
+        # same for the calendar link — an independent field the laptop owns;
+        # adopting it here (before the echo guards) restores highlights on a
+        # fresh install without ever fighting a pending local push
+        if (isinstance(record, dict) and not record.get("deleted")
+                and isinstance(record.get("calendar"), dict)):
+            self.store.set_remote_calendar(nid, record["calendar"])
         # a phone voice note still waiting for text: queue it for the engine
         # regardless of the echo guards below — after a restart the record
         # is old news to the file store but the audio still needs doing
@@ -475,13 +513,16 @@ class CloudSync:
         if part.get("deleted"):
             self._apply_one(nid, part)
             return
-        # a star-only patch (no title/body/updatedAt) folds straight in
+        # a star- or calendar-only patch (no title/body/updatedAt) folds straight in
         if "starred" in part or "starredAt" in part:
             self.store.set_remote_star(nid, part.get("starred"),
                                        int(part.get("starredAt") or 0))
-            if not any(k in part for k in
-                       ("title", "body", "createdAt", "updatedAt")):
-                return
+        if isinstance(part.get("calendar"), dict):
+            self.store.set_remote_calendar(nid, part["calendar"])
+        if ("starred" in part or "starredAt" in part or "calendar" in part) \
+                and not any(k in part for k in
+                            ("title", "body", "createdAt", "updatedAt")):
+            return
         cur = self.store.get(nid)
         if cur is None:                          # unknown or locally deleted
             rec = self._fetch_note(nid)

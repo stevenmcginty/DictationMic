@@ -1,7 +1,9 @@
 // All DOM logic for the notes app. Views: list / note / mic (routes via
 // location.hash, panes toggled with body classes — see styles.css).
 
-import { relTime, dayKey, dayHeading, debounce, noteTitleFrom } from "./util.js";
+import {
+  relTime, dayKey, dayHeading, debounce, noteTitleFrom, calendarLabel,
+} from "./util.js";
 import {
   isImageBody, imageKb, fileToImageBody, imageBodyToPngBlob,
   imageBodyToFile, photoTitle,
@@ -14,6 +16,9 @@ const $ = id => document.getElementById(id);
 
 // a plain 5-point star — outlined when off, filled gold when on (see styles.css)
 const STAR_SVG = `<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>`;
+
+// a small calendar page — the chip on notes that live in the calendar too
+const CAL_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 2.8v4M16 2.8v4"/></svg>`;
 
 export class App {
   constructor(adapter, opts = {}) {
@@ -91,7 +96,9 @@ export class App {
       }
       const li = document.createElement("li");
       li.className = "note-row" + (n.id === this.activeId ? " active" : "")
-        + (n.starred ? " starred" : "");
+        + (n.starred ? " starred" : "")
+        + (!n.calendar ? ""
+           : n.calendar.status === "ok" ? " calendared" : " cal-failed");
       li.dataset.id = n.id;
       li.tabIndex = 0;
       // image/file rows can be dragged straight out of the list as real files
@@ -143,7 +150,9 @@ export class App {
         snippet.textContent = n.body.slice(0, 220);
       }
 
-      li.append(top, snippet);
+      li.append(top);
+      if (n.calendar) li.append(this._calChip(n.calendar));
+      li.append(snippet);
       if (pending.has(n.id)) {
         const dot = document.createElement("span");
         dot.className = "sync-dot";
@@ -161,6 +170,49 @@ export class App {
     const parts = [`${this.notes.length} note${this.notes.length === 1 ? "" : "s"}`];
     if (pending.size) parts.push(`${pending.size} queued`);
     $("noteCount").textContent = parts.join(" · ");
+  }
+
+  // The event chip on a calendared row. The note keeps its normal place in
+  // the list — the chip (plus the row wash) is the only tell that this one
+  // also lives in the calendar.
+  _calChip(cal) {
+    const chip = document.createElement("div");
+    chip.className = "cal-chip" + (cal.status === "ok" ? "" : " failed");
+    chip.innerHTML = CAL_SVG;
+    const label = document.createElement("span");
+    label.textContent = calendarLabel(cal);
+    chip.append(label);
+    const untilStart = (cal.start || 0) - Date.now();
+    if (cal.status === "ok" && !cal.allDay
+        && untilStart <= 60 * 60000 && untilStart > -5 * 60000) {
+      chip.classList.add("soon");
+    }
+    return chip;
+  }
+
+  // In-app heads-up: while the app is open, a timed calendared note toasts
+  // once, 15 minutes before it starts (the pill does the same on the laptop).
+  _calHeadsUp() {
+    const now = Date.now();
+    for (const n of this.notes) {
+      const c = n.calendar;
+      if (!c || c.status !== "ok" || c.allDay || !c.start) continue;
+      if (c.start - now > 15 * 60000 || now - c.start > 5 * 60000) continue;
+      const key = "dictmic-cal-toasted-" + (c.eventId || c.start);
+      if (localStorage.getItem(key)) continue;
+      localStorage.setItem(key, String(c.start));
+      const t = new Date(c.start).toLocaleTimeString(
+        "en-GB", { hour: "2-digit", minute: "2-digit" });
+      this.toast(`Coming up at ${t} — ${n.title}`, 7000);
+      break;
+    }
+    // yesterday's guards have nothing left to guard
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith("dictmic-cal-toasted-")
+          && Number(localStorage.getItem(key)) < now - 86400000) {
+        localStorage.removeItem(key);
+      }
+    }
   }
 
   _markActiveRow() {
@@ -359,6 +411,14 @@ export class App {
       const words = n.body.trim() ? n.body.trim().split(/\s+/).length : 0;
       bits.push(`${words} word${words === 1 ? "" : "s"}`);
     }
+    if (n.calendar?.status === "ok") {
+      bits.push(n.calendar.link
+        ? `<a class="cal-link" href="${n.calendar.link}" target="_blank" `
+          + `rel="noopener">in your calendar · open</a>`
+        : `<span class="cal-link">in your calendar</span>`);
+    } else if (n.calendar) {
+      bits.push(`<span class="cal-fail-note">calendar event didn't make it</span>`);
+    }
     if (this.adapter.pendingIds().has(n.id)) bits.push("<b>saved · syncing…</b>");
     $("noteMeta").innerHTML = bits.join(" · ");
   }
@@ -437,6 +497,7 @@ export class App {
   // ---------------- status ----------------
 
   async _pollStatus() {
+    this._calHeadsUp();
     const s = await this.adapter.status();
     const dot = $("statusDot"), text = $("statusText");
     const pending = this.adapter.pendingIds().size;

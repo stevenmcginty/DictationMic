@@ -122,6 +122,12 @@ DEFAULT_SETTINGS = {
     "sync_email": "",
     "sync_refresh_token": "",
     "sync_uid": "",
+    "calendar_enabled": True,  # "add to calendar" in a dictation makes an event
+    "calendar_provider": "google",   # apple/iCloud is a future option
+    "gcal_client_id": "",      # Steve's own OAuth client (see README)
+    "gcal_client_secret": "",
+    "gcal_refresh_token": "",  # empty = not connected
+    "gcal_email": "",
 }
 
 def load_settings():
@@ -163,6 +169,8 @@ def save_settings(s):
 # ----------------------------------------------------------------------------
 
 from notestore import NoteStore, sanitize_title, note_title_from
+import whenparse
+from gcal import GCal
 
 _STORE = None
 
@@ -1559,6 +1567,16 @@ class DictationApp:
         # the reverse of shots_to_notes: an image note arriving from the
         # phone is pinned to the shelf like a local screenshot
         get_store().subscribe(self._on_remote_note)
+        # "add to calendar" watcher: every note the store sees — dictated
+        # here, typed in the web app, or arriving from the phone — runs
+        # through one detector; a worker thread does the network bit
+        self.gcal = GCal(self.settings, save_settings, dbg=dbg)
+        self._cal_q = queue.Queue()
+        self._cal_inflight = set()
+        self._cal_notify_last = 0.0
+        get_store().subscribe(self._on_note_calendar)
+        threading.Thread(target=self._calendar_worker,
+                         name="calendar-worker", daemon=True).start()
         self._start_cloud_sync()
 
         self.root.update_idletasks()
@@ -1803,6 +1821,32 @@ class DictationApp:
              "check": bool(s.get("save_notes", True)),
              "command": self.toggle_save_notes},
             {"kind": "sep"},
+            {"kind": "header", "text": "Calendar"},
+        ]
+        if self.gcal.connected():
+            items += [
+                {"kind": "status", "text": "Google Calendar is connected",
+                 "bullet": MENU_GREEN, "hint": s.get("gcal_email", "")},
+                {"kind": "item",
+                 "text": "Add events when I say “add to calendar”",
+                 "check": bool(s.get("calendar_enabled", True)),
+                 "command": self.toggle_calendar_enabled},
+                {"kind": "item", "text": "Disconnect Google Calendar",
+                 "command": self.calendar_off},
+            ]
+        else:
+            items += [
+                {"kind": "item", "text": "Connect Google Calendar…",
+                 "hint": "say “add to calendar” while dictating",
+                 "command": self.calendar_dialog},
+                {"kind": "item", "text": "Apple / iCloud Calendar",
+                 "hint": "coming soon",
+                 "command": lambda: self.show_toast(
+                     "Apple Calendar is on the way — Google Calendar "
+                     "works today", 2800)},
+            ]
+        items += [
+            {"kind": "sep"},
             {"kind": "header", "text": "Screenshots"},
             {"kind": "item",
              "text": f"Pinned shots ({self.shots.count()})",
@@ -2023,6 +2067,13 @@ class DictationApp:
                 elif not self.session_text:
                     self.show_toast("Didn't catch anything", 1800)
                 full = " ".join(self.session_text).strip()
+                if (full and not self.settings.get("save_notes", True)
+                        and self.settings.get("calendar_enabled", True)
+                        and self.gcal.connected()
+                        and whenparse.has_trigger(full)):
+                    # notes are off, but "add to calendar" is an explicit ask:
+                    # make the event anyway (no note — nothing to highlight)
+                    self._cal_q.put((None, full, 0))
                 if full and self.settings.get("save_notes", True):
                     try:
                         save_note(full)
@@ -2412,6 +2463,245 @@ class DictationApp:
         except Exception as ex:
             dbg(f"phone shot pin failed: {ex!r}")
 
+    # ---------------- "add to calendar" ----------------
+
+    def _on_note_calendar(self, kind, nid):
+        """Store listener (any thread): a text note that says "add to
+        calendar" and isn't linked to an event yet gets queued for the
+        calendar worker. Covers dictations, typed notes, and phone notes
+        (voice notes arrive here after this laptop transcribes them)."""
+        if kind not in ("create", "update", "remote_create", "remote_update"):
+            return
+        if not (self.settings.get("calendar_enabled", True)
+                and self.gcal.connected()):
+            return
+        try:
+            store = get_store()
+            e = store.entry(nid)
+            if not e or e.get("file") or e.get("deletedLocally"):
+                return                     # image/file note — never a trigger
+            cal = e.get("calendar")
+            if cal and not (cal.get("status") == "failed"
+                            and cal.get("bodyHash") != e.get("hash")):
+                return                     # already linked (or failed as-is)
+            note = store.get(nid)
+            if (not note or note["body"].startswith("data:")
+                    or not whenparse.has_trigger(note["body"])):
+                return
+            if nid in self._cal_inflight:
+                return
+            self._cal_inflight.add(nid)
+            self._cal_q.put(nid)
+        except Exception as ex:
+            dbg(f"calendar detect failed: {ex!r}")
+
+    @staticmethod
+    def _fmt_event_time(start_ms, all_day):
+        lt = time.localtime(start_ms / 1000)
+        day = time.strftime("%a", lt) + f" {lt.tm_mday} " + time.strftime("%b", lt)
+        today = time.localtime()
+        if (lt.tm_year, lt.tm_yday) == (today.tm_year, today.tm_yday):
+            day = "today"
+        elif (lt.tm_year, lt.tm_yday) == (today.tm_year, today.tm_yday + 1):
+            day = "tomorrow"
+        if all_day:
+            return f"{day}, all day"
+        return f"{day} at " + time.strftime("%H:%M", lt)
+
+    def _calendar_worker(self):
+        """One item at a time: parse the when, make the Google event, stamp
+        the note. Never touches Tk directly — toasts go via the event queue."""
+        while True:
+            item = self._cal_q.get()
+            nid, text, attempts = (item if isinstance(item, tuple)
+                                   else (item, None, 0))
+            retrying = False
+            try:
+                # let a typed note settle (the editors save on a 700 ms
+                # debounce — don't calendar half a sentence)
+                time.sleep(2.5)
+                store = get_store()
+                e = None
+                if nid is not None:
+                    note = store.get(nid)
+                    e = store.entry(nid)
+                    if not note or e is None:
+                        continue
+                    text = note["body"]
+                    cal = e.get("calendar")
+                    if cal and not (cal.get("status") == "failed"
+                                    and cal.get("bodyHash") != e.get("hash")):
+                        continue
+                if not text or not whenparse.has_trigger(text):
+                    continue
+                when = whenparse.parse_when(text)
+                summary = note_title_from(whenparse.strip_trigger(text))
+                start_ms = int(when["start"].timestamp() * 1000)
+                end_ms = int(when["end"].timestamp() * 1000)
+                try:
+                    ev = self.gcal.create_event(
+                        summary, when["start"], when["end"], when["all_day"],
+                        description=text + "\n\n— dictated with DictationMic")
+                except RuntimeError as ex:
+                    # Google said no (auth gone, quota, bad request) — mark it
+                    # so the note shows amber; a body edit re-arms it
+                    if nid is not None:
+                        store.set_calendar(nid, {
+                            "status": "failed", "provider": "google",
+                            "error": str(ex)[:140],
+                            "addedAt": int(time.time() * 1000),
+                            "bodyHash": e.get("hash") if e else None})
+                    self.events.put(("toast", str(ex)))
+                    continue
+                except Exception as ex:
+                    # network blip — retry a few times, then mark failed
+                    dbg(f"calendar create retry: {ex!r}")
+                    if attempts < 5:
+                        retrying = True   # inflight stays set — no re-detects
+                        def requeue(item=(nid, text, attempts + 1)):
+                            time.sleep(20)
+                            self._cal_q.put(item)
+                        threading.Thread(target=requeue, daemon=True).start()
+                        continue
+                    if nid is not None:
+                        store.set_calendar(nid, {
+                            "status": "failed", "provider": "google",
+                            "error": "offline",
+                            "addedAt": int(time.time() * 1000),
+                            "bodyHash": e.get("hash") if e else None})
+                    self.events.put(("toast", "Couldn't reach Google Calendar "
+                                     "— that note wasn't scheduled"))
+                    continue
+                if nid is not None:
+                    store.set_calendar(nid, {
+                        "status": "ok", "provider": "google",
+                        "eventId": ev["eventId"], "link": ev["link"],
+                        "start": start_ms, "end": end_ms,
+                        "allDay": bool(when["all_day"]),
+                        "addedAt": int(time.time() * 1000),
+                        "bodyHash": e.get("hash") if e else None})
+                self.events.put(("toast", "Added to your calendar — "
+                                 + self._fmt_event_time(start_ms,
+                                                        when["all_day"])))
+            except Exception as ex:
+                dbg(f"calendar worker: {ex!r}")
+            finally:
+                if not retrying:
+                    self._cal_inflight.discard(nid)
+
+    def _check_upcoming_events(self):
+        """Every ~30 s from tick(): one pill heads-up, 15 minutes before a
+        timed event made through "add to calendar"."""
+        try:
+            for nid, title, start in get_store().upcoming_calendar(
+                    15 * 60 * 1000):
+                get_store().set_calendar_notified(nid)
+                self.show_toast("Coming up " + self._fmt_event_time(start, False)
+                                + " — " + title, 9000)
+                self.beep(880, 160)
+                break                        # one at a time; next tick, next event
+        except Exception as ex:
+            dbg(f"calendar heads-up failed: {ex!r}")
+
+    def toggle_calendar_enabled(self):
+        on = not self.settings.get("calendar_enabled", True)
+        self.settings["calendar_enabled"] = on
+        save_settings(self.settings)
+        self.show_toast("Say “add to calendar” in a dictation and "
+                        "I'll make the event" if on
+                        else "Not making calendar events any more", 2600)
+
+    def calendar_off(self):
+        def work():
+            self.gcal.disconnect()
+            self.events.put(("toast", "Google Calendar is disconnected"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def calendar_dialog(self):
+        win = tk.Toplevel(self.root, bg="#131512")
+        win.title("DictationMic — Google Calendar")
+        win.resizable(False, False)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"420x330+{(sw - 420) // 2}+{max(0, (sh - 330) // 3)}")
+        try:
+            win.iconbitmap(os.path.join(APP_DIR, "icon.ico"))
+        except Exception:
+            pass
+        make_titlebar_dark(win)
+
+        FG, SUB, LIME, FIELD = "#eceee7", "#8a919c", "#b6ee3f", "#1a1d18"
+        tk.Label(win, text="Connect your Google Calendar",
+                 bg="#131512", fg=FG, font=("Segoe UI Semibold", 12)
+                 ).pack(pady=(16, 2))
+        tk.Label(win, text="Say “add to calendar” in any dictation and the\n"
+                           "event lands in your calendar, with the note kept.",
+                 bg="#131512", fg=SUB, font=("Segoe UI", 9)).pack()
+
+        id_var = tk.StringVar(value=self.settings.get("gcal_client_id") or "")
+        sec_var = tk.StringVar(value=self.settings.get("gcal_client_secret") or "")
+        for label, var, show in (("OAuth Client ID", id_var, None),
+                                 ("Client secret", sec_var, "•")):
+            tk.Label(win, text=label, bg="#131512", fg=SUB,
+                     font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=36)
+            tk.Entry(win, textvariable=var, show=show or "",
+                     bg=FIELD, fg=FG, insertbackground=LIME,
+                     relief="flat", font=("Segoe UI", 10)
+                     ).pack(fill="x", padx=36, ipady=5, pady=(0, 6))
+
+        status = tk.Label(win, text="", bg="#131512", fg=SUB,
+                          font=("Segoe UI", 9), wraplength=360)
+        status.pack()
+
+        def guide(_e=None):
+            import webbrowser
+            webbrowser.open("https://console.cloud.google.com/apis/credentials")
+
+        link = tk.Label(win, text="One-time setup: README · opens the "
+                                  "Google Cloud console",
+                        bg="#131512", fg=LIME, cursor="hand2",
+                        font=("Segoe UI", 9, "underline"))
+        link.pack(pady=(2, 0))
+        link.bind("<ButtonRelease-1>", guide)
+
+        def connect():
+            cid, sec = id_var.get().strip(), sec_var.get().strip()
+            if not cid or not sec:
+                status.configure(text="Fill in both boxes", fg="#ff5c48")
+                return
+            btn.configure(state="disabled", text="Waiting for your browser…")
+            status.configure(text="Approve DictationMic in the browser tab "
+                                  "that just opened", fg=SUB)
+
+            def work():
+                ok, msg = self.gcal.connect(cid, sec)
+                def done():
+                    try:
+                        if ok:
+                            win.destroy()
+                            who = self.gcal.email()
+                            self.show_toast(
+                                "Google Calendar connected"
+                                + (f" as {who}" if who else "")
+                                + " — say “add to calendar” while "
+                                  "dictating", 4500)
+                        else:
+                            btn.configure(state="normal", text="Connect")
+                            status.configure(text=msg, fg="#ff5c48")
+                    except tk.TclError:
+                        pass              # dialog closed meanwhile
+                self.root.after(0, done)
+            threading.Thread(target=work, daemon=True).start()
+
+        btn = tk.Button(win, text="Connect", command=connect,
+                        bg=LIME, fg="#0b0c0a", activebackground="#c9f56a",
+                        relief="flat", font=("Segoe UI Semibold", 10),
+                        cursor="hand2")
+        btn.pack(pady=8, ipadx=26, ipady=3)
+        win.bind("<Return>", lambda e: connect())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.lift()
+        win.focus_force()
+
     def _sync_status(self):
         cloud = getattr(self, "cloud", None)
         if cloud is None:
@@ -2769,6 +3059,10 @@ class DictationApp:
             # (no clipboard open, no message pump) — grabbing the actual
             # bitmap happens off-thread only when the number moves
             now = time.time()
+            # calendar heads-up: a cheap index scan twice a minute
+            if now - self._cal_notify_last >= 30.0:
+                self._cal_notify_last = now
+                self._check_upcoming_events()
             if (now - self._clip_last_check >= 0.5 and not self._clip_busy
                     and self.settings.get("catch_shots", True)):
                 self._clip_last_check = now

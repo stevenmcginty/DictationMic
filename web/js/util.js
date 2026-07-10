@@ -50,6 +50,23 @@ export function dayHeading(ms) {
   return `${weekday} ${n}${suffix} of ${month}${year}`;
 }
 
+// The little event chip on a calendared note: "Today · 15:00 · in 20 min".
+// cal is the synced calendar field the laptop stamps on the note.
+export function calendarLabel(cal) {
+  if (!cal) return "";
+  if (cal.status !== "ok") return "calendar event didn't make it";
+  const d = new Date(cal.start);
+  const now = new Date();
+  const sameDay = (a, b) => a.toDateString() === b.toDateString();
+  const day = sameDay(d, now) ? "Today"
+    : sameDay(d, new Date(now.getTime() + 86400000)) ? "Tomorrow"
+    : d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  if (cal.allDay) return `${day} · all day`;
+  const t = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const mins = Math.round((cal.start - Date.now()) / 60000);
+  return `${day} · ${t}` + (mins > 0 && mins <= 60 ? ` · in ${mins} min` : "");
+}
+
 export function debounce(fn, ms) {
   let t = null;
   const wrapped = (...args) => {

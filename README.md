@@ -85,6 +85,55 @@ Extras:
 - Hover over it for a reminder of the controls.
 - Only one copy runs at a time.
 
+## Google Calendar — "add to calendar"
+
+Say **"add to calendar"** anywhere in a dictation and the note becomes a
+Google Calendar event too. The note itself is untouched — full text, same
+place in the list — it just gets a volt wash and a little event chip
+("Tomorrow · 15:00") in the notes app, plus a link to open the event. The
+pill (and the notes app, if it's open) give you a heads-up 15 minutes
+before a timed event starts.
+
+- *"Add to calendar dentist tomorrow at 3"* → Sat 3:00 pm, one hour.
+- Understands today/tomorrow/weekdays, "on the 15th", "august 15", "15/8",
+  "at 3(pm)", "3:30", noon/tonight/morning…, "for 2 hours", "10 to 2",
+  "in 45 minutes". A bare "at 3" reads as 3 pm; "at 9" as 9 am.
+- A date with no time makes an **all-day** event; no date and no time at
+  all makes an all-day event **today**.
+- Works from the phone as well — a phone note (voice or typed) that says
+  "add to calendar" gets its event as soon as the computer sees it, exactly
+  like voice-note transcription.
+- If the event can't be made (Google unreachable, sign-in expired) the note
+  is washed amber instead so you can see it never landed; editing the note
+  arms it again.
+
+### One-time setup (~5 minutes)
+
+Google doesn't hand out calendar access without your own (free) OAuth
+client, so once, in [console.cloud.google.com](https://console.cloud.google.com)
+with the **dictationmic-sync** project selected:
+
+1. **APIs & Services → Library** → search *Google Calendar API* → **Enable**.
+2. **APIs & Services → OAuth consent screen** → External → fill in the two
+   required fields (app name, your email) → save. Under *Publishing status*
+   press **Publish app** (staying in "Testing" makes Google expire the
+   connection every 7 days). It stays unverified — that's fine, only you
+   use it; the consent page just shows an extra "unverified" step the one
+   time you connect.
+3. **APIs & Services → Credentials → Create credentials → OAuth client ID**
+   → application type **Desktop app** → Create. Copy the **Client ID** and
+   **Client secret**.
+4. Right-click the pill → **Connect Google Calendar…** → paste both →
+   **Connect** → approve in the browser tab that opens. Done — the menu
+   shows which Google account is connected.
+
+Disconnect any time from the same menu (this revokes the token with
+Google). Apple / iCloud Calendar is planned as a second provider; the
+events the app makes carry your calendar's default reminders, so your
+phone still buzzes even when the pill isn't running. Note edits and
+deletes don't (yet) follow through to the event — manage the event in
+Google Calendar once it's made.
+
 ## Speech engine
 
 **Parakeet** — NVIDIA's Parakeet TDT 0.6B, run locally through
@@ -147,6 +196,8 @@ Windows only — the Mac needs a separately built app.
 | `shots_keep`        | how many pinned shots to keep, default 12   |
 | `shots_to_notes`    | caught screenshots also saved as image notes|
 | `beeps`             | `true`/`false` — start/stop sounds          |
+| `calendar_enabled`  | "add to calendar" in a dictation makes an event |
+| `gcal_client_id` / `gcal_client_secret` | your OAuth desktop client (see above) |
 
 ## Tech
 

@@ -282,11 +282,25 @@ async function mergeStarInto(id, local, src) {
   return local;
 }
 
+// The calendar link is simpler than the star: the laptop is its only writer,
+// so an inbound copy is always the truth — adopt it before the body-sync
+// guards (a calendar-only PATCH carries no updatedAt, exactly like a star).
+async function mergeCalendarInto(id, local, src) {
+  if (!local || !src || src.deleted || src.calendar === undefined) return local;
+  if (JSON.stringify(local.calendar ?? null) === JSON.stringify(src.calendar ?? null)) {
+    return local;
+  }
+  const updated = { ...local, calendar: src.calendar };
+  await notesDb.put(updated);
+  return updated;
+}
+
 async function applyOne(id, record) {
   const bodyPending = await bodyPendingIds();
   let local = await notesDb.get(id);
   if (record && typeof record === "object") {
     local = await mergeStarInto(id, local, record);   // star merges regardless
+    local = await mergeCalendarInto(id, local, record);
   }
   if (bodyPending.has(id)) return;          // queued body intent wins until flushed
   const tombs = (await metaDb.get("tombstones")) || {};
@@ -301,6 +315,8 @@ async function applyOne(id, record) {
   const rev = Number(record.updatedAt) || 0;
   if (local && rev <= (local.syncedRev || 0)) return;   // body echo (star done above)
   const star = mergeStar(local, record);
+  const calendar = record.calendar !== undefined ? record.calendar
+    : local?.calendar;
   await notesDb.put({
     id,
     title: record.title || "Note",
@@ -309,6 +325,7 @@ async function applyOne(id, record) {
     updatedAt: rev,
     syncedRev: rev,
     ...star,
+    ...(calendar !== undefined ? { calendar } : {}),
   });
 }
 
@@ -320,7 +337,10 @@ async function applyPatch(id, part) {
   if (part == null) return;
   const bodyPending = await bodyPendingIds();
   let local = await notesDb.get(id);
-  if (!part.deleted) local = await mergeStarInto(id, local, part);  // star first
+  if (!part.deleted) {
+    local = await mergeStarInto(id, local, part);     // star first
+    local = await mergeCalendarInto(id, local, part); // calendar rides the same way
+  }
   if (bodyPending.has(id)) return;          // queued body intent wins until flushed
   if (part.deleted) { await applyOne(id, part); return; }
   if (!local) { await refetch(id); return; }
@@ -332,6 +352,7 @@ async function applyPatch(id, part) {
     ...(part.title != null ? { title: part.title } : {}),
     ...(part.body != null ? { body: part.body } : {}),
     ...(part.createdAt != null ? { createdAt: Number(part.createdAt) } : {}),
+    ...(part.calendar !== undefined ? { calendar: part.calendar } : {}),
     ...star,
     updatedAt: rev,
     syncedRev: rev,

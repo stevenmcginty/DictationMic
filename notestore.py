@@ -249,11 +249,14 @@ class NoteStore:
                     body = self._read_file(e["filename"])
                 except OSError:
                     continue
-                out.append({"id": i, "title": e["title"], "body": body,
-                            "createdAt": e.get("createdAt") or 0,
-                            "updatedAt": int(e.get("mtime", 0) * 1000),
-                            "starred": bool(e.get("starred")),
-                            "starredAt": int(e.get("starredAt") or 0)})
+                n = {"id": i, "title": e["title"], "body": body,
+                     "createdAt": e.get("createdAt") or 0,
+                     "updatedAt": int(e.get("mtime", 0) * 1000),
+                     "starred": bool(e.get("starred")),
+                     "starredAt": int(e.get("starredAt") or 0)}
+                if e.get("calendar"):
+                    n["calendar"] = e["calendar"]
+                out.append(n)
             out.sort(key=lambda n: n["updatedAt"], reverse=True)
             return out
 
@@ -266,11 +269,14 @@ class NoteStore:
                 body = self._read_file(e["filename"])
             except OSError:
                 return None
-            return {"id": note_id, "title": e["title"], "body": body,
-                    "createdAt": e.get("createdAt") or 0,
-                    "updatedAt": int(e.get("mtime", 0) * 1000),
-                    "starred": bool(e.get("starred")),
-                    "starredAt": int(e.get("starredAt") or 0)}
+            n = {"id": note_id, "title": e["title"], "body": body,
+                 "createdAt": e.get("createdAt") or 0,
+                 "updatedAt": int(e.get("mtime", 0) * 1000),
+                 "starred": bool(e.get("starred")),
+                 "starredAt": int(e.get("starredAt") or 0)}
+            if e.get("calendar"):
+                n["calendar"] = e["calendar"]
+            return n
 
     def entry(self, note_id):
         with self.lock:
@@ -286,6 +292,12 @@ class NoteStore:
         from `dirty` so a star never re-pushes (or bumps) the note body."""
         with self.lock:
             return [i for i, e in self.notes.items() if e.get("starDirty")]
+
+    def calendar_dirty_ids(self):
+        """Notes whose calendar link hasn't reached the cloud yet. Like stars,
+        the calendar field rides its own push and never bumps the body."""
+        with self.lock:
+            return [i for i, e in self.notes.items() if e.get("calendarDirty")]
 
     # ---------------- local mutations (UI / dictation) ----------------
 
@@ -358,6 +370,77 @@ class NoteStore:
             if e and int(e.get("starredAt") or 0) <= int(pushed_at or 0):
                 e["starDirty"] = False
                 self._save_index()
+
+    # ---------------- calendar link (laptop is the only writer) ----------------
+
+    def set_calendar(self, note_id, meta):
+        """Stamp a note with its calendar event (or the failure to make one).
+        meta: {status, provider, eventId, link, start, end, allDay, addedAt,
+        bodyHash} — index-only metadata, pushed on its own like a star so the
+        note keeps its place in the list."""
+        with self.lock:
+            e = self.notes.get(note_id)
+            if not e or e.get("deletedLocally"):
+                return None
+            e["calendar"] = meta
+            e["calendarDirty"] = True
+            self._save_index()
+        self._notify("calendar", note_id)
+        return self.get(note_id)
+
+    def mark_calendar_synced(self, note_id, pushed_added_at):
+        """Clear the pending flag unless a newer link landed mid-push."""
+        with self.lock:
+            e = self.notes.get(note_id)
+            if e and int((e.get("calendar") or {}).get("addedAt") or 0) \
+                    <= int(pushed_added_at or 0):
+                e["calendarDirty"] = False
+                self._save_index()
+
+    def set_remote_calendar(self, note_id, meta):
+        """Adopt a calendar link arriving from the cloud (our own echo, or a
+        fresh install pulling history). The laptop is the only writer, so
+        there's no timestamp race to arbitrate — just never let an inbound
+        copy clobber a link that is still waiting to push."""
+        if not isinstance(meta, dict):
+            return ""
+        with self.lock:
+            e = self.notes.get(note_id)
+            if not e or e.get("deletedLocally") or e.get("calendarDirty"):
+                return ""
+            if e.get("calendar") == meta:
+                return ""
+            e["calendar"] = meta
+            self._save_index()
+        self._notify("remote_update", note_id)
+        return "remote_update"
+
+    def set_calendar_notified(self, note_id):
+        """The pre-event heads-up fired — local bookkeeping only, never synced."""
+        with self.lock:
+            e = self.notes.get(note_id)
+            if e:
+                e["calendarNotifiedAt"] = _now_ms()
+                self._save_index()
+
+    def upcoming_calendar(self, within_ms, grace_ms=5 * 60 * 1000):
+        """[(note_id, title, start_ms)] for timed events starting within
+        within_ms that haven't had their pill heads-up yet. A note whose
+        start slipped past while the laptop slept still fires for grace_ms."""
+        now = _now_ms()
+        out = []
+        with self.lock:
+            for i, e in self.notes.items():
+                cal = e.get("calendar")
+                if (not cal or e.get("deletedLocally")
+                        or cal.get("status") != "ok" or cal.get("allDay")
+                        or e.get("calendarNotifiedAt")):
+                    continue
+                start = int(cal.get("start") or 0)
+                if now - grace_ms <= start <= now + within_ms:
+                    out.append((i, e.get("title") or "Note", start))
+        out.sort(key=lambda x: x[2])
+        return out
 
     def delete(self, note_id):
         with self.lock:
@@ -439,6 +522,8 @@ class NoteStore:
                         "starred": bool(record.get("starred")),
                         "starredAt": int(record.get("starredAt") or 0),
                     }
+                    if isinstance(record.get("calendar"), dict):
+                        self.notes[note_id]["calendar"] = record["calendar"]
                     self._materialize(self.notes[note_id], body)
                     kind = "remote_create"
                 else:

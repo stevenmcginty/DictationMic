@@ -29,6 +29,9 @@
   --danger: #FF5C48;
   --gold: #F4C752;
   --gold-dim: rgba(244, 199, 82, .13);
+  --amber: #F0A05A;                       /* calendar event that didn't make it */
+  --amber-dim: rgba(240, 160, 90, .12);
+  --amber-edge: rgba(240, 160, 90, .38);
   --sans: "Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
   --ease: cubic-bezier(.2, .7, .2, 1);
@@ -258,6 +261,28 @@ input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; }
 /* a starred note gets a whisper of warmth so it reads as flagged at a glance */
 .note-row.starred { background: linear-gradient(90deg, var(--gold-dim), transparent 62%); }
 .note-row.starred:hover { background: linear-gradient(90deg, var(--gold-dim), var(--surface) 82%); }
+
+/* a calendared note reads as scheduled: volt wash + a small event chip.
+   The note itself keeps its normal chronological spot — this is display only. */
+.note-row.calendared { background: linear-gradient(90deg, var(--volt-dim), transparent 62%); }
+.note-row.calendared:hover { background: linear-gradient(90deg, var(--volt-dim), var(--surface) 82%); }
+.note-row.cal-failed { background: linear-gradient(90deg, var(--amber-dim), transparent 62%); }
+.note-row.cal-failed:hover { background: linear-gradient(90deg, var(--amber-dim), var(--surface) 82%); }
+.cal-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-top: 5px; padding: 2.5px 9px 2.5px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(182, 238, 63, .32);
+  background: var(--volt-dim);
+  color: var(--volt);
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+  white-space: nowrap; max-width: 100%; overflow: hidden;
+}
+.cal-chip svg { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+.cal-chip.failed { border-color: var(--amber-edge); background: var(--amber-dim); color: var(--amber); }
+.cal-chip.soon { animation: pulse 1.6s ease-in-out infinite; }
+.cal-link { color: var(--volt); text-decoration: underline; text-underline-offset: 2px; }
+.cal-fail-note { color: var(--amber); }
 
 .note-row-snippet {
   margin-top: 3px;
