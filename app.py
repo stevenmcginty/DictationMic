@@ -1577,6 +1577,10 @@ class DictationApp:
         get_store().subscribe(self._on_note_calendar)
         threading.Thread(target=self._calendar_worker,
                          name="calendar-worker", daemon=True).start()
+        # the pull half of two-way sync: events made straight in Google
+        # Calendar become green-chip notes; moved/deleted events update theirs
+        threading.Thread(target=self._calendar_poll_loop,
+                         name="calendar-poll", daemon=True).start()
         self._start_cloud_sync()
 
         self.root.update_idletasks()
@@ -2614,6 +2618,99 @@ class DictationApp:
             finally:
                 if not retrying:
                     self._cal_inflight.discard(nid)
+
+    GCAL_POLL_S = 180                  # pull from Google Calendar every 3 min
+
+    def _calendar_poll_loop(self):
+        time.sleep(20)                 # let sync land the first snapshot
+        while True:
+            try:
+                self._calendar_poll()
+            except Exception as ex:
+                dbg(f"calendar poll: {ex!r}")
+            time.sleep(self.GCAL_POLL_S)
+
+    def _calendar_poll(self):
+        """Pull changes from Google Calendar. New events (made on the phone,
+        the web, anywhere) become notes with the green chip; events that were
+        moved update their note's chip; deleted events mark it. Never touches
+        events — this is read-only towards Google."""
+        if not (self.settings.get("calendar_enabled", True)
+                and self.gcal.connected()):
+            return
+        from datetime import datetime, timedelta, timezone
+        last = self.settings.get("gcal_last_poll") or (
+            datetime.now(timezone.utc) - timedelta(minutes=10)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        poll_started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        items = self.gcal.list_updated(last)
+        store = get_store()
+        known = {}                     # eventId -> note id
+        with store.lock:
+            for nid, e in store.notes.items():
+                cal = e.get("calendar") or {}
+                if cal.get("eventId"):
+                    known[cal["eventId"]] = nid
+
+        def parse_side(raw, fallback=None):
+            if not raw:
+                return fallback, False
+            if "date" in raw:          # all-day (end date is exclusive)
+                return datetime.fromisoformat(raw["date"]).astimezone(), True
+            try:
+                return datetime.fromisoformat(raw.get("dateTime")), False
+            except (TypeError, ValueError):
+                return fallback, False
+
+        for ev in items:
+            eid = ev.get("id")
+            if not eid:
+                continue
+            sdt, all_day = parse_side(ev.get("start"))
+            edt, _ = parse_side(ev.get("end"), fallback=sdt)
+            nid = known.get(eid)
+            if nid is not None:
+                # one of ours (or already imported): follow moves/deletes
+                cal = (store.entry(nid) or {}).get("calendar") or {}
+                new = dict(cal)
+                if ev.get("status") == "cancelled":
+                    new["status"] = "cancelled"
+                elif sdt is not None:
+                    new.update(status="ok",
+                               start=int(sdt.timestamp() * 1000),
+                               end=int((edt or sdt).timestamp() * 1000),
+                               allDay=all_day,
+                               link=ev.get("htmlLink") or cal.get("link", ""))
+                if new != cal:
+                    new["addedAt"] = int(time.time() * 1000)
+                    store.set_calendar(nid, new)
+                    dbg(f"calendar poll: updated note {nid[:8]} from event {eid[:10]}")
+                continue
+            # a brand-new event made directly in Google Calendar -> a note
+            if ev.get("status") != "confirmed" or sdt is None:
+                continue
+            if ev.get("recurringEventId"):
+                continue               # instances ride their series' note
+            if "dictated with DictationMic" in (ev.get("description") or ""):
+                continue               # our own notes-off dictation event
+            if sdt.timestamp() < time.time() - 3600:
+                continue               # already past — not worth a note
+            summary = (ev.get("summary") or "Event").strip()
+            start_ms = int(sdt.timestamp() * 1000)
+            when_line = self._fmt_event_time(start_ms, all_day)
+            note = store.create(
+                summary, f"{summary}\n{when_line}\n\nAdded in Google Calendar")
+            store.set_calendar(note["id"], {
+                "status": "ok", "provider": "google", "eventId": eid,
+                "link": ev.get("htmlLink") or "",
+                "start": start_ms,
+                "end": int((edt or sdt).timestamp() * 1000),
+                "allDay": all_day, "addedAt": int(time.time() * 1000),
+                "source": "gcal"})
+            self.events.put(("toast", "From your calendar: " + summary))
+            dbg(f"calendar poll: imported event {eid[:10]} as note")
+        self.settings["gcal_last_poll"] = poll_started
+        save_settings(self.settings)
 
     def _check_upcoming_events(self):
         """Every ~30 s from tick(): one pill heads-up, 15 minutes before a

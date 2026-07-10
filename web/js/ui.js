@@ -417,7 +417,9 @@ export class App {
           + `rel="noopener">in your calendar · open</a>`
         : `<span class="cal-link">in your calendar</span>`);
     } else if (n.calendar) {
-      bits.push(`<span class="cal-fail-note">calendar event didn't make it</span>`);
+      bits.push(`<span class="cal-fail-note">${
+        n.calendar.status === "cancelled"
+          ? "removed from the calendar" : "calendar event didn't make it"}</span>`);
     }
     if (this.adapter.pendingIds().has(n.id)) bits.push("<b>saved · syncing…</b>");
     $("noteMeta").innerHTML = bits.join(" · ");

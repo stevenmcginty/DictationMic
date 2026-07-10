@@ -236,3 +236,28 @@ class GCal:
         data = r.json()
         return {"eventId": data.get("id", ""),
                 "link": data.get("htmlLink", "")}
+
+    def list_updated(self, updated_min_iso):
+        """Events changed since updated_min_iso (RFC3339 UTC), including
+        deletions — the pull half of the two-way sync. Raises on failure."""
+        token = self._token()
+        if token is None:
+            raise RuntimeError("Google Calendar needs a fresh sign-in")
+        import requests
+        params = {"updatedMin": updated_min_iso, "maxResults": 100,
+                  "showDeleted": "true"}
+        r = requests.get(EVENTS_URL,
+                         headers={"Authorization": f"Bearer {token}"},
+                         params=params, timeout=20)
+        if r.status_code == 401:
+            self._access = None
+            token = self._token()
+            if token is None:
+                raise RuntimeError("Google Calendar needs a fresh sign-in")
+            r = requests.get(EVENTS_URL,
+                             headers={"Authorization": f"Bearer {token}"},
+                             params=params, timeout=20)
+        if r.status_code != 200:
+            self.dbg(f"gcal list_updated: {r.status_code} {r.text[:200]}")
+            raise RuntimeError(f"calendar list failed ({r.status_code})")
+        return r.json().get("items", [])

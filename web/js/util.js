@@ -54,6 +54,7 @@ export function dayHeading(ms) {
 // cal is the synced calendar field the laptop stamps on the note.
 export function calendarLabel(cal) {
   if (!cal) return "";
+  if (cal.status === "cancelled") return "removed from the calendar";
   if (cal.status !== "ok") return "calendar event didn't make it";
   const d = new Date(cal.start);
   const now = new Date();
