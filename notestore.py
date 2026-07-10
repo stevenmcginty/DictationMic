@@ -442,6 +442,29 @@ class NoteStore:
         out.sort(key=lambda x: x[2])
         return out
 
+    def calendar_agenda(self, within_ms):
+        """Every linked event that is still ahead (or running right now),
+        soonest first: [{id, title, start, end, allDay, link}]. Feeds the
+        pill's calendar badge + dropdown — local index only, no network."""
+        now = _now_ms()
+        out = []
+        with self.lock:
+            for i, e in self.notes.items():
+                cal = e.get("calendar")
+                if (not cal or e.get("deletedLocally")
+                        or cal.get("status") != "ok"):
+                    continue
+                start = int(cal.get("start") or 0)
+                end = int(cal.get("end") or start)
+                if end < now or start > now + within_ms:
+                    continue
+                out.append({"id": i, "title": e.get("title") or "Note",
+                            "start": start, "end": end,
+                            "allDay": bool(cal.get("allDay")),
+                            "link": cal.get("link") or ""})
+        out.sort(key=lambda x: x["start"])
+        return out
+
     def delete(self, note_id):
         with self.lock:
             e = self.notes.get(note_id)

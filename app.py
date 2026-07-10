@@ -29,6 +29,7 @@ import time
 import tkinter as tk
 import urllib.error
 import urllib.request
+import webbrowser
 from collections import deque
 
 import numpy as np
@@ -124,6 +125,9 @@ DEFAULT_SETTINGS = {
     "sync_uid": "",
     "calendar_enabled": True,  # "add to calendar" in a dictation makes an event
     "calendar_provider": "google",   # apple/iCloud is a future option
+    "cal_badge": True,         # upcoming events pin to the LEFT shoulder
+    "cal_pulse": True,         # the pill breathes ice inside the last hour
+    "cal_badge_hidden_date": "",   # right-click the badge = quiet until tomorrow
     "gcal_client_id": "",      # Steve's own OAuth client (see README)
     "gcal_client_secret": "",
     "gcal_refresh_token": "",  # empty = not connected
@@ -810,6 +814,17 @@ class PillRenderer:
         self._sleep_dots(body, dot)
         return body
 
+    PULSE_STEPS = 10             # quantized so every breath frame caches
+
+    def frame_idle_pulse(self, step):
+        """Idle, but an event is inside the hour: the rim (and the sleeping
+        dots) breathe ice-blue — quiet at the bottom of the breath, never
+        brighter than the 'saved' flash. Ice = calendar, lime stays voice."""
+        k = step / (self.PULSE_STEPS - 1)
+        body = self._body(("pulse", step), ICE + (28 + int(122 * k),)).copy()
+        self._sleep_dots(body, ICE + (70 + int(110 * k),))
+        return body
+
     def frame_listening(self, vals, pulse):
         step = min(3, int(max(0.0, pulse) * 4))     # quantized so bodies cache
         body = self._body(("listen", step), LIME + (95 + step * 16,)).copy()
@@ -897,6 +912,12 @@ class PillRenderer:
             self._static[key] = self._finish(self.frame_idle(hover, dim))
         return self._static[key]
 
+    def idle_pulse(self, step):
+        key = ("pulse", step)
+        if key not in self._static:
+            self._static[key] = self._finish(self.frame_idle_pulse(step))
+        return self._static[key]
+
     def drop(self):
         if "drop" not in self._static:
             self._static["drop"] = self._finish(self.frame_drop())
@@ -931,6 +952,7 @@ MENU_DIM = "#5C6156"
 MENU_LIME = "#B6EE3F"
 MENU_RED = "#FF5C48"
 MENU_GREEN = "#B6EE3F"       # "on" is an accent state — volt, not a 2nd green
+ICE_HEX = "#56C5FF"          # Tk twin of ICE (86, 197, 255)
 
 
 class PopupMenu:
@@ -1478,6 +1500,276 @@ class ShotsWindow:
 
 
 # ----------------------------------------------------------------------------
+# Calendar badge + dropdown — the left-shoulder twin of the screenshot
+# shelf: a disc counting what's coming up, and the agenda it opens. All
+# data comes off the local note index (every event is a green-chip note,
+# even ones made straight in Google — the 3-min poll imports those), so
+# opening it costs nothing and works offline.
+# ----------------------------------------------------------------------------
+
+CAL_AGENDA_MS = 7 * 24 * 3600 * 1000     # the badge looks a week ahead
+CAL_SOON_MS = 60 * 60 * 1000             # ice ring while something's within 1h
+
+
+class CalBadge:
+    """The disc on the pill's LEFT shoulder: how many events are coming up
+    this week. Ice-blue ring while one starts within the hour; quiet grey
+    otherwise. Click = open / close the agenda dropdown."""
+
+    def __init__(self, app):
+        self.app = app
+        self.d = max(20, round(app.height * 0.74))
+        self.win = tk.Toplevel(app.root, bg=TRANSPARENT_HEX)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-transparentcolor", TRANSPARENT_HEX)
+        self.label = tk.Label(self.win, bg=TRANSPARENT_HEX, bd=0,
+                              cursor="hand2")
+        self.label.pack()
+        self.label.bind("<ButtonRelease-1>",
+                        lambda e: app.toggle_cal_window())
+        self.label.bind("<ButtonRelease-3>",     # right-click = quiet today
+                        lambda e: app.hide_cal_badge_today())
+        self._frames = {}
+        self._photo = None
+        self._font = None
+        self.visible = False
+        self.win.withdraw()
+        self.win.update_idletasks()
+        make_non_activating(self.win)
+
+    def _frame(self, count, soon):
+        key = (count, soon)
+        if key in self._frames:
+            return self._frames[key]
+        s = self.d * SS
+        img = Image.new("RGBA", (s, s), C_TRANSPARENT)
+        d = ImageDraw.Draw(img)
+        ring = ICE + (235,) if soon else INK + (64,)
+        d.ellipse([SS, SS, s - SS, s - SS], fill=MENU_BG_RGB + (255,),
+                  outline=ring, width=max(2, round(SS * 1.3)))
+        txt = "9+" if count > 9 else str(count)
+        if self._font is None:
+            self._font = pil_font(s * 0.42, names=(
+                "CascadiaMono.ttf", "CascadiaCode.ttf", "consola.ttf",
+                "seguisb.ttf", "segoeui.ttf"))
+        fill = ICE + (255,) if soon else INK + (190,)
+        d.text((s / 2, s / 2 + SS * 0.3), txt, font=self._font,
+               fill=fill, anchor="mm")
+        ph = tk_photo(img.resize((self.d, self.d), Image.LANCZOS))
+        self._frames[key] = ph
+        return ph
+
+    def place(self):
+        """Sit on the pill's top-left shoulder, wherever the pill goes."""
+        r = self.app.root
+        x = r.winfo_x() - round(self.d * 0.40)
+        y = r.winfo_y() - round(self.d * 0.42)
+        x = max(0, min(x, r.winfo_screenwidth() - self.d))
+        y = max(0, min(y, r.winfo_screenheight() - self.d))
+        self.win.geometry(f"{self.d}x{self.d}+{x}+{y}")
+
+    def hide(self):
+        if self.visible:
+            self.win.withdraw()
+            self.visible = False
+
+    def refresh(self):
+        if self.app._menu is not None:   # the card owns the shoulder space
+            self.hide()
+            return
+        try:
+            agenda = (get_store().calendar_agenda(CAL_AGENDA_MS)
+                      if self.app.settings.get("cal_badge", True)
+                      and not self.app.cal_hidden_today()
+                      and self.app.gcal.connected() else [])
+        except Exception:
+            agenda = []
+        if not agenda:
+            self.hide()
+            return
+        soon = bool(self.app._cal_soon_events())
+        self._photo = self._frame(len(agenda), soon)
+        self.label.configure(image=self._photo)
+        self.place()
+        if not self.visible:
+            self.win.deiconify()
+            self.visible = True
+        self.win.lift()
+
+
+class CalWindow:
+    """The agenda, popped open: the week's events off the local index,
+    grouped by day. Click one and the event opens in Google Calendar."""
+
+    def __init__(self, app, on_close=None):
+        self.app = app
+        self.on_close = on_close
+        self.closed = False
+        self._prev_buttons = True     # swallow the click that opened us
+        self.win = tk.Toplevel(app.root, bg=MENU_BG)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(highlightthickness=1,
+                           highlightbackground=MENU_EDGE,
+                           highlightcolor=MENU_EDGE)
+        self.body = tk.Frame(self.win, bg=MENU_BG)
+        self.body.pack(fill="both", expand=True, padx=10, pady=(10, 8))
+        self.win.bind("<Escape>", lambda e: self.close())
+        self.win.bind("<FocusOut>", lambda e: self.close())
+        self.rebuild()
+
+    @staticmethod
+    def _day_label(start_ms):
+        lt = time.localtime(start_ms / 1000)
+        today = time.localtime()
+        if (lt.tm_year, lt.tm_yday) == (today.tm_year, today.tm_yday):
+            return "Today"
+        tom = time.localtime(time.time() + 86400)
+        if (lt.tm_year, lt.tm_yday) == (tom.tm_year, tom.tm_yday):
+            return "Tomorrow"
+        return time.strftime("%a ", lt) + str(lt.tm_mday) \
+            + time.strftime(" %b", lt)
+
+    def rebuild(self):
+        if self.closed:
+            return
+        for w in self.body.winfo_children():
+            w.destroy()
+        agenda = get_store().calendar_agenda(CAL_AGENDA_MS)
+        head = tk.Frame(self.body, bg=MENU_BG)
+        head.pack(fill="x", pady=(0, 2))
+        tk.Label(head, text=spaced("Coming up"), bg=MENU_BG, fg=MENU_DIM,
+                 font=(MONO_FAMILY, 7)).pack(side="left")
+        tk.Label(head, text=f"· {len(agenda)}", bg=MENU_BG, fg=MENU_SUB,
+                 font=(MONO_FAMILY, 7)).pack(side="left", padx=(6, 0))
+        if not agenda:
+            tk.Label(self.body, text="Nothing this week — say "
+                     "“add to calendar” while dictating",
+                     bg=MENU_BG, fg=MENU_DIM,
+                     font=(UI_FAMILY, 10)).pack(padx=16, pady=12)
+        else:
+            day = None
+            now = time.time() * 1000
+            for ev in agenda:
+                label = self._day_label(ev["start"])
+                if label != day:
+                    day = label
+                    tk.Label(self.body, text=label, bg=MENU_BG,
+                             fg=MENU_LIME if label == "Today" else MENU_SUB,
+                             font=(MONO_FAMILY, 7)).pack(
+                        anchor="w", pady=(7, 1))
+                self._row(ev, now)
+        foot = tk.Frame(self.body, bg=MENU_BG)
+        foot.pack(fill="x", pady=(8, 0))
+        tk.Label(foot, text="click = open in Google Calendar",
+                 bg=MENU_BG, fg=MENU_DIM,
+                 font=(MONO_FAMILY, 7)).pack(side="left")
+        hb = tk.Label(foot, text="Hide for today", bg=MENU_BG, fg=MENU_SUB,
+                      font=(MONO_FAMILY, 7), cursor="hand2")
+        hb.pack(side="right", padx=(14, 0))
+        hb.bind("<Enter>", lambda e: hb.configure(fg=MENU_FG))
+        hb.bind("<Leave>", lambda e: hb.configure(fg=MENU_SUB))
+        hb.bind("<ButtonRelease-1>",
+                lambda e: self.app.hide_cal_badge_today())
+        self.win.update_idletasks()
+
+    def _row(self, ev, now_ms):
+        row = tk.Frame(self.body, bg=MENU_BG, cursor="hand2")
+        row.pack(fill="x")
+        if ev["allDay"]:
+            when = "all day"
+        elif ev["start"] <= now_ms:
+            when = "now"
+        else:
+            when = time.strftime("%H:%M", time.localtime(ev["start"] / 1000))
+        title = ev["title"]
+        if len(title) > 42:
+            title = title[:41] + "…"
+        soon = (not ev["allDay"] and 0 <= ev["start"] - now_ms <= CAL_SOON_MS)
+        wl = tk.Label(row, text=when, width=7, anchor="w", bg=MENU_BG,
+                      fg=ICE_HEX if (soon or when == "now") else MENU_SUB,
+                      font=(MONO_FAMILY, 8))
+        wl.pack(side="left", padx=(2, 6), pady=2)
+        tl = tk.Label(row, text=title, anchor="w", bg=MENU_BG, fg=MENU_FG,
+                      font=(UI_FAMILY, 10))
+        tl.pack(side="left", fill="x", expand=True, pady=2)
+
+        def hover(on):
+            bg = MENU_HOVER if on else MENU_BG
+            for w in (row, wl, tl):
+                w.configure(bg=bg)
+
+        def clicked(e):
+            if ev["link"]:
+                webbrowser.open(ev["link"])
+                self.close()
+            else:
+                self.app.show_toast("That one has no calendar link yet", 2000)
+
+        for w in (row, wl, tl):
+            w.bind("<Enter>", lambda e: hover(True))
+            w.bind("<Leave>", lambda e: hover(False))
+            w.bind("<ButtonRelease-1>", clicked)
+
+    # ---- window plumbing (same patterns as ShotsWindow) ----
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        if self.on_close:
+            self.on_close()
+
+    def show(self):
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        r = self.app.root
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        x = r.winfo_x()                             # left edges aligned
+        y = r.winfo_y() - h - 10                    # prefer above the pill
+        if y < 8:
+            y = r.winfo_y() + self.app.height + 10
+        x = max(8, min(x, sw - w - 8))
+        y = max(8, min(y, sh - h - 8))
+        self.win.geometry(f"+{x}+{y}")
+        round_corners(self.win)
+        fade_in(self.win)
+        self.win.lift()
+        try:
+            self.win.focus_force()
+        except Exception:
+            pass
+        self._watch_outside_click()
+
+    def _watch_outside_click(self):
+        if self.closed:
+            return
+        try:
+            down = any(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                       for vk in (0x01, 0x02, 0x04))
+            if down and not self._prev_buttons:
+                pt = ctypes.wintypes.POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                x0, y0 = self.win.winfo_rootx(), self.win.winfo_rooty()
+                if not (x0 <= pt.x < x0 + self.win.winfo_width()
+                        and y0 <= pt.y < y0 + self.win.winfo_height()):
+                    self.close()
+                    return
+            self._prev_buttons = down
+        except Exception:
+            pass
+        try:
+            self.win.after(80, self._watch_outside_click)
+        except tk.TclError:
+            pass
+
+
+# ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
 
@@ -1593,6 +1885,15 @@ class DictationApp:
 
         self._badge = ShotBadge(self)
         self.root.after(400, self._badge.refresh)   # once geometry settles
+        # calendar badge on the other shoulder; the store tells us (from any
+        # thread) when an event link changes — Tk work goes via the queue
+        self._cal_win = None
+        self._cal_ack = set()          # events looked at — no more pulsing
+        self._cal_pulse_on = False     # draw() reads this every frame
+        self._cal_badge = CalBadge(self)
+        self.root.after(400, self._cal_badge.refresh)
+        self.root.after(400, self._recalc_cal_pulse)
+        get_store().subscribe(self._on_store_cal_change)
 
         if parakeet_files_ready():
             self.state = LOADING
@@ -1835,6 +2136,13 @@ class DictationApp:
                  "text": "Add events when I say “add to calendar”",
                  "check": bool(s.get("calendar_enabled", True)),
                  "command": self.toggle_calendar_enabled},
+                {"kind": "item", "text": "This week's events on my shoulder",
+                 "hint": "click = the list · right-click = hide today",
+                 "check": bool(s.get("cal_badge", True)),
+                 "command": self.toggle_cal_badge},
+                {"kind": "item", "text": "Pulse when an event is an hour out",
+                 "check": bool(s.get("cal_pulse", True)),
+                 "command": self.toggle_cal_pulse},
                 {"kind": "item", "text": "Disconnect Google Calendar",
                  "command": self.calendar_off},
             ]
@@ -2046,6 +2354,11 @@ class DictationApp:
             self.refresh_shot_badge(fresh=True)
             if self._shots_win is not None:
                 self._shots_win.rebuild()
+        elif name == "cal_changed":
+            self._recalc_cal_pulse()
+            self._cal_badge.refresh()
+            if self._cal_win is not None:
+                self._cal_win.rebuild()
         elif name == "toast":
             self.show_toast(payload, 3500)
         elif name == "sync_status":
@@ -2159,13 +2472,18 @@ class DictationApp:
         dx = e.x_root - self.drag_start[0]
         dy = e.y_root - self.drag_start[1]
         if abs(dx) > 4 or abs(dy) > 4:
-            if not self.dragging and self._shots_win is not None:
-                self._shots_win.close()     # shelf doesn't chase the pill
+            if not self.dragging:           # trays don't chase the pill
+                if self._shots_win is not None:
+                    self._shots_win.close()
+                if self._cal_win is not None:
+                    self._cal_win.close()
             self.dragging = True
         if self.dragging:
             self.root.geometry(f"+{self.drag_start[2] + dx}+{self.drag_start[3] + dy}")
             if self._badge.visible:
-                self._badge.place()         # the badge rides the shoulder
+                self._badge.place()         # the badges ride the shoulders
+            if self._cal_badge.visible:
+                self._cal_badge.place()
 
     def on_release(self, e):
         if self.dragging:
@@ -2186,6 +2504,7 @@ class DictationApp:
         if self._menu is not None:
             self._menu.close()
         self._badge.hide()            # the card takes the shoulder space
+        self._cal_badge.hide()
 
         def closed():
             self._menu = None
@@ -2197,6 +2516,7 @@ class DictationApp:
             except Exception:
                 pass
             self._badge.refresh()
+            self._cal_badge.refresh()
 
         r = self.root
         anchor = (r.winfo_x(), r.winfo_y(), self.width, self.height)
@@ -2408,10 +2728,91 @@ class DictationApp:
         if self._shots_win is not None:
             self._shots_win.close()
             return
+        if self._cal_win is not None:
+            self._cal_win.close()                # one shoulder tray at a time
         self.refresh_shot_badge(fresh=False)     # looked at — lime settles
         self._shots_win = ShotsWindow(
             self, on_close=lambda: setattr(self, "_shots_win", None))
         self._shots_win.show()
+
+    def toggle_cal_window(self):
+        if self._cal_win is not None:
+            self._cal_win.close()
+            return
+        if self._shots_win is not None:
+            self._shots_win.close()
+        try:
+            self._cal_win = CalWindow(
+                self, on_close=lambda: setattr(self, "_cal_win", None))
+            self._cal_win.show()
+        except Exception as ex:
+            dbg(f"cal window failed: {ex!r}")
+            return
+        # opening the list IS the acknowledgement — the pulse and the ice
+        # ring settle (same contract as the shots badge going grey)
+        for e in self._cal_soon_events():
+            self._cal_ack.add(e["id"])
+        self._recalc_cal_pulse()
+        self._cal_badge.refresh()
+
+    def cal_hidden_today(self):
+        return (self.settings.get("cal_badge_hidden_date")
+                == time.strftime("%Y-%m-%d"))
+
+    def _cal_soon_events(self):
+        """Timed events inside the hour that haven't been looked at yet.
+        Already-started events don't count — pulsing through a meeting
+        you're in (or missed) helps nobody."""
+        if self.cal_hidden_today() or not self.gcal.connected():
+            return []
+        try:
+            now = time.time() * 1000
+            return [e for e in get_store().calendar_agenda(CAL_SOON_MS)
+                    if not e["allDay"] and e["start"] >= now
+                    and e["id"] not in self._cal_ack]
+        except Exception:
+            return []
+
+    def _recalc_cal_pulse(self):
+        self._cal_pulse_on = (bool(self.settings.get("cal_pulse", True))
+                              and bool(self._cal_soon_events()))
+
+    def hide_cal_badge_today(self):
+        """Right-click the badge (or 'Hide for today'): badge AND pulse go
+        quiet until tomorrow — the settings toggles make it permanent."""
+        self.settings["cal_badge_hidden_date"] = time.strftime("%Y-%m-%d")
+        save_settings(self.settings)
+        if self._cal_win is not None:
+            self._cal_win.close()
+        self._recalc_cal_pulse()
+        self._cal_badge.refresh()
+        self.show_toast("Calendar's quiet until tomorrow — right-click me "
+                        "→ Calendar to turn it off for good", 3200)
+
+    def toggle_cal_badge(self):
+        on = not self.settings.get("cal_badge", True)
+        self.settings["cal_badge"] = on
+        self.settings["cal_badge_hidden_date"] = ""   # an ON is an unhide too
+        save_settings(self.settings)
+        self._cal_badge.refresh()
+        self.show_toast("This week's events sit on my left shoulder"
+                        if on else "Calendar badge is off", 2400)
+
+    def toggle_cal_pulse(self):
+        on = not self.settings.get("cal_pulse", True)
+        self.settings["cal_pulse"] = on
+        save_settings(self.settings)
+        self._recalc_cal_pulse()
+        self.show_toast("I'll breathe ice-blue when an event is inside "
+                        "the hour" if on else "No pulse before events", 2400)
+
+    def _on_store_cal_change(self, kind, nid):
+        """Store listener (any thread): anything that could change the
+        agenda — a new event link, a moved/cancelled event from the poll,
+        a deleted note — nudges the badge on the Tk thread."""
+        if kind in ("calendar", "remote_update", "remote_create",
+                    "delete", "remote_delete"):
+            self.events.put(("cal_changed", None))
 
     def toggle_catch_shots(self):
         on = not self.settings.get("catch_shots", True)
@@ -3076,6 +3477,9 @@ class DictationApp:
             if self._badge.visible:
                 self._badge.win.attributes("-topmost", True)
                 self._badge.win.lift()
+            if self._cal_badge.visible:
+                self._cal_badge.win.attributes("-topmost", True)
+                self._cal_badge.win.lift()
         except Exception:
             pass
         self.root.after(2000, self.assert_topmost)
@@ -3182,10 +3586,14 @@ class DictationApp:
             # (no clipboard open, no message pump) — grabbing the actual
             # bitmap happens off-thread only when the number moves
             now = time.time()
-            # calendar heads-up: a cheap index scan twice a minute
+            # calendar heads-up: a cheap index scan twice a minute (the
+            # badge rides along so its count tracks the clock, not just
+            # store changes — an event passing drops it by one)
             if now - self._cal_notify_last >= 30.0:
                 self._cal_notify_last = now
                 self._check_upcoming_events()
+                self._recalc_cal_pulse()
+                self._cal_badge.refresh()
             if (now - self._clip_last_check >= 0.5 and not self._clip_busy
                     and self.settings.get("catch_shots", True)):
                 self._clip_last_check = now
@@ -3238,6 +3646,13 @@ class DictationApp:
             self._set_frame(None, lambda: r.downloading(self.dl_frac))
         elif self.state == LOADING:
             self._set_frame(("loading",), lambda: r.idle(False, dim=True))
+        elif self._cal_pulse_on and not self.hover:
+            # an event is inside the hour and unseen: a slow ice breath
+            # (~3 s a cycle at the sleeping 10 Hz tick; hover's volt rim
+            # outranks it — armed beats aware)
+            k = 0.5 - 0.5 * math.cos(self.phase * 1.25)
+            step = round(k * (r.PULSE_STEPS - 1))
+            self._set_frame(("pulse", step), lambda: r.idle_pulse(step))
         else:
             self._set_frame(("idle", self.hover),
                             lambda: r.idle(self.hover))
