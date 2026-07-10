@@ -2508,9 +2508,35 @@ class DictationApp:
             return f"{day}, all day"
         return f"{day} at " + time.strftime("%H:%M", lt)
 
+    def _calendar_sweep(self):
+        """Boot catch-up: recent notes that say "add to calendar" but never
+        got their event (they arrived while the app was off/restarting, or
+        before a trigger fix) get queued once. Capped at 48h old so ancient
+        notes can never surprise-create events with today's date."""
+        try:
+            if not (self.settings.get("calendar_enabled", True)
+                    and self.gcal.connected()):
+                return
+            store = get_store()
+            cutoff = (time.time() - 48 * 3600) * 1000
+            for n in store.all_notes():
+                if (n.get("calendar") or int(n.get("createdAt") or 0) < cutoff
+                        or n["body"].startswith("data:")
+                        or not whenparse.has_trigger(n["body"])):
+                    continue
+                e = store.entry(n["id"])
+                if not e or e.get("file") or n["id"] in self._cal_inflight:
+                    continue
+                self._cal_inflight.add(n["id"])
+                self._cal_q.put(n["id"])
+        except Exception as ex:
+            dbg(f"calendar sweep failed: {ex!r}")
+
     def _calendar_worker(self):
         """One item at a time: parse the when, make the Google event, stamp
         the note. Never touches Tk directly — toasts go via the event queue."""
+        time.sleep(8)                    # let sync/gcal settle after boot
+        self._calendar_sweep()
         while True:
             item = self._cal_q.get()
             nid, text, attempts = (item if isinstance(item, tuple)

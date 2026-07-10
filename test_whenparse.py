@@ -15,8 +15,13 @@ CASES = [
     ("trigger", "put it in the calendar for Monday", True),
     ("trigger", "Add it to the Google Calendar please", True),
     ("trigger", "stick that on the calendar", True),
+    ("trigger", "add 8:00 a.m. Autos to my calendar on Monday", True),
+    ("trigger", "Add event for my calendar to Monday at 8am for an MOT", True),
+    ("trigger", "schedule a call with Tom in my calendar for friday", True),
+    ("trigger", "make a calendar entry for the dentist next tuesday", True),
     ("trigger", "buy a new calendar for the kitchen", False),
     ("trigger", "the calendar looks nice", False),
+    ("trigger", "what's on the calendar", False),
 
     # --- explicit date + time ---
     ("when", "add to calendar dentist tomorrow at 3pm",
@@ -78,11 +83,21 @@ CASES = [
     ("when", "add to calendar buy 3 apples and 2 pears tomorrow",
      dict(day=(2026, 7, 11), all_day=True)),                       # bare digits != times
 
+    # --- Steve's real phrasings from 10 Jul (payload between verb and
+    #     "calendar" used to fail the old strict trigger) ---
+    ("when", "add 8:00 a.m. Autos to my calendar on Monday",
+     dict(day=(2026, 7, 13), hm=(8, 0), all_day=False)),
+    ("when", "Add event for my calendar to Monday at 8am for an MOT at "
+             "Intelligent Autos",
+     dict(day=(2026, 7, 13), hm=(8, 0), all_day=False)),
+
     # --- title stripping ---
     ("strip", "Add to calendar dentist tomorrow at 3pm",
      "dentist tomorrow at 3pm"),
     ("strip", "Dentist tomorrow at 3, add it to my calendar please",
      "Dentist tomorrow at 3, please"),
+    ("strip", "add 8:00 a.m. Autos to my calendar on Monday",
+     "8:00 a.m. Autos on Monday"),
 ]
 
 

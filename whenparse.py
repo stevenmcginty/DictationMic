@@ -17,14 +17,36 @@ import re
 from datetime import datetime, timedelta
 
 # ---------------------------------------------------------------------------
-# trigger: "add (it/this/that) to (the/my) (google) calendar", "put it in my
-# calendar", "stick that on the calendar" — anywhere in the text
+# trigger: a scheduling verb with "…(to/in/on/for) (the/my) calendar" later in
+# the same sentence — the thing being added can sit in the middle, exactly as
+# people dictate: "add 8:00 a.m. Autos to my calendar on Monday",
+# "add event for my calendar to Monday at 8am", "put it in the calendar"
 # ---------------------------------------------------------------------------
 
+_VERBS = r"(?:add|put|stick|pop|create|make|schedule)"
+
+# NB: "." is NOT a boundary here — dictation is full of "8:00 a.m." dots
 TRIGGER_RE = re.compile(
-    r"\b(?:add|put|stick|pop)\s*[,.]?\s*(?:it|this|that|this one)?\s*[,.]?\s*"
-    r"(?:to|in|into|on|onto)\s+(?:the\s+|my\s+)?(?:google\s+)?calendar\b[,.]?",
+    r"\b" + _VERBS + r"\b[^\n!?;]{0,80}?"
+    r"\b(?:to|in|into|on|onto|for)\s+(?:the\s+|my\s+)?(?:google\s+)?calendar\b"
+    r"|\b(?:add|create|make|schedule)\b[^\n!?;]{0,40}?"
+    r"\bcalendar\s+(?:event|entry|appointment)\b",
     re.IGNORECASE)
+
+# the scaffolding words to peel off for the event title (never from the note)
+_PREP_CAL_RE = re.compile(
+    r"\b(?:to|in|into|on|onto|for)\s+(?:the\s+|my\s+)?(?:google\s+)?"
+    r"calendar\b[,.]?", re.IGNORECASE)
+_LEAD_VERB_RE = re.compile(
+    r"^\s*(?:please\s+)?" + _VERBS + r"\b\s*(?:it|this|that|an?|the)?\s*"
+    r"(?:calendar\s+)?(?:event|entry|appointment)?\s*(?:for|of)?\s*[,.]?\s*",
+    re.IGNORECASE)
+_DANGLING_RE = re.compile(
+    r"\b" + _VERBS + r"\s+(?:it|this|that)\s*(?=please\b|$|[,.])",
+    re.IGNORECASE)
+_LEAD_PREP_RE = re.compile(
+    r"^(?:to|on|for)\s+(?=(?:next\s+)?(?:monday|tuesday|wednesday|thursday"
+    r"|friday|saturday|sunday|tomorrow|today)\b)", re.IGNORECASE)
 
 
 def has_trigger(text):
@@ -32,10 +54,13 @@ def has_trigger(text):
 
 
 def strip_trigger(text):
-    """The note text without the trigger phrase — used for the event title.
-    The note itself always keeps the full original text."""
-    out = TRIGGER_RE.sub(" ", text or "")
-    return re.sub(r"\s{2,}", " ", out).strip(" ,.;:")
+    """The note text without the trigger scaffolding — used for the event
+    title. The note itself always keeps the full original text."""
+    out = _PREP_CAL_RE.sub(" ", text or "")
+    out = _LEAD_VERB_RE.sub("", out)
+    out = _DANGLING_RE.sub(" ", out)
+    out = re.sub(r"\s{2,}", " ", out).strip(" ,.;:")
+    return _LEAD_PREP_RE.sub("", out)
 
 
 # ---------------------------------------------------------------------------
