@@ -196,20 +196,27 @@ export class Horizon {
   }
 
   _onClick(e) {
-    if (e.target.closest(".h-toggle")) { this._toggle(); return; }
-    // collapsed: any click on the strip opens the week back up
-    if (this.collapsed && e.target.closest(".h-strip")) { this._toggle(); return; }
+    // collapsed: it's just the one quiet line — a tap anywhere opens the week
+    if (this.collapsed) { this._toggle(); return; }
 
+    // a day holding several stops fans them out as a popover
     const day = e.target.closest(".h-day");
-    if (!day) return;
-    const bucket = this._buckets?.[Number(day.dataset.day)] || [];
-    if (bucket.length > 1) {           // several stops here — fan them out
+    const bucket = day ? this._buckets?.[Number(day.dataset.day)] || [] : [];
+    if (bucket.length > 1) {
       e.stopPropagation();
       this._openPop(day, bucket);
       return;
     }
+    // a single event opens its note
     const tile = e.target.closest(".h-tile");
-    if (tile?.dataset.id) location.hash = `#/note/${tile.dataset.id}`;
+    if (tile?.dataset.id) { location.hash = `#/note/${tile.dataset.id}`; return; }
+
+    // a tap while a day-stack is open just dismisses it
+    if (this.pop) { this._closePop(); return; }
+
+    // any other tap on the band — an empty day, the track, the chevron —
+    // contracts it. The whole bar is the toggle; the chevron is only a cue.
+    this._toggle();
   }
 
   // the day's tiles as a little stack pinned under its station — a fixed

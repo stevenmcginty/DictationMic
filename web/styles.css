@@ -297,15 +297,19 @@ body.horizon-collapsed .h-strip { display: flex; }
 }
 .h-strip-more { color: var(--faint); flex: none; }
 
-/* the expand / contract chevron, pinned top-right of the band in both states */
+/* a quiet state cue at the band's right edge. The whole bar is the tap target
+   now, so this is decoration only (pointer-events: none) — it rides its own
+   fade so a tile scrolled under it dissolves out instead of colliding. */
 .h-toggle {
   position: absolute; top: 0; right: 0;
-  height: var(--horizon-h); width: 42px;
-  display: flex; align-items: center; justify-content: center;
+  height: var(--horizon-h); width: 58px;
+  display: flex; align-items: center; justify-content: flex-end;
+  padding-right: 15px;
   color: var(--faint);
-  transition: color .15s, transform .26s var(--ease), height .26s var(--ease);
+  background: linear-gradient(90deg, transparent, var(--horizon-bg) 55%);
+  pointer-events: none;
+  transition: height .26s var(--ease);
 }
-.h-toggle:hover { color: var(--horizon-accent); }
 .h-toggle svg { transition: transform .26s var(--ease); }
 body.horizon-collapsed .h-toggle svg { transform: rotate(180deg); }
 
