@@ -5,9 +5,10 @@
     "{folder} captures spoken words and finds a matching real folder",
     "inside 'dir' (saying 'folder one' finds 'folder1').",
     "Fields: say = trigger phrases | terminal = command to run in a",
-    "new terminal window ('' = just open one) | open = file/app/web",
-    "address to open instead | dir = starting folder (~ = home) |",
-    "toast = the message the pill shows.",
+    "new terminal window ('' = just open one) | tab = true opens a",
+    "new TAB in your existing terminal window instead | open =",
+    "file/app/web address to open instead | dir = starting folder",
+    "(~ = home) | toast = the message the pill shows.",
     "Edit and save this file freely - it reloads automatically."
   ],
   "commands": [
@@ -34,6 +35,28 @@
       "terminal": "claude",
       "dir": "~/Desktop/{folder}",
       "toast": "Starting Claude Code in {folder}"
+    },
+    {
+      "say": [
+        "open a new tab",
+        "open new tab",
+        "open a new tab with claude",
+        "open claude in a new tab"
+      ],
+      "terminal": "claude",
+      "tab": true,
+      "dir": "~/Desktop",
+      "toast": "New tab \u2014 starting Claude Code"
+    },
+    {
+      "say": [
+        "open up {folder} in a new tab",
+        "open {folder} in a new tab"
+      ],
+      "terminal": "claude",
+      "tab": true,
+      "dir": "~/Desktop/{folder}",
+      "toast": "New tab \u2014 Claude Code in {folder}"
     },
     {
       "say": [

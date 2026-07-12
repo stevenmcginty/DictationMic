@@ -20,6 +20,8 @@ commands.json fields per command:
     say      list of phrases that trigger it (may contain {folder})
     terminal command line run in a NEW terminal window ("" = just
              open the terminal)
+    tab      true = open a new TAB in the terminal window you already
+             have (most recent one) instead of a new window
     open     a file, app or web address to open instead of a terminal
     dir      working directory (~ = home; may contain {folder})
     toast    the little message the pill shows ({folder} filled in)
@@ -57,9 +59,10 @@ DEFAULT_COMMANDS = {
         "{folder} captures spoken words and finds a matching real folder",
         "inside 'dir' (saying 'folder one' finds 'folder1').",
         "Fields: say = trigger phrases | terminal = command to run in a",
-        "new terminal window ('' = just open one) | open = file/app/web",
-        "address to open instead | dir = starting folder (~ = home) |",
-        "toast = the message the pill shows.",
+        "new terminal window ('' = just open one) | tab = true opens a",
+        "new TAB in your existing terminal window instead | open =",
+        "file/app/web address to open instead | dir = starting folder",
+        "(~ = home) | toast = the message the pill shows.",
         "Edit and save this file freely - it reloads automatically.",
     ],
     "commands": [
@@ -82,6 +85,23 @@ DEFAULT_COMMANDS = {
             "terminal": "claude",
             "dir": "~/Desktop/{folder}",
             "toast": "Starting Claude Code in {folder}",
+        },
+        {
+            "say": ["open a new tab", "open new tab",
+                    "open a new tab with claude",
+                    "open claude in a new tab"],
+            "terminal": "claude",
+            "tab": True,
+            "dir": "~/Desktop",
+            "toast": "New tab — starting Claude Code",
+        },
+        {
+            "say": ["open up {folder} in a new tab",
+                    "open {folder} in a new tab"],
+            "terminal": "claude",
+            "tab": True,
+            "dir": "~/Desktop/{folder}",
+            "toast": "New tab — Claude Code in {folder}",
         },
         {
             "say": ["open the terminal", "open a terminal",
@@ -156,16 +176,19 @@ def compile_pattern(pat):
     return re.compile(rx + r"\Z")
 
 
-def launch_terminal(workdir, command):
-    """New terminal window at workdir, optionally running a command and
-    staying open. Prefers Windows Terminal, falls back to a console."""
+def launch_terminal(workdir, command, tab=False):
+    """New terminal window at workdir — or, with tab=True, a new TAB in
+    the most recently used Windows Terminal window (a window is created
+    if none is open). Optionally runs a command and stays open."""
     wt = shutil.which("wt")
     if wt:
-        args = [wt, "-w", "new", "-d", workdir]
+        where = ["-w", "last", "new-tab"] if tab else ["-w", "new"]
+        args = [wt] + where + ["-d", workdir]
         if command:
             args += ["cmd", "/k", command]
         subprocess.Popen(args)
     else:
+        # plain consoles have no tabs — a fresh window is the best we can do
         args = ["cmd", "/k", command] if command else ["cmd"]
         subprocess.Popen(args, cwd=workdir,
                          creationflags=subprocess.CREATE_NEW_CONSOLE)
@@ -239,7 +262,8 @@ class VoiceCommands:
             if cmd.get("open"):
                 os.startfile(cmd["open"].replace("{folder}", folder or ""))
             elif "terminal" in cmd:
-                launch_terminal(workdir, cmd.get("terminal", ""))
+                launch_terminal(workdir, cmd.get("terminal", ""),
+                                tab=bool(cmd.get("tab")))
             else:
                 return None     # a command with nothing to do — ignore it
         except Exception as ex:
