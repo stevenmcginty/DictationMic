@@ -167,10 +167,12 @@ mid-dictation and the pill stops typing and listens for a command
 instead: *"open Chrome and go to fifa.com"*, *"open four tabs with
 claude in each"*, *"open Notepad"*, *"open the wankers folder"* —
 phrased however you like. Powered by the Gemini API's **free tier**
-(hundreds of commands a day, £0): put a key from
-[aistudio.google.com/apikey](https://aistudio.google.com/apikey) in a
-one-line `gemini.key` file next to `app.py` (gitignored, never leaves
-your machine except to Google). Only what you say **after** "Hey Mike"
+(hundreds of commands a day, £0): grab a key from
+[aistudio.google.com/apikey](https://aistudio.google.com/apikey), then
+pill menu → **My Gemini API key…** and paste it in. It's checked with
+Google, then saved to a gitignored `gemini.key` file next to `app.py` —
+it never leaves your machine except to Google, so everyone runs on
+their own key. Only what you say **after** "Hey Mike"
 is ever sent — ordinary dictation stays fully offline. Nothing said in
 command mode is ever typed; say *"back to typing"* (or just stop) to
 return to dictation. No key? Exact hot words keep working.

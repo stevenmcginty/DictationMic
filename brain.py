@@ -11,8 +11,10 @@ list of launcher actions:
     none           the words weren't a command after all
 
 Uses the Gemini API free tier (generous daily allowance, £0). The key
-comes from settings["gemini_api_key"] or a one-line gemini.key file
-next to app.py — gitignored, never written by the pill. No key or no
+lives in a one-line gemini.key file next to app.py — gitignored, never
+leaves the machine except to Google. The pill menu's "My Gemini API
+key…" dialog writes it (save_key), so everyone pastes their own; a
+settings["gemini_api_key"] is honoured as a fallback. No key or no
 internet: interpret() returns an "error" the pill can toast; the strict
 hot words in commands.json keep working regardless.
 """
@@ -97,19 +99,60 @@ class Brain:
         self.dbg = dbg
         self._model = None          # first model that answered
 
+    def _key_path(self):
+        return os.path.join(self.app_dir, "gemini.key")
+
     def key(self):
-        k = (self.settings.get("gemini_api_key") or "").strip()
-        if k:
-            return k
+        # the file wins — it's the one the pill's dialog manages
         try:
-            with open(os.path.join(self.app_dir, "gemini.key"),
-                      "r", encoding="utf-8") as f:
-                return f.read().strip()
+            with open(self._key_path(), "r", encoding="utf-8") as f:
+                k = f.read().strip()
+            if k:
+                return k
         except OSError:
-            return ""
+            pass
+        return (self.settings.get("gemini_api_key") or "").strip()
 
     def has_key(self):
         return bool(self.key())
+
+    def save_key(self, key):
+        """Write (or, given an empty key, remove) the gemini.key file."""
+        key = (key or "").strip()
+        try:
+            if key:
+                with open(self._key_path(), "w", encoding="utf-8") as f:
+                    f.write(key + "\n")
+            elif os.path.exists(self._key_path()):
+                os.remove(self._key_path())
+            return True
+        except OSError as ex:
+            self.dbg(f"brain key save failed: {ex!r}")
+            return False
+
+    def test_key(self, key):
+        """One tiny request to prove a pasted key works. -> (ok, message)"""
+        payload = {"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                   "generationConfig": {"maxOutputTokens": 10}}
+        last = ""
+        for model in MODELS:
+            try:
+                r = requests.post(URL.format(model=model),
+                                  params={"key": key}, json=payload,
+                                  timeout=8)
+            except requests.RequestException as ex:
+                self.dbg(f"brain key test offline: {ex!r}")
+                return False, "Can't reach Google — is the internet up?"
+            if r.status_code in (200, 429):   # 429 = real key, over quota
+                return True, ""
+            if r.status_code in (400, 401, 403):
+                self.dbg(f"brain key test {model} HTTP {r.status_code}: "
+                         f"{r.text[:200]}")
+                return False, ("Google rejected that key — copy it fresh "
+                               "from aistudio.google.com/apikey")
+            last = f"{model}: HTTP {r.status_code}"
+        self.dbg(f"brain key test exhausted models: {last}")
+        return False, "Couldn't check the key just now — try again"
 
     def _desktop_folders(self):
         desk = os.path.expanduser("~/Desktop").replace("/", os.sep)
@@ -124,7 +167,7 @@ class Brain:
         key = self.key()
         if not key:
             return {"error": "The Hey Mike brain needs a Gemini key — "
-                             "see gemini.key in the DictationMic folder"}
+                             "pill menu → My Gemini API key"}
         payload = {
             "systemInstruction": {"parts": [{"text": INSTRUCTIONS.replace(
                 "{folders}", ", ".join(self._desktop_folders()) or "(none)")}]},

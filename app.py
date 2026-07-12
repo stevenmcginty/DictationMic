@@ -136,7 +136,7 @@ DEFAULT_SETTINGS = {
     "gcal_email": "",
     # "Hey Mike" natural-language commands (brain.py, Gemini free tier)
     "wake_words": ["hey mike", "hey mic", "hey mick"],
-    "gemini_api_key": "",      # or a one-line gemini.key file next to app.py
+    "gemini_api_key": "",      # fallback — the menu dialog writes gemini.key
     "brain_model": "",         # override; empty = brain.py's default list
 }
 
@@ -2130,9 +2130,13 @@ class DictationApp:
             {"kind": "status",
              "text": "Say “Hey Mike”, then tell me what to open"
                      if self.brain.has_key()
-                     else "Hey Mike needs a Gemini key (free) — see README",
+                     else "Hey Mike needs a Gemini key — add yours below",
              "bullet": MENU_GREEN if self.brain.has_key() else MENU_RED,
-             "hint": "needs internet" if self.brain.has_key() else ""},
+             "hint": "needs internet" if self.brain.has_key() else "free"},
+            {"kind": "item", "text": "My Gemini API key…",
+             "hint": "saved on this PC" if self.brain.has_key()
+                     else "free from aistudio.google.com",
+             "command": self.gemini_dialog},
             {"kind": "item", "text": "Edit my voice commands…",
              "hint": "“open claude in a terminal”",
              "command": self.open_commands},
@@ -3331,6 +3335,95 @@ class DictationApp:
                         cursor="hand2")
         btn.pack(pady=8, ipadx=26, ipady=3)
         win.bind("<Return>", lambda e: connect())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.lift()
+        win.focus_force()
+
+    def gemini_dialog(self):
+        """Paste-your-own Gemini key for “Hey Mike” — checked against
+        Google, then saved to the gitignored gemini.key file next to
+        app.py. Each person brings their own free key."""
+        win = tk.Toplevel(self.root, bg="#131512")
+        win.title("DictationMic — Hey Mike")
+        win.resizable(False, False)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"420x290+{(sw - 420) // 2}+{max(0, (sh - 290) // 3)}")
+        try:
+            win.iconbitmap(os.path.join(APP_DIR, "icon.ico"))
+        except Exception:
+            pass
+        make_titlebar_dark(win)
+
+        FG, SUB, LIME, FIELD = "#eceee7", "#8a919c", "#b6ee3f", "#1a1d18"
+        tk.Label(win, text="Your Gemini API key",
+                 bg="#131512", fg=FG, font=("Segoe UI Semibold", 12)
+                 ).pack(pady=(16, 2))
+        tk.Label(win, text="Powers “Hey Mike” natural-language commands.\n"
+                           "Free tier — hundreds of commands a day, £0.",
+                 bg="#131512", fg=SUB, font=("Segoe UI", 9)).pack()
+
+        key_var = tk.StringVar(value=self.brain.key())
+        tk.Label(win, text="API key", bg="#131512", fg=SUB,
+                 font=("Segoe UI", 8), anchor="w").pack(fill="x", padx=36,
+                                                        pady=(10, 0))
+        tk.Entry(win, textvariable=key_var, show="•",
+                 bg=FIELD, fg=FG, insertbackground=LIME,
+                 relief="flat", font=("Segoe UI", 10)
+                 ).pack(fill="x", padx=36, ipady=5, pady=(0, 2))
+        tk.Label(win, text="Saved only on this PC · empty + Save removes it",
+                 bg="#131512", fg=SUB, font=("Segoe UI", 8)).pack()
+
+        status = tk.Label(win, text="", bg="#131512", fg=SUB,
+                          font=("Segoe UI", 9), wraplength=360)
+        status.pack()
+
+        def guide(_e=None):
+            import webbrowser
+            webbrowser.open("https://aistudio.google.com/apikey")
+
+        link = tk.Label(win, text="Get a free key: aistudio.google.com/apikey",
+                        bg="#131512", fg=LIME, cursor="hand2",
+                        font=("Segoe UI", 9, "underline"))
+        link.pack(pady=(2, 0))
+        link.bind("<ButtonRelease-1>", guide)
+
+        def save():
+            k = key_var.get().strip()
+            if not k:
+                self.brain.save_key("")
+                win.destroy()
+                self.show_toast("Gemini key removed — “Hey Mike” is off\n"
+                                "(exact hot words still work)", 3500)
+                return
+            btn.configure(state="disabled", text="Checking with Google…")
+            status.configure(text="", fg=SUB)
+
+            def work():
+                ok, msg = self.brain.test_key(k)
+                def done():
+                    try:
+                        if ok and self.brain.save_key(k):
+                            win.destroy()
+                            self.show_toast(
+                                "Gemini key saved — say “Hey Mike”, "
+                                "then tell me what to open", 4500)
+                        else:
+                            btn.configure(state="normal", text="Save")
+                            status.configure(
+                                text=msg or "Couldn't save the key — is the "
+                                            "DictationMic folder writable?",
+                                fg="#ff5c48")
+                    except tk.TclError:
+                        pass              # dialog closed meanwhile
+                self.root.after(0, done)
+            threading.Thread(target=work, daemon=True).start()
+
+        btn = tk.Button(win, text="Save", command=save,
+                        bg=LIME, fg="#0b0c0a", activebackground="#c9f56a",
+                        relief="flat", font=("Segoe UI Semibold", 10),
+                        cursor="hand2")
+        btn.pack(pady=8, ipadx=26, ipady=3)
+        win.bind("<Return>", lambda e: save())
         win.bind("<Escape>", lambda e: win.destroy())
         win.lift()
         win.focus_force()
