@@ -1,5 +1,6 @@
 # secrets & personal data — never commit these
 settings.json
+gemini.key
 notes/
 shots/
 debug.log

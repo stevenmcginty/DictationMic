@@ -41,6 +41,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import shots
 import voicecmd
+import brain
 
 # OS drag-and-drop onto the pill (tkdnd). Optional: if the package or its
 # native DLL is unavailable (Smart App Control has blocked stranger things),
@@ -133,6 +134,10 @@ DEFAULT_SETTINGS = {
     "gcal_client_secret": "",
     "gcal_refresh_token": "",  # empty = not connected
     "gcal_email": "",
+    # "Hey Mike" natural-language commands (brain.py, Gemini free tier)
+    "wake_words": ["hey mike", "hey mic", "hey mick"],
+    "gemini_api_key": "",      # or a one-line gemini.key file next to app.py
+    "brain_model": "",         # override; empty = brain.py's default list
 }
 
 def load_settings():
@@ -1847,6 +1852,10 @@ class DictationApp:
         # voice commands ("open claude in a terminal" runs it, not types it)
         self.voicecmds = voicecmd.VoiceCommands(
             os.path.join(APP_DIR, "commands.json"), dbg=dbg)
+        # "Hey Mike" = stop dictating, start commanding (nothing said in
+        # command mode is ever typed; only command phrases go to Gemini)
+        self.brain = brain.Brain(self.settings, APP_DIR, dbg=dbg)
+        self.command_mode = False
 
         # screenshot shelf: real PNGs in shots\, watched off the clipboard
         self.shots = shots.ShotShelf(os.path.join(APP_DIR, "shots"),
@@ -2118,6 +2127,12 @@ class DictationApp:
              "command": lambda: self.set_mode("clipboard")},
             {"kind": "sep"},
             {"kind": "header", "text": "Voice commands"},
+            {"kind": "status",
+             "text": "Say “Hey Mike”, then tell me what to open"
+                     if self.brain.has_key()
+                     else "Hey Mike needs a Gemini key (free) — see README",
+             "bullet": MENU_GREEN if self.brain.has_key() else MENU_RED,
+             "hint": "needs internet" if self.brain.has_key() else ""},
             {"kind": "item", "text": "Edit my voice commands…",
              "hint": "“open claude in a terminal”",
              "command": self.open_commands},
@@ -2293,8 +2308,36 @@ class DictationApp:
             except Exception:
                 msg = None
             if msg is not None:
+                self.command_mode = False
                 self.events.put(("toast", msg))
                 self.events.put(("stop_if_listening", None))
+                continue
+            if self.command_mode:
+                # everything said in command mode is a command, never typed
+                self._handle_command(text)
+                continue
+            try:
+                wake = voicecmd.split_wake(
+                    text, self.settings.get("wake_words") or [])
+            except Exception:
+                wake = None
+            if wake is not None:
+                before, after = wake
+                self.command_mode = True
+                self.events.put(("wake", None))
+                if before.strip():
+                    # words spoken BEFORE "Hey Mike" are ordinary dictation
+                    try:
+                        if self.settings["mode"] == "type":
+                            wait_modifiers_up()
+                            keyboard.write(before.strip() + " ", delay=0.002)
+                        else:
+                            self.session_text.append(before.strip())
+                            pyperclip.copy(" ".join(self.session_text))
+                    except Exception:
+                        pass
+                if after.strip():
+                    self._handle_command(after)
                 continue
             self.context += " " + text
             self.session_text.append(text)
@@ -2308,6 +2351,47 @@ class DictationApp:
                     pyperclip.copy(" ".join(self.session_text))
             except Exception:
                 pass
+
+    EXIT_COMMAND_MODE = {"back to typing", "back to dictation",
+                         "back to dictating", "keep dictating",
+                         "start dictating", "cancel", "never mind",
+                         "nevermind", "stop", "forget it"}
+
+    def _handle_command(self, text):
+        """Worker thread. One command-mode utterance: local escapes first,
+        then exact hot words, then the Gemini brain."""
+        said = voicecmd.normalize(text)
+        if said in self.EXIT_COMMAND_MODE:
+            self.command_mode = False
+            self.events.put(("toast", "Back to dictation — carry on"))
+            return
+        try:
+            msg = self.voicecmds.try_run(text)
+        except Exception:
+            msg = None
+        if msg is not None:
+            self.command_mode = False
+            self.events.put(("toast", msg))
+            self.events.put(("stop_if_listening", None))
+            return
+        res = self.brain.interpret(text)
+        if res.get("error"):
+            self.events.put(("toast", res["error"]))   # stay in command mode
+            return
+        try:
+            fired, toast = voicecmd.execute_actions(
+                res.get("actions"), res.get("say"), dbg=dbg)
+        except Exception as ex:
+            dbg(f"execute_actions blew up: {ex!r}")
+            fired, toast = False, "That went wrong — try again"
+        if fired:
+            self.command_mode = False
+            self.events.put(("toast", toast))
+            self.events.put(("stop_if_listening", None))
+        else:
+            # not a command (or nothing worked) — stay in command mode
+            self.events.put(("toast", toast or (res.get("say")
+                             or "Didn't catch a command — try again")))
 
     # ---------------- events ----------------
 
@@ -2357,6 +2441,9 @@ class DictationApp:
                 self.state = IDLE
             self.beep(300, 120)
             self.show_toast(f"Mic error: {payload}", 3000)
+        elif name == "wake":
+            self.beep(920, 90)
+            self.show_toast("🎯 Hey Mike — what shall I open?", 4000)
         elif name == "flash":
             self.flash_until = time.time() + 1.1
         elif name == "shot":
@@ -2396,6 +2483,7 @@ class DictationApp:
                 self.show_toast("Your talk key is now " + self.hotkey_label()
                                 + " — tap it and speak", 3500)
         elif name == "session_done":
+            self.command_mode = False
             if self.state == FINISHING:
                 self.state = IDLE
                 if self.settings["mode"] == "clipboard" and self.session_text:
@@ -2438,6 +2526,7 @@ class DictationApp:
                 return
             self.session_text = []
             self.context = ""
+            self.command_mode = False
             self.session_start = time.time()
             # Feedback FIRST: opening the input stream can take a second on
             # some audio drivers, and doing it inline froze the pill with no

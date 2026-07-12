@@ -150,6 +150,31 @@ Benchmark your own machine any time:
 venv\Scripts\python.exe bench_stt.py clip.wav [clip.txt with the true words]
 ```
 
+## Voice commands & "Hey Mike"
+
+Two layers, both hands-free:
+
+**Exact hot words** (offline, instant). If a whole spoken phrase matches
+one in `commands.json` — say *"open claude in a terminal"* — the pill
+runs the task instead of typing the words. Right-click the pill →
+*Edit my voice commands…* to add your own; the file reloads on save.
+`{folder}` in a phrase matches a real Desktop folder by sound
+("folder one" finds `folder1`), and `"tab": true` opens a tab in the
+terminal window you already have.
+
+**"Hey Mike"** (natural language, needs internet). Say **"Hey Mike"**
+mid-dictation and the pill stops typing and listens for a command
+instead: *"open Chrome and go to fifa.com"*, *"open four tabs with
+claude in each"*, *"open Notepad"*, *"open the wankers folder"* —
+phrased however you like. Powered by the Gemini API's **free tier**
+(hundreds of commands a day, £0): put a key from
+[aistudio.google.com/apikey](https://aistudio.google.com/apikey) in a
+one-line `gemini.key` file next to `app.py` (gitignored, never leaves
+your machine except to Google). Only what you say **after** "Hey Mike"
+is ever sent — ordinary dictation stays fully offline. Nothing said in
+command mode is ever typed; say *"back to typing"* (or just stop) to
+return to dictation. No key? Exact hot words keep working.
+
 ## Claude / MCP
 
 `mcp_server.py` serves your notes over the

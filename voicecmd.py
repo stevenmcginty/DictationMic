@@ -31,11 +31,14 @@ restart needed.
 """
 
 import difflib
+import glob
 import json
 import os
 import re
 import shutil
 import subprocess
+import time
+import webbrowser
 
 # Mis-hearings folded before MATCHING only — typed text is untouched.
 WORD_ALIASES = {
@@ -192,6 +195,168 @@ def launch_terminal(workdir, command, tab=False):
         args = ["cmd", "/k", command] if command else ["cmd"]
         subprocess.Popen(args, cwd=workdir,
                          creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+
+# ---------------------------------------------------------------------------
+# "Hey Mike" — wake word + the executor for the brain's actions
+# ---------------------------------------------------------------------------
+
+def wake_regex(wake_words):
+    """One regex matching any wake phrase, tolerant of 'Hey, Mike!'."""
+    alts = []
+    for phrase in wake_words:
+        words = normalize(phrase).split()
+        if words:
+            alts.append(r"[\W_]+".join(re.escape(w) for w in words))
+    if not alts:
+        return None
+    return re.compile(r"(?:^|[\W_])(?:%s)(?:[\W_]+|$)" % "|".join(alts),
+                      re.IGNORECASE)
+
+
+def split_wake(text, wake_words):
+    """None if no wake word; else (before, after) around the FIRST one —
+    'that's done. Hey Mike, open chrome' -> ("that's done. ", "open chrome")."""
+    rx = wake_regex(wake_words)
+    if rx is None:
+        return None
+    m = rx.search(text)
+    if m is None:
+        return None
+    return text[:m.start()], text[m.end():]
+
+
+# apps whose real exe name isn't what you'd say
+APP_ALIASES = {
+    "chrome": "chrome", "google chrome": "chrome",
+    "edge": "msedge", "microsoft edge": "msedge",
+    "notepad": "notepad", "notebook": "notepad",
+    "calculator": "calc", "paint": "mspaint",
+    "word": "winword", "microsoft word": "winword",
+    "excel": "excel", "powerpoint": "powerpnt",
+    "explorer": "explorer", "file explorer": "explorer",
+    "task manager": "taskmgr", "control panel": "control",
+    "settings": "ms-settings:", "windows settings": "ms-settings:",
+    "terminal": "wt", "windows terminal": "wt",
+}
+
+_app_index = None    # fold_name(shortcut stem) -> .lnk path, built once
+
+
+def _start_menu_index():
+    global _app_index
+    if _app_index is not None:
+        return _app_index
+    roots = [
+        os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                     r"Microsoft\Windows\Start Menu\Programs"),
+        os.path.join(os.environ.get("APPDATA", ""),
+                     r"Microsoft\Windows\Start Menu\Programs"),
+    ]
+    index = {}
+    for root in roots:
+        for ext in ("*.lnk", "*.url"):
+            for p in glob.glob(os.path.join(root, "**", ext), recursive=True):
+                stem = os.path.splitext(os.path.basename(p))[0]
+                index.setdefault(fold_name(stem), p)
+    _app_index = index
+    return index
+
+
+def resolve_app(name):
+    """Spoken app name -> something os.startfile can open, or None."""
+    said = normalize(name)
+    tries = []
+    alias = APP_ALIASES.get(said)
+    if alias:
+        if alias.endswith(":"):          # a settings-style URI
+            return alias
+        tries.append(alias)
+    tries.append(said)
+    for t in tries:
+        found = shutil.which(t)
+        if found:
+            return found
+    index = _start_menu_index()
+    want = fold_name(said)
+    if not want:
+        return None
+    if want in index:
+        return index[want]
+    starts = [p for f, p in index.items()
+              if f.startswith(want) or want.startswith(f)]
+    if not starts and len(want) >= 4:
+        # "chrome" lives inside "Google Chrome" — substring as a fallback
+        starts = [p for f, p in index.items() if want in f]
+    if starts:
+        return sorted(starts, key=lambda p: len(os.path.basename(p)))[0]
+    close = difflib.get_close_matches(want, list(index), n=1, cutoff=0.8)
+    return index[close[0]] if close else None
+
+
+def execute_actions(actions, say, dbg=lambda m: None):
+    """Run the brain's actions. Returns (fired, toast) — fired False means
+    nothing happened (stay in command mode and let Steve try again)."""
+    desktop = os.path.expanduser("~/Desktop").replace("/", os.sep)
+    done, failed = 0, []
+    for a in (actions or [])[:6]:
+        kind = a.get("kind")
+        try:
+            if kind == "open_app":
+                target = resolve_app(a.get("target") or "")
+                if target is None:
+                    failed.append(f"couldn't find “{a.get('target')}”")
+                else:
+                    os.startfile(target)
+                    done += 1
+            elif kind == "open_url":
+                url = (a.get("target") or "").strip()
+                if url:
+                    if "://" not in url:
+                        url = "https://" + url
+                    webbrowser.open(url)
+                    done += 1
+            elif kind == "open_terminal":
+                tabs = max(1, min(int(a.get("tabs") or 1), 8))
+                raw = (a.get("dir") or "").strip()
+                if raw and os.path.isabs(raw) and os.path.isdir(raw):
+                    workdir = raw
+                elif raw:
+                    folder = resolve_folder(desktop, raw)
+                    if folder is None:
+                        failed.append(f"no folder like “{raw}”")
+                        continue
+                    workdir = os.path.join(desktop, folder)
+                else:
+                    workdir = desktop
+                for i in range(tabs):
+                    launch_terminal(workdir, a.get("run") or "", tab=True)
+                    if i < tabs - 1:
+                        time.sleep(0.35)   # let wt process tabs in order
+                done += 1
+            elif kind == "open_folder":
+                raw = (a.get("target") or "").strip()
+                if os.path.isdir(raw):
+                    os.startfile(raw)
+                    done += 1
+                else:
+                    folder = resolve_folder(desktop, raw)
+                    if folder is None:
+                        failed.append(f"no folder like “{raw}”")
+                    else:
+                        os.startfile(os.path.join(desktop, folder))
+                        done += 1
+        except Exception as ex:
+            dbg(f"action {kind} failed: {ex!r}")
+            failed.append(f"{kind} failed")
+    if done:
+        toast = "⚡ " + (say or "Done")
+        if failed:
+            toast += " — but " + "; ".join(failed)
+        return True, toast
+    if failed:
+        return False, "🤔 " + "; ".join(failed) + " — try again"
+    return False, None
 
 
 class VoiceCommands:
