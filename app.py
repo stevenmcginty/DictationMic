@@ -40,6 +40,7 @@ import winsound
 from PIL import Image, ImageDraw, ImageFont
 
 import shots
+import voicecmd
 
 # OS drag-and-drop onto the pill (tkdnd). Optional: if the package or its
 # native DLL is unavailable (Smart App Control has blocked stranger things),
@@ -1843,6 +1844,10 @@ class DictationApp:
         self.label.bind("<Leave>", self.on_leave)
         self._install_drop_targets()
 
+        # voice commands ("open claude in a terminal" runs it, not types it)
+        self.voicecmds = voicecmd.VoiceCommands(
+            os.path.join(APP_DIR, "commands.json"), dbg=dbg)
+
         # screenshot shelf: real PNGs in shots\, watched off the clipboard
         self.shots = shots.ShotShelf(os.path.join(APP_DIR, "shots"),
                                      keep=self.settings.get("shots_keep"))
@@ -2112,6 +2117,11 @@ class DictationApp:
              "radio": s["mode"] == "clipboard",
              "command": lambda: self.set_mode("clipboard")},
             {"kind": "sep"},
+            {"kind": "header", "text": "Voice commands"},
+            {"kind": "item", "text": "Edit my voice commands…",
+             "hint": "“open claude in a terminal”",
+             "command": self.open_commands},
+            {"kind": "sep"},
             {"kind": "header", "text": "Notes"},
             {"kind": "item", "text": "My notes",
              "hint": "in your web browser",
@@ -2275,6 +2285,16 @@ class DictationApp:
             except Exception:
                 text = ""
             if not text:
+                continue
+            try:
+                # hot words: a whole utterance that IS a voice command runs
+                # the task instead of being typed (and stays out of notes)
+                msg = self.voicecmds.try_run(text)
+            except Exception:
+                msg = None
+            if msg is not None:
+                self.events.put(("toast", msg))
+                self.events.put(("stop_if_listening", None))
                 continue
             self.context += " " + text
             self.session_text.append(text)
@@ -3231,6 +3251,17 @@ class DictationApp:
         if cloud is None:
             return {"sync": "off", "lastSync": 0}
         return cloud.status()
+
+    def open_commands(self):
+        """commands.json in Notepad — say a 'say' phrase while dictating
+        and the pill runs the task instead of typing the words."""
+        try:
+            subprocess.Popen(["notepad", self.voicecmds.path])
+        except Exception:
+            os.startfile(self.voicecmds.path)
+        self.show_toast("Say one of the “say” phrases while dictating and\n"
+                        "I'll run the task instead of typing it.\n"
+                        "Save the file — it reloads by itself.", 5000)
 
     def open_files_folder(self):
         """Explorer on notes\\files — the real PDFs, docs and photos behind

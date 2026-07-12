@@ -1,0 +1,49 @@
+{
+  "_help": [
+    "Voice commands: say a whole phrase from a 'say' list while",
+    "dictating and DictationMic runs the task instead of typing it.",
+    "{folder} captures spoken words and finds a matching real folder",
+    "inside 'dir' (saying 'folder one' finds 'folder1').",
+    "Fields: say = trigger phrases | terminal = command to run in a",
+    "new terminal window ('' = just open one) | open = file/app/web",
+    "address to open instead | dir = starting folder (~ = home) |",
+    "toast = the message the pill shows.",
+    "Edit and save this file freely - it reloads automatically."
+  ],
+  "commands": [
+    {
+      "say": [
+        "open claude in a terminal",
+        "open claude in the terminal",
+        "open a terminal and open claude",
+        "open a new terminal and open claude",
+        "open terminal and open claude",
+        "open claude code"
+      ],
+      "terminal": "claude",
+      "dir": "~/Desktop",
+      "toast": "Starting Claude Code on the Desktop"
+    },
+    {
+      "say": [
+        "open up {folder} in claude code",
+        "open {folder} in claude code",
+        "open up {folder} in claude",
+        "open {folder} in claude"
+      ],
+      "terminal": "claude",
+      "dir": "~/Desktop/{folder}",
+      "toast": "Starting Claude Code in {folder}"
+    },
+    {
+      "say": [
+        "open the terminal",
+        "open a terminal",
+        "open a new terminal"
+      ],
+      "terminal": "",
+      "dir": "~/Desktop",
+      "toast": "Opening a terminal on the Desktop"
+    }
+  ]
+}
