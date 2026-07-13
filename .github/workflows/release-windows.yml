@@ -1,0 +1,69 @@
+# Puts the Windows build on the repo's Releases page so anyone can download
+# DictationMic straight from GitHub. The zip is built on Steve's Windows
+# machine and uploaded to the live site (it's ~110 MB, so it doesn't live in
+# git); this workflow fetches that current zip and attaches it to the fixed
+# `windows-latest` release, giving a GitHub download link that never changes:
+#
+#   https://github.com/stevenmcginty/DictationMic/releases/download/windows-latest/DictationMic-Windows.zip
+#
+# Run it from Actions -> "Publish Windows release" -> Run workflow whenever a
+# new build goes up on the site; a weekly run is a safety net. If the zip
+# hasn't changed since the last publish, the run is a no-op.
+
+name: Publish Windows release
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the current zip from the live site
+        run: |
+          curl -fL --retry 4 -o DictationMic-Windows.zip \
+            https://dictationmic-sync.web.app/downloads/DictationMic-Windows.zip
+          sha256sum DictationMic-Windows.zip | tee sha256.txt
+
+      - name: Skip if the release already carries this exact build
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          new=$(cut -d' ' -f1 sha256.txt)
+          old=$(gh release view windows-latest --repo "$GITHUB_REPOSITORY" \
+                  --json body -q .body 2>/dev/null | grep -oE '[0-9a-f]{64}' | head -1 || true)
+          if [ "$new" = "$old" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Release already has this build ($new) — nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update the windows-latest release
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(cut -d' ' -f1 sha256.txt)
+          sed "s/__SHA256__/$sha/; s/__DATE__/$(date -u +%Y-%m-%d)/" \
+            .github/windows-release-notes.md > release-notes.md
+          if gh release view windows-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit windows-latest --repo "$GITHUB_REPOSITORY" \
+              --title "DictationMic for Windows" --notes-file release-notes.md --latest
+          else
+            gh release create windows-latest --repo "$GITHUB_REPOSITORY" \
+              --title "DictationMic for Windows" --notes-file release-notes.md --latest
+          fi
+          gh release upload windows-latest DictationMic-Windows.zip \
+            --repo "$GITHUB_REPOSITORY" --clobber

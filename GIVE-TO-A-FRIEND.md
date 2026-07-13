@@ -5,7 +5,7 @@ follow you between them.
 
 ## On your Windows computer
 
-1. Download **https://dictationmic-sync.web.app/downloads/DictationMic-Windows.zip**
+1. Download **https://github.com/stevenmcginty/DictationMic/releases/download/windows-latest/DictationMic-Windows.zip**
    and extract it anywhere (your Desktop is fine).
 2. Double-click **DictationMic.exe**. Windows may show a blue warning
    because the app is new — click **More info → Run anyway**.

@@ -4,6 +4,26 @@ On-device **live** dictation for Windows. A small, dark floating pill that
 turns your speech into text as you talk — **no internet needed** after the
 first run, nothing leaves your computer.
 
+## Download & install (Windows)
+
+**[⬇ Download DictationMic-Windows.zip](https://github.com/stevenmcginty/DictationMic/releases/download/windows-latest/DictationMic-Windows.zip)**
+(~110 MB, always the current build — also on the
+[releases page](https://github.com/stevenmcginty/DictationMic/releases))
+
+1. Right-click the downloaded zip → **Extract All…** and put the folder
+   anywhere you like (your Desktop is fine). There's no installer — the
+   extracted folder *is* the app.
+2. Open the folder and double-click **DictationMic.exe**. Windows
+   SmartScreen may show a blue warning because the app is unsigned — click
+   **More info → Run anyway**.
+3. First run only: the pill shows a percentage while it fetches the speech
+   model (one time). After that it's fully offline.
+
+To uninstall, delete the folder. On Android, install
+**DictationMic-Android.apk** from the
+[releases page](https://github.com/stevenmcginty/DictationMic/releases)
+instead.
+
 ## How to use
 
 1. Double-click **DictationMic.exe**.
@@ -175,11 +195,19 @@ claude mcp add --scope user dictationmic -- ^
 
 ## Sharing it
 
-Send someone `DictationMic-Windows.zip`. They just:
+Send someone this link — it's always the current build:
+
+**https://github.com/stevenmcginty/DictationMic/releases/download/windows-latest/DictationMic-Windows.zip**
+
+They just:
 1. Extract it anywhere (e.g. their Desktop).
 2. Run `DictationMic.exe` — Windows SmartScreen may warn because the app is
    unsigned: click **More info → Run anyway**.
 3. Wait for the one-time model download, then dictate away.
+
+(The zip is built on Windows and published to the repo's Releases page by
+the *Publish Windows release* workflow — run it from the Actions tab after
+uploading a new build to the site, and the GitHub link above updates.)
 
 Windows only — the Mac needs a separately built app.
 
