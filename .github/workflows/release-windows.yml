@@ -7,14 +7,20 @@
 #   https://github.com/stevenmcginty/DictationMic/releases/download/windows-latest/DictationMic-Windows.zip
 #
 # Run it from Actions -> "Publish Windows release" -> Run workflow whenever a
-# new build goes up on the site; a weekly run is a safety net. If the zip
-# hasn't changed since the last publish, the run is a no-op.
+# new build goes up on the site; a weekly run is a safety net, and touching
+# this file or the release notes on main republishes too. If the zip hasn't
+# changed since the last publish, the run is a no-op.
 
 name: Publish Windows release
 on:
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-windows.yml
+      - .github/windows-release-notes.md
 
 permissions:
   contents: write
