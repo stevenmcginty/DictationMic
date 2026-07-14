@@ -48,6 +48,7 @@ if (location.protocol === "file:") {
       <span class="eyebrow">Notes</span>
       <span class="head-tools">
         <span class="count mono" id="noteCount"></span>
+        <button class="capsule small" id="pcBtn" aria-label="Send a command to the PC" hidden>PC</button>
         <button class="capsule small" id="addImageBtn" aria-label="Add an image">+ Image</button>
         <button class="capsule small" id="addFileBtn" aria-label="Add a file">+ File</button>
         <button class="capsule small" id="newNoteBtn" aria-label="New note">+ New</button>
@@ -157,6 +158,19 @@ if (location.protocol === "file:") {
   <span class="account-label">Signed in as</span>
   <span class="account-email mono" id="accountEmail"></span>
   <button class="capsule small" id="signOutBtn">Sign out</button>
+</div>
+
+<!-- tap PC (hosted + signed in): type a command, the pill runs it, status lives here -->
+<div class="pc-pop" id="pcPop" hidden>
+  <span class="eyebrow">PC command</span>
+  <div class="pc-input-row">
+    <input id="pcInput" type="text" inputmode="text" enterkeyhint="send"
+           autocomplete="off" spellcheck="false" aria-label="Command for the PC"
+           placeholder="Tell the PC what to do…">
+    <button class="capsule solid" id="pcSendBtn">Send</button>
+  </div>
+  <span class="pc-hint mono">e.g. “open claude code” · “open chrome”</span>
+  <ul class="pc-list" id="pcList" aria-label="Recent commands"></ul>
 </div>
 
 <button class="mic-fab" id="micFab" hidden aria-label="Dictate a note">

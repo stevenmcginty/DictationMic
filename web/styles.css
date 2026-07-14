@@ -798,6 +798,68 @@ body.horizon-collapsed .h-toggle svg { transform: rotate(180deg); }
 .account-email { font-size: 12px; color: var(--ink); }
 
 /* --------------------------------------------------------------------------
+   PC command panel — tap PC to send a command to the pill; status lives here
+   -------------------------------------------------------------------------- */
+.pc-pop {
+  position: fixed;
+  top: calc(var(--topbar-h) + env(safe-area-inset-top) + 8px);
+  left: 0; right: 0; margin: 0 auto;
+  width: min(460px, calc(100% - 24px));
+  z-index: 72;
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 16px;
+  background: var(--raised);
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .45);
+  animation: pop-in .18s var(--ease);
+}
+.pc-input-row { display: flex; gap: 8px; }
+.pc-input-row input {
+  flex: 1; min-width: 0;
+  height: 40px; padding: 0 16px;
+  border-radius: 20px;
+  border: 1px solid var(--hairline);
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--sans); font-size: 14px;
+  outline: none;
+  transition: border-color .2s;
+}
+.pc-input-row input:focus { border-color: rgba(182, 238, 63, .45); }
+.pc-input-row input::placeholder { color: var(--faint); }
+.pc-input-row .capsule { flex: none; height: 40px; border-radius: 20px; }
+.pc-hint {
+  font-size: 10px; letter-spacing: .1em;
+  color: var(--faint);
+}
+.pc-list { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.pc-empty {
+  font-size: 10px; letter-spacing: .22em; text-transform: uppercase;
+  color: var(--faint); padding: 4px 2px;
+}
+.pc-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 9px 2px;
+  border-top: 1px solid var(--hairline);
+}
+.pc-row:first-child { border-top: 0; }
+.pc-row .status-dot { margin-top: 5px; flex: none; }
+.pc-row .status-dot.stale { background: var(--amber); }
+.pc-row-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.pc-cmd {
+  font-size: 14px; color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.pc-meta { display: flex; align-items: baseline; gap: 8px; }
+.pc-msg { font-size: 11px; overflow-wrap: anywhere; }
+.pc-msg.ok { color: var(--volt); }
+.pc-msg.err { color: var(--danger); }
+.pc-msg.stale { color: var(--amber); }
+.pc-msg.dim { color: var(--muted); }
+.pc-time { flex: none; margin-left: auto; font-size: 10px; color: var(--faint); }
+
+/* --------------------------------------------------------------------------
    Toast
    -------------------------------------------------------------------------- */
 
@@ -867,3 +929,11 @@ body.view-note .mic-fab, body.view-mic .mic-fab { display: none; }
   .brand-pill.live i { height: 10px; }
   .mic-meter i { height: 12px !important; }
 }
+
+/* --------------------------------------------------------------------------
+   Room for the fourth (PC) tool capsule in the list header on phones — the
+   three existing capsules keep their look; only the gap tightens, and the
+   note count steps aside on the narrowest screens so nothing overflows.
+   -------------------------------------------------------------------------- */
+@media (max-width: 899px) { .head-tools { gap: 8px; } }
+@media (max-width: 400px) { .list-head .count { display: none; } }

@@ -42,6 +42,7 @@ from PIL import Image, ImageDraw, ImageFont
 import shots
 import voicecmd
 import brain
+from remotecmd import RemoteCommands
 
 # OS drag-and-drop onto the pill (tkdnd). Optional: if the package or its
 # native DLL is unavailable (Smart App Control has blocked stranger things),
@@ -139,6 +140,7 @@ DEFAULT_SETTINGS = {
     "wake_words": ["hey mike", "hey mic", "hey mick"],
     "gemini_api_key": "",      # fallback — the menu dialog writes gemini.key
     "brain_model": "",         # override; empty = brain.py's default list
+    "remote_commands": False,  # phone web app can drive this PC (remotecmd.py)
 }
 
 def load_settings():
@@ -1889,6 +1891,13 @@ class DictationApp:
         threading.Thread(target=self._calendar_poll_loop,
                          name="calendar-poll", daemon=True).start()
         self._start_cloud_sync()
+        # phone can tap "PC" in the web app to run a command here; remotecmd
+        # streams those over the same account as sync. start() self-gates on
+        # the remote_commands flag + sync credentials, so this is safe.
+        self.remotecmds = RemoteCommands(self.settings, save_settings,
+                                         self.events, self.voicecmds,
+                                         self.brain, dbg=dbg)
+        self.remotecmds.start()
 
         self.root.update_idletasks()
         make_non_activating(self.root)
@@ -2232,6 +2241,12 @@ class DictationApp:
             items.append({"kind": "item", "text": "Set up phone sync…",
                           "hint": "your notes, on your phone",
                           "command": self.sync_dialog})
+        items.append(
+            {"kind": "item",
+             "text": "Phone commands — the web app drives this PC",
+             "hint": "tap “PC” to run it here",
+             "check": bool(s.get("remote_commands")),
+             "command": self.toggle_remote_commands})
         items += [
             {"kind": "sep"},
             {"kind": "header", "text": f"Talk key — {self.hotkey_label()}"},
@@ -3594,6 +3609,24 @@ class DictationApp:
             save_settings(self.settings)
         self.show_toast("Phone sync is off — notes stay on this computer", 3000)
 
+    def toggle_remote_commands(self):
+        """Let the phone web app run a command on this PC. Rides the sync
+        account, so it needs sync signed in first."""
+        if not self.settings.get("remote_commands"):
+            if not self.settings.get("sync_uid"):
+                self.show_toast("Turn on phone sync first — the PC button "
+                                "rides the same account", 3000)
+                return
+            self.settings["remote_commands"] = True
+            save_settings(self.settings)
+            self.remotecmds.start()
+            self.show_toast("Phone commands ON — tap PC on the web app", 3000)
+        else:
+            self.settings["remote_commands"] = False
+            save_settings(self.settings)
+            self.remotecmds.stop()
+            self.show_toast("Phone commands are off", 2400)
+
     def sync_dialog(self):
         try:
             from cloudsync import CloudSync
@@ -3679,6 +3712,7 @@ class DictationApp:
                     if ok:
                         self.cloud = cs
                         cs.start()
+                        self.remotecmds.start()   # self-gates on the flag
                         win.destroy()
                         self.show_toast(
                             "Phone sync is on — open the same link on your "

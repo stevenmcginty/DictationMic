@@ -12,6 +12,7 @@ import {
   isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody, SHEET_EXT_RE,
 } from "./filenote.js";
 import { Horizon } from "./horizon.js";
+import { pcAvailable, togglePcPanel } from "./pccmd.js";
 
 const $ = id => document.getElementById(id);
 
@@ -735,6 +736,12 @@ export class App {
 
     $("micFab").addEventListener("click", () => { location.hash = "#/mic"; });
     $("newNoteBtn").addEventListener("click", () => this.newNote());
+
+    // PC command panel — hosted PWA + signed in only (local/desktop hides it)
+    if (pcAvailable(this.adapter)) {
+      $("pcBtn").hidden = false;
+      $("pcBtn").addEventListener("click", () => togglePcPanel());
+    }
 
     // add an image: camera or gallery on the phone, file picker on desktop
     $("addImageBtn").addEventListener("click", () => $("imageInput").click());
