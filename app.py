@@ -134,6 +134,7 @@ DEFAULT_SETTINGS = {
     "gcal_client_secret": "",
     "gcal_refresh_token": "",  # empty = not connected
     "gcal_email": "",
+    "gcal_bridge": False,      # cloud bridge imports calendar events; pill defers 4 min as backup
     # "Hey Mike" natural-language commands (brain.py, Gemini free tier)
     "wake_words": ["hey mike", "hey mic", "hey mick"],
     "gemini_api_key": "",      # fallback — the menu dialog writes gemini.key
@@ -3134,6 +3135,7 @@ class DictationApp:
                     self._cal_inflight.discard(nid)
 
     GCAL_POLL_S = 180                  # pull from Google Calendar every 3 min
+    GCAL_BRIDGE_DEFER_S = 240          # let the cloud bridge's note land first
 
     def _calendar_poll_loop(self):
         time.sleep(20)                 # let sync land the first snapshot
@@ -3153,10 +3155,12 @@ class DictationApp:
                 and self.gcal.connected()):
             return
         from datetime import datetime, timedelta, timezone
+        bridge_on = bool(self.settings.get("gcal_bridge"))
         last = self.settings.get("gcal_last_poll") or (
             datetime.now(timezone.utc) - timedelta(minutes=10)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        poll_started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        poll_started_dt = datetime.now(timezone.utc)
+        poll_started = poll_started_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         items = self.gcal.list_updated(last)
         store = get_store()
         known = {}                     # eventId -> note id
@@ -3209,6 +3213,19 @@ class DictationApp:
                 continue               # our own notes-off dictation event
             if sdt.timestamp() < time.time() - 3600:
                 continue               # already past — not worth a note
+            if bridge_on:
+                # the cloud bridge (Apps Script) also imports this event, and
+                # it's faster off-laptop; give its note a head start so we
+                # land on the "known" path above instead of a duplicate
+                try:
+                    updated = datetime.fromisoformat(
+                        ev["updated"].replace("Z", "+00:00"))
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    updated = None       # unparseable/missing -> treat as old
+                if (updated is not None
+                        and (poll_started_dt - updated).total_seconds()
+                            < self.GCAL_BRIDGE_DEFER_S):
+                    continue            # too new — a later poll will catch it
             summary = (ev.get("summary") or "Event").strip()
             start_ms = int(sdt.timestamp() * 1000)
             when_line = self._fmt_event_time(start_ms, all_day)
@@ -3223,7 +3240,15 @@ class DictationApp:
                 "source": "gcal"})
             self.events.put(("toast", "From your calendar: " + summary))
             dbg(f"calendar poll: imported event {eid[:10]} as note")
-        self.settings["gcal_last_poll"] = poll_started
+        if bridge_on:
+            # rewind the cursor so anything we deferred above is re-seen
+            # next poll (idempotent: it's either "known" by then, or gets
+            # deferred/skipped again)
+            self.settings["gcal_last_poll"] = (
+                poll_started_dt - timedelta(seconds=self.GCAL_BRIDGE_DEFER_S)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            self.settings["gcal_last_poll"] = poll_started
         save_settings(self.settings)
 
     def _check_upcoming_events(self):
