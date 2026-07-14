@@ -140,6 +140,7 @@ DEFAULT_SETTINGS = {
     "wake_words": ["hey mike", "hey mic", "hey mick"],
     "gemini_api_key": "",      # fallback — the menu dialog writes gemini.key
     "brain_model": "",         # override; empty = brain.py's default list
+    "notes_badge": True,       # recent-notes disc on the pill's bottom corner
     "remote_commands": False,  # phone web app can drive this PC (remotecmd.py)
 }
 
@@ -674,6 +675,25 @@ def spaced(text):
     return " ".join(text.upper())
 
 
+def rel_time(ms):
+    """A compact 'when' for the recent-notes list: just now / 4m / 2h /
+    Mon / 3 Jul — echoes the web app's note timestamps."""
+    if not ms:
+        return ""
+    diff = time.time() * 1000 - ms
+    mins = max(0.0, diff) / 60000
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{int(mins)}m"
+    if mins < 24 * 60:
+        return f"{int(mins / 60)}h"
+    lt = time.localtime(ms / 1000)
+    if diff < 7 * 86400000:
+        return time.strftime("%a", lt)                    # Mon
+    return f"{lt.tm_mday} " + time.strftime("%b", lt)     # 3 Jul
+
+
 # Tk font families — resolved once a root exists (pick_ui_fonts); the
 # Variable/Cascadia families ship with Windows 11 and echo the web app's
 # Space Grotesk / JetBrains Mono without bundling a single font file.
@@ -962,6 +982,7 @@ MENU_LIME = "#B6EE3F"
 MENU_RED = "#FF5C48"
 MENU_GREEN = "#B6EE3F"       # "on" is an accent state — volt, not a 2nd green
 ICE_HEX = "#56C5FF"          # Tk twin of ICE (86, 197, 255)
+GOLD_HEX = "#F4C752"         # the star on a flagged note
 
 
 class PopupMenu:
@@ -1779,6 +1800,266 @@ class CalWindow:
 
 
 # ----------------------------------------------------------------------------
+# Recent-notes badge + dropdown — the pill's bottom-right corner: a disc
+# that lights up when a note lands (dictated here or typed on the phone),
+# opening a list of the newest notes you can click to copy. Metadata comes
+# off the local index (no bodies read); a click reads that one note's body.
+# ----------------------------------------------------------------------------
+
+
+class NotesBadge:
+    """The disc on the pill's bottom-right corner: a little note glyph.
+    Lime ring while there's a note you haven't looked at; settles to grey
+    once the list has been opened. Click = open / close the recent list."""
+
+    def __init__(self, app):
+        self.app = app
+        self.d = max(20, round(app.height * 0.74))
+        self.win = tk.Toplevel(app.root, bg=TRANSPARENT_HEX)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-transparentcolor", TRANSPARENT_HEX)
+        self.label = tk.Label(self.win, bg=TRANSPARENT_HEX, bd=0,
+                              cursor="hand2")
+        self.label.pack()
+        for seq in ("<ButtonRelease-1>", "<ButtonRelease-3>"):
+            self.label.bind(seq, lambda e: app.toggle_notes_window())
+        self._frames = {}
+        self._photo = None
+        self.visible = False
+        self._pulse_left = 0
+        self.win.withdraw()
+        self.win.update_idletasks()
+        make_non_activating(self.win)
+
+    def _frame(self, fresh):
+        key = fresh
+        if key in self._frames:
+            return self._frames[key]
+        s = self.d * SS
+        img = Image.new("RGBA", (s, s), C_TRANSPARENT)
+        d = ImageDraw.Draw(img)
+        ring = LIME + (235,) if fresh else INK + (64,)
+        d.ellipse([SS, SS, s - SS, s - SS], fill=MENU_BG_RGB + (255,),
+                  outline=ring, width=max(2, round(SS * 1.3)))
+        fill = LIME + (255,) if fresh else INK + (190,)
+        lw = max(2, round(SS * 1.1))
+        # three text lines, the last one short — a "note" glyph, the count
+        # discs' quiet cousin
+        for i, y in enumerate((0.40, 0.52, 0.64)):
+            xr = s * 0.56 if i == 2 else s * 0.66
+            d.line([(s * 0.34, s * y), (xr, s * y)], fill=fill, width=lw)
+        ph = tk_photo(img.resize((self.d, self.d), Image.LANCZOS))
+        self._frames[key] = ph
+        return ph
+
+    def place(self):
+        """Sit on the pill's bottom-right corner, wherever the pill goes."""
+        r = self.app.root
+        x = r.winfo_x() + self.app.width - round(self.d * 0.60)
+        y = r.winfo_y() + self.app.height - round(self.d * 0.42)
+        x = max(0, min(x, r.winfo_screenwidth() - self.d))
+        y = max(0, min(y, r.winfo_screenheight() - self.d))
+        self.win.geometry(f"{self.d}x{self.d}+{x}+{y}")
+
+    def hide(self):
+        if self.visible:
+            self.win.withdraw()
+            self.visible = False
+
+    def refresh(self):
+        if self.app._menu is not None:       # the card owns the pill's corners
+            self.hide()
+            return
+        if not (self.app.settings.get("notes_badge", True)
+                and get_store().recent(1)):
+            self.hide()
+            return
+        self._photo = self._frame(self.app.notes_fresh)
+        self.label.configure(image=self._photo)
+        self.place()
+        if not self.visible:
+            self.win.deiconify()
+            self.visible = True
+        self.win.lift()
+
+    def pulse(self, times=6):
+        """A quick blink of the lime ring when a note lands from the phone —
+        our take on the shoulder badges' 'fresh' flash, drawn by toggling the
+        ring on and off a few times, then settling on the current state."""
+        if not self.visible:
+            return
+        self._pulse_left = times
+        self._blink()
+
+    def _blink(self):
+        if not self.visible:
+            return
+        if self._pulse_left <= 0:
+            self._photo = self._frame(self.app.notes_fresh)
+            self.label.configure(image=self._photo)
+            return
+        self._photo = self._frame(self._pulse_left % 2 == 0)
+        self.label.configure(image=self._photo)
+        self._pulse_left -= 1
+        try:
+            self.win.after(150, self._blink)
+        except tk.TclError:
+            pass
+
+
+class NotesWindow:
+    """The recent-notes list, popped open from the bottom corner: the newest
+    notes off the local index, grouped nowhere — just newest first. Click one
+    and its text goes to the clipboard."""
+
+    def __init__(self, app, on_close=None):
+        self.app = app
+        self.on_close = on_close
+        self.closed = False
+        self._prev_buttons = True     # swallow the click that opened us
+        self.win = tk.Toplevel(app.root, bg=MENU_BG)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(highlightthickness=1,
+                           highlightbackground=MENU_EDGE,
+                           highlightcolor=MENU_EDGE)
+        self.body = tk.Frame(self.win, bg=MENU_BG)
+        self.body.pack(fill="both", expand=True, padx=10, pady=(10, 8))
+        self.win.bind("<Escape>", lambda e: self.close())
+        self.win.bind("<FocusOut>", lambda e: self.close())
+        self.rebuild()
+
+    def rebuild(self):
+        if self.closed:
+            return
+        for w in self.body.winfo_children():
+            w.destroy()
+        notes = get_store().recent(8)
+        head = tk.Frame(self.body, bg=MENU_BG)
+        head.pack(fill="x", pady=(0, 2))
+        tk.Label(head, text=spaced("Recent notes"), bg=MENU_BG, fg=MENU_DIM,
+                 font=(MONO_FAMILY, 7)).pack(side="left")
+        tk.Label(head, text=f"· {len(notes)}", bg=MENU_BG, fg=MENU_SUB,
+                 font=(MONO_FAMILY, 7)).pack(side="left", padx=(6, 0))
+        if not notes:
+            tk.Label(self.body, text="No notes yet — dictate one, or type "
+                     "one on your phone", bg=MENU_BG, fg=MENU_DIM,
+                     font=(UI_FAMILY, 10)).pack(padx=16, pady=12)
+        else:
+            for n in notes:
+                self._row(n)
+        foot = tk.Frame(self.body, bg=MENU_BG)
+        foot.pack(fill="x", pady=(8, 0))
+        tk.Label(foot, text="click a note to copy it", bg=MENU_BG,
+                 fg=MENU_DIM, font=(MONO_FAMILY, 7)).pack(side="left")
+        self.win.update_idletasks()
+
+    def _row(self, n):
+        row = tk.Frame(self.body, bg=MENU_BG, cursor="hand2")
+        row.pack(fill="x")
+        widgets = [row]
+        if n["starred"]:
+            sl = tk.Label(row, text="★", bg=MENU_BG, fg=GOLD_HEX,
+                          font=(UI_FAMILY, 9))
+            sl.pack(side="left", padx=(2, 0), pady=2)
+            widgets.append(sl)
+        title = n["title"] or "(untitled)"
+        if len(title) > 40:
+            title = title[:39] + "…"
+        wl = tk.Label(row, text=rel_time(n["updatedAt"]), width=8, anchor="e",
+                      bg=MENU_BG, fg=MENU_SUB, font=(MONO_FAMILY, 8))
+        wl.pack(side="right", padx=(6, 2), pady=2)
+        widgets.append(wl)
+        tl = tk.Label(row, text=title, anchor="w", bg=MENU_BG, fg=MENU_FG,
+                      font=(UI_FAMILY, 10))
+        tl.pack(side="left", fill="x", expand=True,
+                padx=(4 if n["starred"] else 2, 0), pady=2)
+        widgets.append(tl)
+
+        def hover(on):
+            bg = MENU_HOVER if on else MENU_BG
+            for w in widgets:
+                w.configure(bg=bg)
+
+        for w in widgets:
+            w.bind("<Enter>", lambda e: hover(True))
+            w.bind("<Leave>", lambda e: hover(False))
+            w.bind("<ButtonRelease-1>", lambda e, nid=n["id"]: self._copy(nid))
+
+    def _copy(self, nid):
+        note = get_store().get(nid)          # the one disk read, only on click
+        self.close()
+        if not note or not note["body"]:
+            self.app.show_toast("That note is empty", 2000)
+            return
+        # image/file notes are data-URLs — pasting one is base64 soup
+        if note["body"].startswith("data:") and ";base64," in note["body"][:400]:
+            self.app.show_toast("That one's an image or file — "
+                                "grab it from the web app", 2600)
+            return
+        pyperclip.copy(note["body"])
+        self.app.note_own_clipboard()         # our own copy — not a screenshot
+        self.app.show_toast(f"Copied — {note['title'] or '(untitled)'}", 2200)
+
+    # ---- window plumbing (same patterns as CalWindow) ----
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        if self.on_close:
+            self.on_close()
+
+    def show(self):
+        self.win.update_idletasks()
+        w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        r = self.app.root
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        x = r.winfo_x() + self.app.width - w        # right edges aligned
+        y = r.winfo_y() + self.app.height + 10      # prefer below the pill
+        if y + h > sh - 8:                          # no room below -> above
+            y = r.winfo_y() - h - 10
+        x = max(8, min(x, sw - w - 8))
+        y = max(8, min(y, sh - h - 8))
+        self.win.geometry(f"+{x}+{y}")
+        round_corners(self.win)
+        fade_in(self.win)
+        self.win.lift()
+        try:
+            self.win.focus_force()
+        except Exception:
+            pass
+        self._watch_outside_click()
+
+    def _watch_outside_click(self):
+        if self.closed:
+            return
+        try:
+            down = any(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000
+                       for vk in (0x01, 0x02, 0x04))
+            if down and not self._prev_buttons:
+                pt = ctypes.wintypes.POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                x0, y0 = self.win.winfo_rootx(), self.win.winfo_rooty()
+                if not (x0 <= pt.x < x0 + self.win.winfo_width()
+                        and y0 <= pt.y < y0 + self.win.winfo_height()):
+                    self.close()
+                    return
+            self._prev_buttons = down
+        except Exception:
+            pass
+        try:
+            self.win.after(80, self._watch_outside_click)
+        except tk.TclError:
+            pass
+
+
+# ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
 
@@ -1918,6 +2199,13 @@ class DictationApp:
         self.root.after(400, self._cal_badge.refresh)
         self.root.after(400, self._recalc_cal_pulse)
         get_store().subscribe(self._on_store_cal_change)
+        # recent-notes badge on the pill's bottom corner; the store nudges it
+        # (from any thread) whenever a note lands — Tk work goes via the queue
+        self._notes_win = None
+        self.notes_fresh = False       # lime ring until the list is opened
+        self._notes_badge = NotesBadge(self)
+        self.root.after(400, self._notes_badge.refresh)
+        get_store().subscribe(self._on_notes_change)
 
         if parakeet_files_ready():
             self.state = LOADING
@@ -2164,6 +2452,10 @@ class DictationApp:
             {"kind": "item", "text": "Keep a copy of each dictation",
              "check": bool(s.get("save_notes", True)),
              "command": self.toggle_save_notes},
+            {"kind": "item", "text": "Recent notes on my corner",
+             "hint": "click to copy the latest",
+             "check": bool(s.get("notes_badge", True)),
+             "command": self.toggle_notes_badge},
             {"kind": "sep"},
             {"kind": "header", "text": "Calendar"},
         ]
@@ -2486,6 +2778,13 @@ class DictationApp:
             self._cal_badge.refresh()
             if self._cal_win is not None:
                 self._cal_win.rebuild()
+        elif name == "notes_badge":
+            self.notes_fresh = True          # something new to copy
+            self._notes_badge.refresh()
+            if payload == "remote_create":   # a note just came from the phone
+                self._notes_badge.pulse()
+            if self._notes_win is not None:
+                self._notes_win.rebuild()
         elif name == "toast":
             self.show_toast(payload, 3500)
         elif name == "sync_status":
@@ -2606,6 +2905,8 @@ class DictationApp:
                     self._shots_win.close()
                 if self._cal_win is not None:
                     self._cal_win.close()
+                if self._notes_win is not None:
+                    self._notes_win.close()
             self.dragging = True
         if self.dragging:
             self.root.geometry(f"+{self.drag_start[2] + dx}+{self.drag_start[3] + dy}")
@@ -2613,6 +2914,8 @@ class DictationApp:
                 self._badge.place()         # the badges ride the shoulders
             if self._cal_badge.visible:
                 self._cal_badge.place()
+            if self._notes_badge.visible:
+                self._notes_badge.place()
 
     def on_release(self, e):
         if self.dragging:
@@ -2634,6 +2937,7 @@ class DictationApp:
             self._menu.close()
         self._badge.hide()            # the card takes the shoulder space
         self._cal_badge.hide()
+        self._notes_badge.hide()
 
         def closed():
             self._menu = None
@@ -2646,6 +2950,7 @@ class DictationApp:
                 pass
             self._badge.refresh()
             self._cal_badge.refresh()
+            self._notes_badge.refresh()
 
         r = self.root
         anchor = (r.winfo_x(), r.winfo_y(), self.width, self.height)
@@ -2859,10 +3164,42 @@ class DictationApp:
             return
         if self._cal_win is not None:
             self._cal_win.close()                # one shoulder tray at a time
+        if self._notes_win is not None:
+            self._notes_win.close()
         self.refresh_shot_badge(fresh=False)     # looked at — lime settles
         self._shots_win = ShotsWindow(
             self, on_close=lambda: setattr(self, "_shots_win", None))
         self._shots_win.show()
+
+    def toggle_notes_window(self):
+        if self._notes_win is not None:
+            self._notes_win.close()
+            return
+        if self._shots_win is not None:
+            self._shots_win.close()              # one tray at a time
+        if self._cal_win is not None:
+            self._cal_win.close()
+        self.notes_fresh = False                 # opening the list settles it
+        self._notes_badge.refresh()
+        self._notes_win = NotesWindow(
+            self, on_close=lambda: setattr(self, "_notes_win", None))
+        self._notes_win.show()
+
+    def _on_notes_change(self, kind, nid):
+        """Store listener (any thread): a note landing or changing — dictated
+        here, typed on the phone — refreshes the recent-notes badge; a phone
+        arrival also pulses it. Tk work goes via the event queue only."""
+        if kind in ("create", "update", "remote_create", "remote_update"):
+            self.events.put(("notes_badge", kind))
+
+    def toggle_notes_badge(self):
+        on = not self.settings.get("notes_badge", True)
+        self.settings["notes_badge"] = on
+        save_settings(self.settings)
+        self._notes_badge.refresh()
+        self.show_toast("Your newest notes sit on my bottom corner — "
+                        "click one to copy it" if on
+                        else "Recent-notes badge is off", 2600)
 
     def toggle_cal_window(self):
         if self._cal_win is not None:
@@ -2870,6 +3207,8 @@ class DictationApp:
             return
         if self._shots_win is not None:
             self._shots_win.close()
+        if self._notes_win is not None:
+            self._notes_win.close()
         try:
             self._cal_win = CalWindow(
                 self, on_close=lambda: setattr(self, "_cal_win", None))
@@ -3752,6 +4091,9 @@ class DictationApp:
             if self._cal_badge.visible:
                 self._cal_badge.win.attributes("-topmost", True)
                 self._cal_badge.win.lift()
+            if self._notes_badge.visible:
+                self._notes_badge.win.attributes("-topmost", True)
+                self._notes_badge.win.lift()
         except Exception:
             pass
         self.root.after(2000, self.assert_topmost)

@@ -260,6 +260,21 @@ class NoteStore:
             out.sort(key=lambda n: n["updatedAt"], reverse=True)
             return out
 
+    def recent(self, n=8):
+        """Newest first, metadata only: [{id, title, updatedAt, starred}].
+        Reads no bodies (the whole point — feeds the pill's recent-notes
+        list cheaply); same filtering/updatedAt as all_notes()."""
+        with self.lock:
+            out = []
+            for i, e in self.notes.items():
+                if e.get("deletedLocally"):
+                    continue
+                out.append({"id": i, "title": e["title"],
+                            "updatedAt": int(e.get("mtime", 0) * 1000),
+                            "starred": bool(e.get("starred"))})
+            out.sort(key=lambda x: x["updatedAt"], reverse=True)
+            return out[:n]
+
     def get(self, note_id):
         with self.lock:
             e = self.notes.get(note_id)
