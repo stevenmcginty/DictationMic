@@ -786,6 +786,19 @@ def round_corners(win):
         pass
 
 
+def work_area(win):
+    """(top, bottom) of the primary monitor's work area — the screen minus
+    the taskbar, so cards never hide rows underneath it."""
+    try:
+        rect = ctypes.wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(
+                0x0030, 0, ctypes.byref(rect), 0):   # SPI_GETWORKAREA
+            return rect.top, rect.bottom
+    except Exception:
+        pass
+    return 0, win.winfo_screenheight()
+
+
 def fade_in(win, steps=5, ms=16):
     """~110ms alpha ramp — the only entrance motion any card gets."""
     try:
@@ -1213,7 +1226,7 @@ GOLD_HEX = "#F4C752"         # the star on a flagged note
 
 CARD_RGB = (19, 21, 18)      # PIL twins of the card surface
 CARD_TOP_RGB = (26, 29, 25)
-CARD_MUTED = (159, 164, 152)
+CARD_MUTED = (181, 186, 173)   # lifted from 159/164/152 for readability
 SIGNAL_RED = (255, 92, 72)
 
 # toast anatomy per kind: (accent rgb, icon glyph)
@@ -1228,8 +1241,9 @@ def render_card(title=None, detail=None, kind=None, rows=None):
     wallpaper: the shadow defines it on light, the hairline on dark."""
     s = TK_SCALE
     ac, glyph = CARD_KINDS.get(kind, (None, None))
-    tf = pil_font(round(14 * s))
-    df = pil_font(round(12 * s), names=("segoeui.ttf", "arial.ttf"))
+    # sized up from 14/12 — Steve found the toasts hard to read
+    tf = pil_font(round(17 * s))
+    df = pil_font(round(14 * s), names=("segoeui.ttf", "arial.ttf"))
     meas = ImageDraw.Draw(Image.new("RGB", (1, 1)))
 
     def ellipsize(txt, f, w):
@@ -1249,7 +1263,7 @@ def render_card(title=None, detail=None, kind=None, rows=None):
         rw = max(meas.textlength(b, font=rf_) for _, b in rows)
         gap = round(16 * s)
         cw = int(pad_in * 2 + lw + gap + rw)
-        row_h = round(21 * s)
+        row_h = round(24 * s)
         ch = int(pad_in * 2 + row_h * len(rows) - round(4 * s))
     else:
         title = ellipsize(title or "", tf, max_text)
@@ -1258,7 +1272,7 @@ def render_card(title=None, detail=None, kind=None, rows=None):
             detail = ellipsize(detail, df, max_text)
             tw = max(tw, meas.textlength(detail, font=df))
         cw = int(pad_in + icon_w + icon_gap + tw + pad_in)
-        ch = round((52 if detail else 40) * s)
+        ch = round((60 if detail else 46) * s)
     shadow_pad = round(16 * s)                 # window margin for the shadow
     w, h = cw + 2 * shadow_pad, ch + 2 * shadow_pad
 
@@ -1334,9 +1348,9 @@ def render_card(title=None, detail=None, kind=None, rows=None):
     else:
         tx = shadow_pad + pad_in + icon_w + icon_gap
         if detail:
-            d.text((tx, shadow_pad + round(9 * s)), title, font=tf,
+            d.text((tx, shadow_pad + round(10 * s)), title, font=tf,
                    fill=INK + (255,))
-            d.text((tx, shadow_pad + round(28 * s)), detail, font=df,
+            d.text((tx, shadow_pad + round(33 * s)), detail, font=df,
                    fill=CARD_MUTED + (255,))
         else:
             d.text((tx, shadow_pad + ch / 2), title, font=tf,
@@ -1372,8 +1386,15 @@ class PopupMenu:
                            highlightbackground=MENU_EDGE,
                            highlightcolor=MENU_EDGE)
         self._prev_buttons = True     # swallow the click that opened us
-        self._body = tk.Frame(self.win, bg=MENU_BG)
-        self._body.pack(fill="both", expand=True, pady=7)
+        # the rows live on a canvas so the card can clamp to the screen and
+        # scroll when the menu outgrows it (it did — Exit went off-screen)
+        self._canvas = tk.Canvas(self.win, bg=MENU_BG, bd=0,
+                                 highlightthickness=0, yscrollincrement=20)
+        self._canvas.pack(fill="both", expand=True, pady=7)
+        self._body = tk.Frame(self._canvas, bg=MENU_BG)
+        self._body_item = self._canvas.create_window(
+            (0, 0), window=self._body, anchor="nw")
+        self._scrollable = False
         for it in items:
             self._add(self._body, it)
         self._finish_heroes(self._body)
@@ -1481,10 +1502,22 @@ class PopupMenu:
         self.close()
         root.after(10, cmd)
 
+    def _on_wheel(self, e):
+        try:
+            self._canvas.yview_scroll(
+                -int(e.delta / 40) or (-1 if e.delta > 0 else 1), "units")
+        except Exception:
+            pass
+
     def close(self):
         if self.closed:
             return
         self.closed = True
+        if self._scrollable:
+            try:
+                self.win.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
         try:
             self.win.destroy()
         except Exception:
@@ -1498,9 +1531,21 @@ class PopupMenu:
         if not self._heroes:
             return None
         lab = self._heroes[0][0]
-        return self._body.winfo_y() + lab.winfo_y() + lab.winfo_height() // 2
+        return (self._canvas.winfo_y() + self._body.winfo_y()
+                + lab.winfo_y() + lab.winfo_height() // 2)
 
     def show(self, x, y, anchor=None):
+        self.win.update_idletasks()
+        bw, bh = self._body.winfo_reqwidth(), self._body.winfo_reqheight()
+        wa_top, wa_bot = work_area(self.win)
+        # 14 = the canvas's pady, 2 = the card's highlight border
+        max_body = wa_bot - wa_top - 16 - 14 - 2
+        self._canvas.configure(width=bw, height=min(bh, max_body),
+                               scrollregion=(0, 0, bw, bh))
+        self._canvas.itemconfigure(self._body_item, width=bw)
+        self._scrollable = bh > max_body
+        if self._scrollable:
+            self.win.bind_all("<MouseWheel>", self._on_wheel)
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
@@ -1518,7 +1563,7 @@ class PopupMenu:
         elif y - h > 8:               # pill lives near the bottom: open upward
             y = y - h
         x = max(8, min(x, sw - w - 8))
-        y = max(8, min(y, sh - h - 8))
+        y = max(wa_top + 8, min(y, wa_bot - h - 8))
         self.win.geometry(f"+{x}+{y}")
         round_corners(self.win)
         fade_in(self.win)

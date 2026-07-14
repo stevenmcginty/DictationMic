@@ -8,6 +8,8 @@ list of launcher actions:
     open_url       target = full URL (invented from a spoken description)
     open_terminal  tabs = how many, dir = folder, run = command ("claude")
     open_folder    target = folder name or path
+    create_folder  target = new folder's name (made on the Desktop)
+    run_command    run = one PowerShell command (full computer control)
     none           the words weren't a command after all
 
 Uses the Gemini API free tier (generous daily allowance, £0). The key
@@ -45,6 +47,7 @@ SCHEMA = {
                     "kind": {"type": "STRING",
                              "enum": ["open_app", "open_url",
                                       "open_terminal", "open_folder",
+                                      "create_folder", "run_command",
                                       "none"]},
                     "target": {"type": "STRING"},
                     "tabs": {"type": "INTEGER"},
@@ -79,6 +82,28 @@ Actions:
   Claude Code; empty = a plain terminal.
 - open_folder: target = folder name from the list below (or a path);
   opens in Explorer.
+- create_folder: target = the name for a NEW folder ("make a folder
+  called invoices" -> "Invoices"). It is created on the Desktop unless
+  the speaker gives a full path. Capitalise the name sensibly.
+- run_command: run = ONE PowerShell command doing exactly what was
+  asked. This is for everything the actions above can't do: rename,
+  move or delete files and folders, write a file, read something out,
+  close an app, change volume, empty the recycle bin, lock or restart
+  the computer... Prefer the specific actions above when they fit.
+  Rules for the command you write:
+  * Do only what was asked — no extras, no cleanup they didn't request.
+  * Work inside the speaker's own files (Desktop, Documents, Downloads,
+    Pictures...) unless they clearly name somewhere else.
+  * NEVER format a drive, never touch C:\\Windows or Program Files,
+    never turn off security or delete a whole drive or user profile.
+  * ALWAYS reach the user's files through PowerShell variables, NEVER a
+    hard-coded C:\\Users\\<name> path (you do NOT know the username):
+    "$HOME\\Desktop", "$HOME\\Documents", "$HOME\\Downloads",
+    "$HOME\\Pictures". The user's real folders are listed below.
+  * When asked to DELETE, move it to the Recycle Bin so mistakes are
+    recoverable: Add-Type -AssemblyName Microsoft.VisualBasic;
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory("<path>",
+    'OnlyErrorDialogs','SendToRecycleBin')  (DeleteFile for a file).
 - none: the words are NOT an instruction to the computer — ordinary
   dictation, conversation, or you can't tell. WHEN IN DOUBT, "none".
 
@@ -88,6 +113,8 @@ actions. "open four tabs with claude" = one open_terminal, tabs 4.
 Set "say" to a short, friendly confirmation of what you're doing
 (or why nothing), under ten words.
 
+The user's folders (use $HOME-relative paths, these show the layout):
+{places}
 Desktop folders: {folders}
 """
 
@@ -162,6 +189,15 @@ class Brain:
         except OSError:
             return []
 
+    def _places(self):
+        home = os.path.expanduser("~")
+        lines = [f"  home ($HOME) = {home}"]
+        for name in ("Desktop", "Documents", "Downloads", "Pictures"):
+            p = os.path.join(home, name)
+            if os.path.isdir(p):
+                lines.append(f"  $HOME\\{name} = {p}")
+        return "\n".join(lines)
+
     def interpret(self, text):
         """Spoken words -> {"actions": [...], "say": str} or {"error": str}."""
         key = self.key()
@@ -170,6 +206,7 @@ class Brain:
                              "pill menu → My Gemini API key"}
         payload = {
             "systemInstruction": {"parts": [{"text": INSTRUCTIONS.replace(
+                "{places}", self._places()).replace(
                 "{folders}", ", ".join(self._desktop_folders()) or "(none)")}]},
             "contents": [{"role": "user", "parts": [{"text": text}]}],
             "generationConfig": {

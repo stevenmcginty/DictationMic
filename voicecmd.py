@@ -294,6 +294,36 @@ def resolve_app(name):
     return index[close[0]] if close else None
 
 
+# Full-control mode: Mike runs whatever PowerShell the brain writes. The
+# ONLY refusals are catastrophic, never-meant-by-voice operations — this is
+# a tripwire against a disastrous mis-hearing, not a security boundary.
+DANGER_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
+    r"\bformat(\.com)?\s+[a-z]:",                       # format a drive
+    r"\bdiskpart\b",
+    r"\bbcdedit\b",
+    r"\bcipher\s+/w\b",
+    r"\bvssadmin\b.*\bdelete\b",
+    r"set-mppreference.*disabl",                        # turn off Defender
+    r"(remove-item|\brd\b|\brmdir\b|\bdel\b|\brm\b)"    # delete a drive root,
+    r"[^;&|]*[\"' ][a-z]:[\\/]?[\"']?\s*(-|;|$)",       # e.g. rm C:\ -Recurse
+    r"(remove-item|\brd\b|\brmdir\b|\bdel\b|\brm\b)"
+    r"[^;&|]*\\(windows|program files)",
+)]
+
+AUDIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "mike-actions.log")
+
+
+def _audit(line):
+    """Every run_command lands in mike-actions.log — the paper trail for
+    full-control mode. Must never raise."""
+    try:
+        with open(AUDIT_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "  " + line + "\n")
+    except Exception:
+        pass
+
+
 def execute_actions(actions, say, dbg=lambda m: None):
     """Run the brain's actions. Returns (fired, toast) — fired False means
     nothing happened (stay in command mode and let Steve try again)."""
@@ -346,6 +376,49 @@ def execute_actions(actions, say, dbg=lambda m: None):
                     else:
                         os.startfile(os.path.join(desktop, folder))
                         done += 1
+            elif kind == "create_folder":
+                raw = (a.get("target") or "").strip()
+                if os.path.isabs(raw):
+                    path = raw
+                else:
+                    # strip characters Windows folder names can't hold
+                    name = re.sub(r'[<>:"/\\|?*]', "", raw).strip(". ")
+                    if not name:
+                        failed.append("couldn't make out the folder name")
+                        continue
+                    path = os.path.join(desktop, name)
+                if os.path.isdir(path):
+                    failed.append(f"“{os.path.basename(path)}” already exists")
+                else:
+                    os.makedirs(path)
+                    done += 1
+            elif kind == "run_command":
+                cmd = (a.get("run") or "").strip()
+                if not cmd:
+                    failed.append("no command to run")
+                    continue
+                if any(p.search(cmd) for p in DANGER_PATTERNS):
+                    _audit("BLOCKED  " + cmd)
+                    failed.append("that looked too dangerous — I didn't run it")
+                    continue
+                _audit("RUN      " + cmd)
+                try:
+                    p = subprocess.run(
+                        ["powershell", "-NoProfile", "-ExecutionPolicy",
+                         "Bypass", "-Command", cmd],
+                        capture_output=True, text=True, timeout=45,
+                        creationflags=0x08000000)       # CREATE_NO_WINDOW
+                except subprocess.TimeoutExpired:
+                    _audit("TIMEOUT")
+                    failed.append("that command took too long — gave up")
+                    continue
+                _audit(f"EXIT {p.returncode}")
+                if p.returncode == 0:
+                    done += 1
+                else:
+                    err = (p.stderr or p.stdout or "").strip().splitlines()
+                    failed.append((err[0][:90] if err
+                                   else f"command failed ({p.returncode})"))
         except Exception as ex:
             dbg(f"action {kind} failed: {ex!r}")
             failed.append(f"{kind} failed")

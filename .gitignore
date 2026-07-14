@@ -4,6 +4,7 @@ gemini.key
 notes/
 shots/
 debug.log
+mike-actions.log
 
 # python runtime & build outputs
 venv/
