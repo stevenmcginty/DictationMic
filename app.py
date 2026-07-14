@@ -1395,27 +1395,40 @@ class PopupMenu:
         self._body_item = self._canvas.create_window(
             (0, 0), window=self._body, anchor="nw")
         self._scrollable = False
-        for it in items:
-            self._add(self._body, it)
-        self._finish_heroes(self._body)
+        self._items = items
+        self._compact = False         # squeezed paddings for short screens
+        self._arrows = []             # ▲ / ▼ overflow strips, made on demand
+        self._auto_id = None          # hover-glide after() handle
+        self._build()
         self.win.bind("<Escape>", lambda e: self.close())
         self.win.bind("<FocusOut>", lambda e: self.close())
 
+    def _build(self):
+        for w in self._body.winfo_children():
+            w.destroy()
+        self._heroes.clear()
+        self._hero_photos.clear()
+        for it in self._items:
+            self._add(self._body, it)
+        self._finish_heroes(self._body)
+
     def _add(self, body, it):
         kind = it.get("kind", "item")
+        pr = 1 if self._compact else 4          # per-row breathing room
         if kind == "sep":
             tk.Frame(body, bg=MENU_EDGE, height=1).pack(
-                fill="x", padx=10, pady=6)
+                fill="x", padx=10, pady=2 if self._compact else 6)
             return
         if kind == "hero":
             lab = tk.Label(body, bg=MENU_BG, bd=0, cursor="hand2")
-            lab.pack(padx=10, pady=(2, 6))
+            lab.pack(padx=10, pady=(2, 3) if self._compact else (2, 6))
             self._heroes.append((lab, it))
             return
         if kind == "header":
             tk.Label(body, text=spaced(it["text"]), bg=MENU_BG, fg=MENU_DIM,
                      font=(MONO_FAMILY, 7), anchor="w"
-                     ).pack(fill="x", padx=self.PAD_X, pady=(5, 1))
+                     ).pack(fill="x", padx=self.PAD_X,
+                            pady=(2, 0) if self._compact else (5, 1))
             return
         row = tk.Frame(body, bg=MENU_BG)
         row.pack(fill="x")
@@ -1431,17 +1444,17 @@ class PopupMenu:
         widgets = [row]
         lead = tk.Label(row, text=lead_txt, width=2, bg=MENU_BG, fg=lead_fg,
                         font=(UI_FAMILY, 10), anchor="w")
-        lead.pack(side="left", padx=(self.PAD_X - 6, 0), pady=4)
+        lead.pack(side="left", padx=(self.PAD_X - 6, 0), pady=pr)
         widgets.append(lead)
         fg = (MENU_RED if it.get("danger")
               else MENU_SUB if kind == "status" else MENU_FG)
         lab = tk.Label(row, text=it["text"], bg=MENU_BG, fg=fg,
                        font=(UI_FAMILY, 10), anchor="w")
-        lab.pack(side="left", pady=4)
+        lab.pack(side="left", pady=pr)
         widgets.append(lab)
         tail = tk.Label(row, text=it.get("hint", ""), bg=MENU_BG, fg=MENU_DIM,
                         font=(MONO_FAMILY, 7), anchor="e")
-        tail.pack(side="right", padx=(24, self.PAD_X), pady=4)
+        tail.pack(side="right", padx=(24, self.PAD_X), pady=pr)
         widgets.append(tail)
         cmd = it.get("command") if kind == "item" else None
         if cmd is not None:
@@ -1506,13 +1519,76 @@ class PopupMenu:
         try:
             self._canvas.yview_scroll(
                 -int(e.delta / 40) or (-1 if e.delta > 0 else 1), "units")
+            self._sync_arrows()
         except Exception:
             pass
+
+    # ---- overflow arrows: the Windows-menu ▲ / ▼ strips. Wheel delivery to
+    # an unfocused override-redirect window is flaky, so these are the path
+    # that always works: hover = glide, click = a whole page. ----
+
+    def _make_arrows(self, bw):
+        if not self._arrows:
+            for sym, d in (("▲", -1), ("▼", 1)):
+                lab = tk.Label(self.win, text=sym, bg=MENU_BG, fg=MENU_DIM,
+                               font=(UI_FAMILY, 8), cursor="hand2")
+                if d < 0:
+                    lab.pack(before=self._canvas, fill="x")
+                else:
+                    lab.pack(after=self._canvas, fill="x")
+                lab.bind("<Enter>",
+                         lambda e, d=d, l=lab: self._auto_scroll(d, l))
+                lab.bind("<Leave>", lambda e: self._auto_stop())
+                lab.bind("<ButtonRelease-1>",
+                         lambda e, d=d: (self._canvas.yview_scroll(d, "pages"),
+                                         self._sync_arrows()))
+                self._arrows.append(lab)
+        self.win.update_idletasks()
+        self._sync_arrows()
+        return sum(l.winfo_reqheight() for l in self._arrows)
+
+    def _sync_arrows(self, hot=None):
+        if not self._arrows:
+            return
+        try:
+            f0, f1 = self._canvas.yview()
+        except Exception:
+            return
+        for lab, live in zip(self._arrows, (f0 > 0.0005, f1 < 0.9995)):
+            lab.configure(fg=(MENU_LIME if lab is hot and live
+                              else MENU_DIM if live else MENU_EDGE))
+
+    def _auto_scroll(self, d, lab):
+        self._auto_stop()
+
+        def step():
+            try:
+                self._canvas.yview_scroll(d, "units")
+                self._sync_arrows(hot=lab)
+                self._auto_id = self.win.after(40, step)
+            except tk.TclError:
+                self._auto_id = None
+        step()
+
+    def _auto_stop(self):
+        if self._auto_id is not None:
+            try:
+                self.win.after_cancel(self._auto_id)
+            except Exception:
+                pass
+            self._auto_id = None
+        self._sync_arrows()
 
     def close(self):
         if self.closed:
             return
         self.closed = True
+        if self._auto_id is not None:
+            try:
+                self.win.after_cancel(self._auto_id)
+            except Exception:
+                pass
+            self._auto_id = None
         if self._scrollable:
             try:
                 self.win.unbind_all("<MouseWheel>")
@@ -1540,12 +1616,21 @@ class PopupMenu:
         wa_top, wa_bot = work_area(self.win)
         # 14 = the canvas's pady, 2 = the card's highlight border
         max_body = wa_bot - wa_top - 16 - 14 - 2
-        self._canvas.configure(width=bw, height=min(bh, max_body),
+        if bh > max_body and not self._compact:
+            # taller than the screen: squeeze the air out before resorting
+            # to scrolling — the compact build usually fits outright
+            self._compact = True
+            self._build()
+            self.win.update_idletasks()
+            bw, bh = self._body.winfo_reqwidth(), self._body.winfo_reqheight()
+        self._scrollable = bh > max_body
+        view = min(bh, max_body)
+        if self._scrollable:
+            view -= self._make_arrows(bw)
+            self.win.bind_all("<MouseWheel>", self._on_wheel)
+        self._canvas.configure(width=bw, height=view,
                                scrollregion=(0, 0, bw, bh))
         self._canvas.itemconfigure(self._body_item, width=bw)
-        self._scrollable = bh > max_body
-        if self._scrollable:
-            self.win.bind_all("<MouseWheel>", self._on_wheel)
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
