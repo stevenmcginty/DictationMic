@@ -37,7 +37,7 @@ import sounddevice as sd
 import keyboard
 import pyperclip
 import winsound
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 import shots
 import voicecmd
@@ -229,6 +229,127 @@ def make_titlebar_dark(win):
                 break
     except Exception:
         pass
+
+# ----------------------------------------------------------------------------
+# Per-pixel alpha windows (UpdateLayeredWindow). Tk's -transparentcolor is a
+# chroma key: the capsule's anti-aliased edge flattens onto near-black and
+# grows a dark fringe on light backgrounds. A layered window carries a real
+# alpha channel instead — clean edges and soft shadows on any wallpaper.
+# Everything falls back to the chroma-key path if any call here fails.
+# ----------------------------------------------------------------------------
+
+WS_EX_LAYERED = 0x00080000
+WS_EX_CLICKTHROUGH = 0x00000020     # WS_EX_TRANSPARENT (input passes through)
+ULW_ALPHA = 2
+
+# private handles so argtypes never leak into other windll users (shots.py
+# talks to gdi32 too)
+_ulw_usr = ctypes.WinDLL("user32")
+_ulw_gdi = ctypes.WinDLL("gdi32")
+_ulw_usr.GetDC.restype = ctypes.c_void_p
+_ulw_usr.GetDC.argtypes = [ctypes.c_void_p]
+_ulw_usr.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_ulw_gdi.CreateCompatibleDC.restype = ctypes.c_void_p
+_ulw_gdi.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+_ulw_gdi.CreateDIBSection.restype = ctypes.c_void_p
+_ulw_gdi.SelectObject.restype = ctypes.c_void_p
+_ulw_gdi.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_ulw_gdi.DeleteObject.argtypes = [ctypes.c_void_p]
+_ulw_gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+
+
+class _BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [("BlendOp", ctypes.c_byte), ("BlendFlags", ctypes.c_byte),
+                ("SourceConstantAlpha", ctypes.c_ubyte),
+                ("AlphaFormat", ctypes.c_byte)]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.wintypes.DWORD),
+                ("biWidth", ctypes.wintypes.LONG),
+                ("biHeight", ctypes.wintypes.LONG),
+                ("biPlanes", ctypes.wintypes.WORD),
+                ("biBitCount", ctypes.wintypes.WORD),
+                ("biCompression", ctypes.wintypes.DWORD),
+                ("biSizeImage", ctypes.wintypes.DWORD),
+                ("biXPelsPerMeter", ctypes.wintypes.LONG),
+                ("biYPelsPerMeter", ctypes.wintypes.LONG),
+                ("biClrUsed", ctypes.wintypes.DWORD),
+                ("biClrImportant", ctypes.wintypes.DWORD)]
+
+
+_ulw_gdi.CreateDIBSection.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(_BITMAPINFOHEADER), ctypes.c_uint,
+    ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+_ulw_usr.UpdateLayeredWindow.restype = ctypes.wintypes.BOOL
+_ulw_usr.UpdateLayeredWindow.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.POINTER(ctypes.wintypes.SIZE), ctypes.c_void_p,
+    ctypes.POINTER(ctypes.wintypes.POINT), ctypes.wintypes.COLORREF,
+    ctypes.POINTER(_BLENDFUNCTION), ctypes.wintypes.DWORD]
+
+
+def layered_ready(win, click_through=False):
+    """Flip a MAPPED Toplevel into per-pixel-alpha mode. Returns the real
+    top-level hwnd, or None. (The wrapper hwnd only exists once the window
+    has been mapped — call win.update() / deiconify first.)"""
+    try:
+        win.update_idletasks()
+        hwnd = (ctypes.windll.user32.GetParent(win.winfo_id())
+                or win.winfo_id())
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        style |= WS_EX_LAYERED
+        if click_through:
+            style |= WS_EX_CLICKTHROUGH
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+        return hwnd
+    except Exception:
+        return None
+
+
+def layered_paint(hwnd, img, alpha=255):
+    """Blit a PIL image (RGBA, or 'RGBa' premultiplied) onto a layered
+    window with a real alpha channel. alpha ramps the whole window (fades).
+    Returns False rather than raising — callers fall back to chroma-key."""
+    try:
+        w, h = img.size
+        if img.mode == "RGBa":
+            arr = np.asarray(img, dtype=np.uint8)
+        else:
+            a16 = np.asarray(img.convert("RGBA"), dtype=np.uint16)
+            arr = a16.copy()
+            arr[..., :3] = (a16[..., :3] * a16[..., 3:4] + 127) // 255
+            arr = arr.astype(np.uint8)
+        bgra = np.ascontiguousarray(arr[..., [2, 1, 0, 3]]).tobytes()
+        bmi = _BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+        bmi.biWidth, bmi.biHeight = w, -h
+        bmi.biPlanes, bmi.biBitCount = 1, 32
+        sdc = _ulw_usr.GetDC(None)
+        mdc = _ulw_gdi.CreateCompatibleDC(sdc)
+        bits = ctypes.c_void_p()
+        hbm = _ulw_gdi.CreateDIBSection(sdc, ctypes.byref(bmi), 0,
+                                        ctypes.byref(bits), None, 0)
+        if not hbm:
+            _ulw_gdi.DeleteDC(mdc)
+            _ulw_usr.ReleaseDC(None, sdc)
+            return False
+        ctypes.memmove(bits, bgra, len(bgra))
+        old = _ulw_gdi.SelectObject(mdc, hbm)
+        size = ctypes.wintypes.SIZE(w, h)
+        src = ctypes.wintypes.POINT(0, 0)
+        bf = _BLENDFUNCTION(0, 0, alpha, 1)     # AC_SRC_ALPHA
+        ok = _ulw_usr.UpdateLayeredWindow(
+            hwnd, sdc, None, ctypes.byref(size), mdc, ctypes.byref(src),
+            0, ctypes.byref(bf), ULW_ALPHA)
+        _ulw_gdi.SelectObject(mdc, old)
+        _ulw_gdi.DeleteObject(hbm)
+        _ulw_gdi.DeleteDC(mdc)
+        _ulw_usr.ReleaseDC(None, sdc)
+        return bool(ok)
+    except Exception:
+        return False
+
 
 _mutex_handle = None
 
@@ -605,26 +726,38 @@ def wait_modifiers_up(timeout=30.0):
 
 # ----------------------------------------------------------------------------
 # Rendering (Pillow, supersampled) — "Obsidian Capsule" (see DESIGN-DESKTOP.md):
-# lacquered obsidian pebble, bone ink, one volt-lime accent.
+# machined obsidian pebble, bone ink, one volt-lime accent. On a layered
+# window the pebble floats on a real two-layer elevation shadow; live states
+# add an outer glow. The chroma-key fallback renders the same pebble flat.
 # ----------------------------------------------------------------------------
 
 SS = 3  # supersampling factor
 
 C_TRANSPARENT = (1, 2, 3, 255)
 
-BODY_TOP = (31, 34, 32)                  # lacquer gradient, top -> bottom
+BODY_TOP = (31, 34, 32)                  # body gradient, top -> bottom
 BODY_BOT = (14, 16, 14)                  # (green undertone, like the web app)
-EDGE_IDLE = (236, 238, 231, 26)          # hairline rim, bone ink
-EDGE_DIM = (236, 238, 231, 14)
+EDGE_IDLE = (236, 238, 231, 30)          # hairline rim, bone ink
+EDGE_DIM = (236, 238, 231, 16)
 LIME = (182, 238, 63)                    # volt — THE accent (#B6EE3F)
 ICE = (86, 197, 255)                     # "caught it" flash after a drop/paste
 INK = (236, 238, 231)                    # bone white
-DOT_SLEEP = INK + (77,)                  # 3 sleeping dots at rest
-DOT_SLEEP_HOVER = INK + (140,)
+DOT_SLEEP = INK + (85,)                  # 3 sleeping dots at rest
+DOT_SLEEP_HOVER = INK + (150,)
 DOT_SLEEP_DIM = INK + (46,)
 DOT_THINK = LIME + (200,)                # "your words are coming" dots
 TEXT_SOFT = INK + (255,)
 TRACK = (255, 255, 255, 34)              # download progress track
+
+
+def over(img, draw_fn):
+    """Draw translucent shapes correctly. ImageDraw writes a shape's low
+    alpha INTO the destination — on a layered window that punches see-through
+    holes. Draw on an overlay and Porter-Duff composite instead."""
+    ov = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw_fn(ImageDraw.Draw(ov))
+    img.alpha_composite(ov)
+    return img
 
 
 def pil_font(px, names=("seguisb.ttf", "segoeuib.ttf", "segoeui.ttf",
@@ -701,8 +834,17 @@ UI_FAMILY = "Segoe UI"
 MONO_FAMILY = "Consolas"
 
 
+TK_SCALE = 1.0      # px per pt / 0.75 — 1.0 at 96dpi, 1.5 at 144dpi; the
+                    # PIL-drawn cards (toast/tooltip) scale by this so their
+                    # text matches what the old 10pt Tk labels rendered at
+
+
 def pick_ui_fonts(root):
-    global UI_FAMILY, MONO_FAMILY
+    global UI_FAMILY, MONO_FAMILY, TK_SCALE
+    try:
+        TK_SCALE = max(0.75, float(root.tk.call("tk", "scaling")) * 0.75)
+    except Exception:
+        pass
     try:
         import tkinter.font as tkfont
         fams = set(tkfont.families(root))
@@ -720,11 +862,21 @@ def pick_ui_fonts(root):
 
 class PillRenderer:
     """Draws the capsule in every state. frame_* methods return PIL images
-    (testable without Tk); the public methods wrap them as PhotoImages."""
+    (testable without Tk); the public methods wrap them for the window —
+    layered mode: premultiplied frames on an elevation shadow, window padded
+    to hold it; legacy mode: flattened PhotoImages, window = body size."""
 
-    def __init__(self, width, height):
+    def __init__(self, width, height, layered=False):
         self.w, self.h = width, height
         self.sw, self.sh = width * SS, height * SS
+        self.layered = bool(layered)
+        k = height / 30.0                    # every metric scales with height
+        self.pad_x = round(14 * k) if layered else 0
+        self.pad_t = round(9 * k) if layered else 0
+        self.pad_b = round(16 * k) if layered else 0
+        self.win_w = width + 2 * self.pad_x
+        self.win_h = height + self.pad_t + self.pad_b
+        self._unders = {}                    # padded shadow(+glow) canvases
         self.pad = SS                        # room so the rim's AA isn't clipped
         self.edge_w = max(2, round(SS * 1.1))
         # meter layout: bars stay clear of the round end caps
@@ -767,52 +919,62 @@ class PillRenderer:
         ImageDraw.Draw(mask).rounded_rectangle(box, radius=radius, fill=255)
         body = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
         body.paste(grad, (0, 0), mask)
-        # the lacquer: a soft top sheen + a bottom inner shade, clipped to
-        # the capsule, give the flat gradient its "polished pebble" depth
-        lac = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
-        ld = ImageDraw.Draw(lac)
-        ld.ellipse([-sw * 0.25, -sh * 0.95, sw * 1.25, sh * 0.52],
-                   fill=(255, 255, 255, 23))
-        ld.rectangle([0, sh * 0.72, sw, sh], fill=(0, 0, 0, 30))
-        lac.putalpha(Image.composite(
-            lac.getchannel("A"), Image.new("L", (sw, sh), 0), mask))
-        body.alpha_composite(lac)
-        d = ImageDraw.Draw(body)
-        d.rounded_rectangle(box, radius=radius, outline=edge_rgba, width=self.edge_w)
+        # machined top highlight: a 1px inner arc along the upper edge,
+        # fading out by mid-height — a milled pebble, not glossy plastic
+        hi = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+        ImageDraw.Draw(hi).rounded_rectangle(
+            [p + self.edge_w, p + self.edge_w,
+             sw - p - self.edge_w, sh - p - self.edge_w],
+            radius=radius - self.edge_w, outline=(255, 255, 255, 34),
+            width=self.edge_w)
+        fade = Image.new("L", (sw, sh), 0)
+        ImageDraw.Draw(fade).rectangle([0, 0, sw, sh * 0.45], fill=255)
+        fade = fade.filter(ImageFilter.GaussianBlur(sh * 0.12))
+        hi.putalpha(Image.composite(hi.getchannel("A"),
+                                    Image.new("L", (sw, sh), 0), fade))
+        body.alpha_composite(hi)
+        over(body, lambda o: o.rounded_rectangle(
+            box, radius=radius, outline=edge_rgba, width=self.edge_w))
         self._bodies[key] = body
         return body
 
     # ---- shared meter ----
 
-    def _bars(self, d, vals, color, glow=None):
+    def _bars(self, body, vals, color, glow=None):
         cy = self.sh / 2
-        if glow:                            # volt under-glow, drawn first
+
+        def draw(d):
+            if glow:                        # volt under-glow, drawn first
+                x = self.bar_x0
+                gx = self.bar_w * 0.45
+                for v in vals:
+                    half = self.nub_half + (self.max_half - self.nub_half) \
+                        * max(0.0, min(1.0, v))
+                    d.rounded_rectangle(
+                        [x - gx, cy - half - gx, x + self.bar_w + gx,
+                         cy + half + gx],
+                        radius=self.bar_w / 2 + gx, fill=glow)
+                    x += self.bar_w + self.bar_gap
             x = self.bar_x0
-            gx = self.bar_w * 0.45
             for v in vals:
                 half = self.nub_half + (self.max_half - self.nub_half) \
                     * max(0.0, min(1.0, v))
-                d.rounded_rectangle(
-                    [x - gx, cy - half - gx, x + self.bar_w + gx,
-                     cy + half + gx],
-                    radius=self.bar_w / 2 + gx, fill=glow)
+                d.rounded_rectangle([x, cy - half, x + self.bar_w, cy + half],
+                                    radius=self.bar_w / 2, fill=color)
                 x += self.bar_w + self.bar_gap
-        x = self.bar_x0
-        for v in vals:
-            half = self.nub_half + (self.max_half - self.nub_half) * max(0.0, min(1.0, v))
-            d.rounded_rectangle([x, cy - half, x + self.bar_w, cy + half],
-                                radius=self.bar_w / 2, fill=color)
-            x += self.bar_w + self.bar_gap
+        over(body, draw)
 
     def _sleep_dots(self, body, color):
-        """The brand mark at rest: 3 dots, blended onto the lacquer."""
-        d = ImageDraw.Draw(body, "RGBA")
+        """The brand mark at rest: 3 dots, blended onto the stone."""
         cy = self.sh / 2
         r = self.sh * 0.058
         gap = self.sh * 0.36
-        for i in (-1, 0, 1):
-            x = self.sw / 2 + i * gap
-            d.ellipse([x - r, cy - r, x + r, cy + r], fill=color)
+
+        def draw(d):
+            for i in (-1, 0, 1):
+                x = self.sw / 2 + i * gap
+                d.ellipse([x - r, cy - r, x + r, cy + r], fill=color)
+        over(body, draw)
 
     # ---- frames (pure PIL) ----
 
@@ -830,6 +992,51 @@ class PillRenderer:
         rgb = self._compose(img).convert("RGB")
         data = b"P6\n%d %d\n255\n" % rgb.size + rgb.tobytes()
         return tk.PhotoImage(data=data, format="ppm")
+
+    # ---- layered finishing: elevation shadow + outer glow, real alpha ----
+
+    def _under(self, key):
+        """Padded canvas with the elevation shadow (and, for live states,
+        an outer glow) baked — cached; GaussianBlur only runs on a miss."""
+        got = self._unders.get(key)
+        if got is not None:
+            return got
+        k = self.h / 30.0
+        cw, ch = self.win_w * SS, self.win_h * SS
+        box = [self.pad_x * SS + self.pad, self.pad_t * SS + self.pad,
+               (self.pad_x + self.w) * SS - self.pad,
+               (self.pad_t + self.h) * SS - self.pad]
+        radius = (box[3] - box[1]) / 2
+        canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        # two-layer elevation: tight key shadow + wide soft ambient
+        for off, blur, a in ((2.2, 3.0, 70), (5.0, 9.0, 46)):
+            sh = Image.new("L", (cw, ch), 0)
+            ImageDraw.Draw(sh).rounded_rectangle(
+                [box[0], box[1] + off * k * SS,
+                 box[2], box[3] + off * k * SS], radius=radius, fill=a)
+            sh = sh.filter(ImageFilter.GaussianBlur(blur * k * SS))
+            canvas.alpha_composite(Image.merge(
+                "RGBA", (*Image.new("RGB", (cw, ch), (0, 0, 0)).split(), sh)))
+        glow = {"drop": (LIME, 100, 4.5), "flash": (ICE, 100, 4.5)}.get(key)
+        if isinstance(key, tuple) and key[0] == "listen":
+            glow = (LIME, 60 + key[1] * 12, 4.0)
+        if glow:
+            color, a, blur = glow
+            gl = Image.new("L", (cw, ch), 0)
+            ImageDraw.Draw(gl).rounded_rectangle(box, radius=radius, fill=a)
+            gl = gl.filter(ImageFilter.GaussianBlur(blur * k * SS))
+            canvas.alpha_composite(Image.merge(
+                "RGBA", (*Image.new("RGB", (cw, ch), color).split(), gl)))
+        self._unders[key] = canvas
+        return canvas
+
+    def _padded(self, img, under_key="plain"):
+        """Body frame -> full window frame: shadow/glow under the capsule,
+        downsampled premultiplied so the AA edge never fringes."""
+        out = self._under(under_key).copy()
+        out.alpha_composite(img, (self.pad_x * SS, self.pad_t * SS))
+        return out.convert("RGBa").resize((self.win_w, self.win_h),
+                                          Image.LANCZOS)
 
     def frame_idle(self, hover, dim=False):
         if dim:
@@ -857,32 +1064,29 @@ class PillRenderer:
     def frame_listening(self, vals, pulse):
         step = min(3, int(max(0.0, pulse) * 4))     # quantized so bodies cache
         body = self._body(("listen", step), LIME + (95 + step * 16,)).copy()
-        self._bars(ImageDraw.Draw(body, "RGBA"), vals, LIME + (255,),
-                   glow=LIME + (52,))
+        self._bars(body, vals, LIME + (255,), glow=LIME + (52,))
         return body
 
     def frame_dots(self, phase):
         body = self._body("idle", EDGE_IDLE).copy()
-        d = ImageDraw.Draw(body, "RGBA")
         cy = self.sh / 2
         r0 = self.sh * 0.065
         gap = self.sh * 0.40
-        for i in range(3):
-            k = 0.6 + 0.4 * math.sin(phase - i * 0.9)
-            r = r0 * (0.55 + 0.75 * k)
-            x = self.sw / 2 + (i - 1) * gap
-            d.ellipse([x - r, cy - r, x + r, cy + r], fill=DOT_THINK)
+
+        def draw(d):
+            for i in range(3):
+                k = 0.6 + 0.4 * math.sin(phase - i * 0.9)
+                r = r0 * (0.55 + 0.75 * k)
+                x = self.sw / 2 + (i - 1) * gap
+                d.ellipse([x - r, cy - r, x + r, cy + r], fill=DOT_THINK)
+        over(body, draw)
         return body
 
     def frame_drop(self):
         """Drag hovering over the pill: full lime ring + arrow-into-tray,
         so there's no doubt it will catch the drop. Static on purpose."""
         body = self._body("drop", LIME + (235,)).copy()
-        d = ImageDraw.Draw(body)
         p = self.pad
-        d.rounded_rectangle([p, p, self.sw - p, self.sh - p],
-                            radius=(self.sh - 2 * p) / 2,
-                            outline=LIME + (235,), width=self.edge_w * 2)
         cx = self.sw / 2
         ah = self.sh * 0.50                      # glyph box height
         top = self.sh / 2 - ah / 2
@@ -890,13 +1094,21 @@ class PillRenderer:
         head = self.sh * 0.17
         tip = top + ah * 0.68
         lime = LIME + (255,)
-        d.rounded_rectangle([cx - shaft / 2, top, cx + shaft / 2,
-                             tip - head * 0.7], radius=shaft / 2, fill=lime)
-        d.polygon([(cx - head, tip - head), (cx + head, tip - head),
-                   (cx, tip)], fill=lime)
-        ty = top + ah                            # the tray it drops into
-        d.rounded_rectangle([cx - head * 1.55, ty - shaft, cx + head * 1.55, ty],
-                            radius=shaft / 2, fill=lime)
+
+        def draw(d):
+            d.rounded_rectangle([p, p, self.sw - p, self.sh - p],
+                                radius=(self.sh - 2 * p) / 2,
+                                outline=LIME + (235,), width=self.edge_w * 2)
+            d.rounded_rectangle([cx - shaft / 2, top, cx + shaft / 2,
+                                 tip - head * 0.7], radius=shaft / 2,
+                                fill=lime)
+            d.polygon([(cx - head, tip - head), (cx + head, tip - head),
+                       (cx, tip)], fill=lime)
+            ty = top + ah                        # the tray it drops into
+            d.rounded_rectangle([cx - head * 1.55, ty - shaft,
+                                 cx + head * 1.55, ty],
+                                radius=shaft / 2, fill=lime)
+        over(body, draw)
         return body
 
     def frame_flash(self):
@@ -904,67 +1116,82 @@ class PillRenderer:
         full ice-blue ring + tick, so there's no doubt the pill caught it
         (the lime states all mean voice/drop-armed; blue means 'saved')."""
         body = self._body("flash", ICE + (235,)).copy()
-        d = ImageDraw.Draw(body)
         p = self.pad
-        d.rounded_rectangle([p, p, self.sw - p, self.sh - p],
-                            radius=(self.sh - 2 * p) / 2,
-                            outline=ICE + (235,), width=self.edge_w * 2)
         cx, cy = self.sw / 2, self.sh / 2
         u = self.sh * 0.16                       # tick glyph scale
         w = max(2.0, self.sh * 0.075)
-        ice = ICE + (255,)
-        d.line([(cx - 1.6 * u, cy), (cx - 0.4 * u, cy + u),
-                (cx + 1.7 * u, cy - 1.1 * u)], fill=ice, width=int(w),
-               joint="curve")
+
+        def draw(d):
+            d.rounded_rectangle([p, p, self.sw - p, self.sh - p],
+                                radius=(self.sh - 2 * p) / 2,
+                                outline=ICE + (235,), width=self.edge_w * 2)
+            d.line([(cx - 1.6 * u, cy), (cx - 0.4 * u, cy + u),
+                    (cx + 1.7 * u, cy - 1.1 * u)], fill=ICE + (255,),
+                   width=int(w), joint="curve")
+        over(body, draw)
         return body
 
     def frame_downloading(self, frac):
         body = self._body("dim", EDGE_DIM).copy()
-        d = ImageDraw.Draw(body)
         frac = max(0.0, min(1.0, frac))
         x0, x1 = self.bar_x0, self.sw - self.bar_x0
         th = max(2.0, self.sh * 0.05)
         ty = self.sh * 0.70
-        d.rounded_rectangle([x0, ty - th, x1, ty + th], radius=th, fill=TRACK)
         fx = x0 + max(th * 2.2, (x1 - x0) * frac)
-        d.rounded_rectangle([x0, ty - th, fx, ty + th], radius=th, fill=LIME + (255,))
-        if self._font is not None:
-            d.text((self.sw / 2, self.sh * 0.36), f"{int(frac * 100)}%",
-                   font=self._font, fill=TEXT_SOFT, anchor="mm")
+
+        def draw(d):
+            d.rounded_rectangle([x0, ty - th, x1, ty + th], radius=th,
+                                fill=TRACK)
+            d.rounded_rectangle([x0, ty - th, fx, ty + th], radius=th,
+                                fill=LIME + (255,))
+            if self._font is not None:
+                d.text((self.sw / 2, self.sh * 0.36), f"{int(frac * 100)}%",
+                       font=self._font, fill=TEXT_SOFT, anchor="mm")
+        over(body, draw)
         return body
 
-    # ---- PhotoImage wrappers ----
+    # ---- window-frame wrappers (PhotoImages, or padded RGBa if layered) ----
+
+    def _still(self, img, under_key="plain"):
+        return (self._padded(img, under_key) if self.layered
+                else self._finish(img))
+
+    def _moving(self, img, under_key="plain"):
+        return (self._padded(img, under_key) if self.layered
+                else self._finish_fast(img))
 
     def idle(self, hover, dim=False):
         key = ("idle", hover, dim)
         if key not in self._static:
-            self._static[key] = self._finish(self.frame_idle(hover, dim))
+            self._static[key] = self._still(self.frame_idle(hover, dim))
         return self._static[key]
 
     def idle_pulse(self, step):
         key = ("pulse", step)
         if key not in self._static:
-            self._static[key] = self._finish(self.frame_idle_pulse(step))
+            self._static[key] = self._still(self.frame_idle_pulse(step))
         return self._static[key]
 
     def drop(self):
         if "drop" not in self._static:
-            self._static["drop"] = self._finish(self.frame_drop())
+            self._static["drop"] = self._still(self.frame_drop(), "drop")
         return self._static["drop"]
 
     def flash(self):
         if "flash" not in self._static:
-            self._static["flash"] = self._finish(self.frame_flash())
+            self._static["flash"] = self._still(self.frame_flash(), "flash")
         return self._static["flash"]
 
     def listening(self, vals, pulse):
-        return self._finish_fast(self.frame_listening(vals, pulse))
+        step = min(3, int(max(0.0, pulse) * 4))
+        return self._moving(self.frame_listening(vals, pulse),
+                            ("listen", step))
 
     def dots(self, phase):
-        return self._finish_fast(self.frame_dots(phase))
+        return self._moving(self.frame_dots(phase))
 
     def downloading(self, frac):
-        return self._finish_fast(self.frame_downloading(frac))
+        return self._moving(self.frame_downloading(frac))
 
 
 # ----------------------------------------------------------------------------
@@ -983,6 +1210,139 @@ MENU_RED = "#FF5C48"
 MENU_GREEN = "#B6EE3F"       # "on" is an accent state — volt, not a 2nd green
 ICE_HEX = "#56C5FF"          # Tk twin of ICE (86, 197, 255)
 GOLD_HEX = "#F4C752"         # the star on a flagged note
+
+CARD_RGB = (19, 21, 18)      # PIL twins of the card surface
+CARD_TOP_RGB = (26, 29, 25)
+CARD_MUTED = (159, 164, 152)
+SIGNAL_RED = (255, 92, 72)
+
+# toast anatomy per kind: (accent rgb, icon glyph)
+CARD_KINDS = {"saved": (ICE, "tick"), "info": (LIME, "dots"),
+              "error": (SIGNAL_RED, "bang")}
+
+
+def render_card(title=None, detail=None, kind=None, rows=None):
+    """A floating card with real elevation, drawn once in PIL: obsidian
+    surface, hairline edge, two-layer shadow, optional icon disc + title +
+    muted detail line — or gesture/action rows (the tooltip). Works on any
+    wallpaper: the shadow defines it on light, the hairline on dark."""
+    s = TK_SCALE
+    ac, glyph = CARD_KINDS.get(kind, (None, None))
+    tf = pil_font(round(14 * s))
+    df = pil_font(round(12 * s), names=("segoeui.ttf", "arial.ttf"))
+    meas = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+    def ellipsize(txt, f, w):
+        if meas.textlength(txt, font=f) <= w:
+            return txt
+        while txt and meas.textlength(txt + "…", font=f) > w:
+            txt = txt[:-1]
+        return txt + "…"
+
+    pad_in = round(14 * s)                     # card inner padding
+    icon_w = round(26 * s) if glyph else 0
+    icon_gap = round(10 * s) if glyph else 0
+    max_text = round(460 * s)
+    if rows:
+        lf_, rf_ = tf, df
+        lw = max(meas.textlength(a, font=lf_) for a, _ in rows)
+        rw = max(meas.textlength(b, font=rf_) for _, b in rows)
+        gap = round(16 * s)
+        cw = int(pad_in * 2 + lw + gap + rw)
+        row_h = round(21 * s)
+        ch = int(pad_in * 2 + row_h * len(rows) - round(4 * s))
+    else:
+        title = ellipsize(title or "", tf, max_text)
+        tw = meas.textlength(title, font=tf)
+        if detail:
+            detail = ellipsize(detail, df, max_text)
+            tw = max(tw, meas.textlength(detail, font=df))
+        cw = int(pad_in + icon_w + icon_gap + tw + pad_in)
+        ch = round((52 if detail else 40) * s)
+    shadow_pad = round(16 * s)                 # window margin for the shadow
+    w, h = cw + 2 * shadow_pad, ch + 2 * shadow_pad
+
+    canvas = Image.new("RGBA", (w * SS, h * SS), (0, 0, 0, 0))
+    box = [shadow_pad * SS, shadow_pad * SS,
+           (shadow_pad + cw) * SS, (shadow_pad + ch) * SS]
+    rad = round(11 * s) * SS
+    for off, blur, a in ((1.5, 2.5, 60), (5, 12, 50)):   # key + ambient
+        sh = Image.new("L", canvas.size, 0)
+        ImageDraw.Draw(sh).rounded_rectangle(
+            [box[0], box[1] + off * s * SS, box[2], box[3] + off * s * SS],
+            radius=rad, fill=a)
+        sh = sh.filter(ImageFilter.GaussianBlur(blur * s * SS))
+        canvas.alpha_composite(Image.merge(
+            "RGBA", (*Image.new("RGB", sh.size, (0, 0, 0)).split(), sh)))
+    # card surface: a barely-there vertical gradient + hairline edge
+    gh, gw = box[3] - box[1], box[2] - box[0]
+    yy = np.linspace(0.0, 1.0, gh, dtype=np.float32)[:, None]
+    arr = np.empty((gh, gw, 4), np.uint8)
+    for i in range(3):
+        col = (CARD_TOP_RGB[i]
+               + (CARD_RGB[i] - CARD_TOP_RGB[i]) * yy).astype(np.uint8)
+        arr[..., i] = np.broadcast_to(col, (gh, gw))
+    arr[..., 3] = 255
+    grad = Image.fromarray(arr, "RGBA")
+    mask = Image.new("L", (gw, gh), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, gw - 1, gh - 1],
+                                           radius=rad, fill=255)
+    card = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    card.paste(grad, (box[0], box[1]), mask)
+    ix = (shadow_pad + round(12 * s)) * SS
+    iy = (shadow_pad + ch / 2) * SS
+    r = round(13 * s) * SS
+
+    def deco(o):
+        o.rounded_rectangle(box, radius=rad, outline=INK + (36,), width=SS)
+        if glyph:
+            o.ellipse([ix, iy - r, ix + 2 * r, iy + r], fill=ac + (42,))
+            cx = ix + r
+            if glyph == "tick":
+                u = 4.4 * s * SS
+                o.line([(cx - u, iy), (cx - u * 0.25, iy + u * 0.8),
+                        (cx + u * 1.15, iy - u * 0.75)], fill=ac + (255,),
+                       width=round(2 * s * SS), joint="curve")
+            elif glyph == "dots":
+                dr = 1.6 * s * SS
+                for i in (-1, 0, 1):
+                    o.ellipse([cx + i * 5 * s * SS - dr, iy - dr,
+                               cx + i * 5 * s * SS + dr, iy + dr],
+                              fill=ac + (255,))
+            else:                              # bang
+                o.line([(cx, iy - 4.5 * s * SS), (cx, iy + 1.2 * s * SS)],
+                       fill=ac + (255,), width=round(2 * s * SS))
+                br = 1.2 * s * SS
+                o.ellipse([cx - br, iy + 3.2 * s * SS,
+                           cx + br, iy + 5.6 * s * SS], fill=ac + (255,))
+    over(card, deco)
+    canvas.alpha_composite(card)
+    out = canvas.convert("RGBa").resize((w, h), Image.LANCZOS).convert("RGBA")
+
+    # text at final resolution — FreeType AA is crisp without supersampling
+    txt = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(txt)
+    if rows:
+        y = shadow_pad + pad_in - round(2 * s)
+        lx = shadow_pad + pad_in
+        rx = int(lx + lw + gap)
+        for a, b in rows:
+            d.text((lx, y), a, font=tf, fill=INK + (255,))
+            d.text((rx, y + round(1 * s)), b, font=df,
+                   fill=CARD_MUTED + (255,))
+            y += row_h
+    else:
+        tx = shadow_pad + pad_in + icon_w + icon_gap
+        if detail:
+            d.text((tx, shadow_pad + round(9 * s)), title, font=tf,
+                   fill=INK + (255,))
+            d.text((tx, shadow_pad + round(28 * s)), detail, font=df,
+                   fill=CARD_MUTED + (255,))
+        else:
+            d.text((tx, shadow_pad + ch / 2), title, font=tf,
+                   fill=INK + (255,), anchor="lm")
+    out.alpha_composite(txt)
+    return out
 
 
 class PopupMenu:
@@ -1202,6 +1562,72 @@ class PopupMenu:
 MENU_BG_RGB = (19, 21, 18)               # PIL twin of MENU_BG "#131512"
 
 
+def badge_disc(d, pad, ring_rgba, layered):
+    """The badge stone at SS: obsidian disc + ring, and (layered) a small
+    soft shadow so it floats like the pill. Caller draws content via over();
+    finish with badge_finish(). Returns (img, off) — off = pad * SS."""
+    full = (d + 2 * pad) * SS
+    off = pad * SS
+    img = Image.new("RGBA", (full, full),
+                    (0, 0, 0, 0) if layered else C_TRANSPARENT)
+    if layered:
+        sh = Image.new("L", (full, full), 0)
+        dy = d * SS * 0.10
+        ImageDraw.Draw(sh).ellipse(
+            [off + SS, off + SS + dy, full - off - SS, full - off - SS + dy],
+            fill=80)
+        sh = sh.filter(ImageFilter.GaussianBlur(d * SS * 0.10))
+        img.alpha_composite(Image.merge(
+            "RGBA", (*Image.new("RGB", (full, full), (0, 0, 0)).split(), sh)))
+    over(img, lambda o: o.ellipse(
+        [off + SS, off + SS, full - off - SS, full - off - SS],
+        fill=MENU_BG_RGB + (255,), outline=ring_rgba,
+        width=max(2, round(SS * 1.3))))
+    return img, off
+
+
+def badge_finish(img, d, pad, layered):
+    final = d + 2 * pad
+    if layered:
+        return img.convert("RGBa").resize((final, final), Image.LANCZOS)
+    return tk_photo(img.resize((final, final), Image.LANCZOS))
+
+
+def badge_window(badge, app):
+    """Shared badge window setup — layered when the pill is (real alpha),
+    chroma-key otherwise. Binds happen on win AND label so both modes hear
+    clicks (the label is only packed — and only covers — in legacy mode)."""
+    badge.app = app
+    badge.pad = round(badge.d * 0.25) if app._layered else 0
+    badge.win = tk.Toplevel(app.root, bg=TRANSPARENT_HEX)
+    badge.win.overrideredirect(True)
+    badge.win.attributes("-topmost", True)
+    badge.win.configure(cursor="hand2")
+    if not app._layered:
+        badge.win.attributes("-transparentcolor", TRANSPARENT_HEX)
+    badge.label = tk.Label(badge.win, bg=TRANSPARENT_HEX, bd=0,
+                           cursor="hand2")
+    if not app._layered:
+        badge.label.pack()
+    badge._hwnd = None
+
+
+def badge_apply(badge, frame):
+    """Show a badge frame: ULW blit (layered) or PhotoImage (legacy)."""
+    if badge.app._layered:
+        if badge._hwnd is None:
+            try:
+                badge.win.update_idletasks()
+            except Exception:
+                return
+            badge._hwnd = layered_ready(badge.win)
+        if not (badge._hwnd and layered_paint(badge._hwnd, frame)):
+            badge._hwnd = None            # not mapped yet — retry next refresh
+    else:
+        badge._photo = frame
+        badge.label.configure(image=badge._photo)
+
+
 class ShotBadge:
     """The little button that appears on the pill's shoulder the moment a
     screenshot is pinned: a dark disc with the count. Lime ring while
@@ -1209,17 +1635,11 @@ class ShotBadge:
     shelf has been opened. Click = open / close the shelf."""
 
     def __init__(self, app):
-        self.app = app
         self.d = max(20, round(app.height * 0.74))
-        self.win = tk.Toplevel(app.root, bg=TRANSPARENT_HEX)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
-        self.win.attributes("-transparentcolor", TRANSPARENT_HEX)
-        self.label = tk.Label(self.win, bg=TRANSPARENT_HEX, bd=0,
-                              cursor="hand2")
-        self.label.pack()
-        for seq in ("<ButtonRelease-1>", "<ButtonRelease-3>"):
-            self.label.bind(seq, lambda e: app.toggle_shots_window())
+        badge_window(self, app)
+        for w in (self.win, self.label):
+            for seq in ("<ButtonRelease-1>", "<ButtonRelease-3>"):
+                w.bind(seq, lambda e: app.toggle_shots_window())
         self._frames = {}
         self._photo = None
         self._font = None
@@ -1233,31 +1653,32 @@ class ShotBadge:
         if key in self._frames:
             return self._frames[key]
         s = self.d * SS
-        img = Image.new("RGBA", (s, s), C_TRANSPARENT)
-        d = ImageDraw.Draw(img)
-        ring = LIME + (235,) if fresh else INK + (64,)
-        d.ellipse([SS, SS, s - SS, s - SS], fill=MENU_BG_RGB + (255,),
-                  outline=ring, width=max(2, round(SS * 1.3)))
+        img, off = badge_disc(self.d, self.pad,
+                              LIME + (235,) if fresh else INK + (64,),
+                              self.app._layered)
         txt = "9+" if count > 9 else str(count)
         if self._font is None:
             self._font = pil_font(s * 0.42, names=(
                 "CascadiaMono.ttf", "CascadiaCode.ttf", "consola.ttf",
                 "seguisb.ttf", "segoeui.ttf"))
         fill = LIME + (255,) if fresh else INK + (190,)
-        d.text((s / 2, s / 2 + SS * 0.3), txt, font=self._font,
-               fill=fill, anchor="mm")
-        ph = tk_photo(img.resize((self.d, self.d), Image.LANCZOS))
+        over(img, lambda o: o.text((off + s / 2, off + s / 2 + SS * 0.3),
+                                   txt, font=self._font, fill=fill,
+                                   anchor="mm"))
+        ph = badge_finish(img, self.d, self.pad, self.app._layered)
         self._frames[key] = ph
         return ph
 
     def place(self):
         """Sit on the pill's top-right shoulder, wherever the pill goes."""
         r = self.app.root
-        x = r.winfo_x() + self.app.width - round(self.d * 0.60)
-        y = r.winfo_y() - round(self.d * 0.42)
-        x = max(0, min(x, r.winfo_screenwidth() - self.d))
-        y = max(0, min(y, r.winfo_screenheight() - self.d))
-        self.win.geometry(f"{self.d}x{self.d}+{x}+{y}")
+        bx, by, bw, bh = self.app.pill_rect()
+        size = self.d + 2 * self.pad
+        x = bx + bw - round(self.d * 0.60) - self.pad
+        y = by - round(self.d * 0.42) - self.pad
+        x = max(0, min(x, r.winfo_screenwidth() - size))
+        y = max(0, min(y, r.winfo_screenheight() - size))
+        self.win.geometry(f"{size}x{size}+{x}+{y}")
 
     def hide(self):
         if self.visible:
@@ -1271,12 +1692,12 @@ class ShotBadge:
                 self.win.withdraw()
                 self.visible = False
             return
-        self._photo = self._frame(count, self.app.shots_fresh)
-        self.label.configure(image=self._photo)
+        frame = self._frame(count, self.app.shots_fresh)
         self.place()
         if not self.visible:
             self.win.deiconify()
             self.visible = True
+        badge_apply(self, frame)
         self.win.lift()
 
 
@@ -1450,10 +1871,11 @@ class ShotsWindow:
                 lab.configure(image=copied)
                 lab.after(450, lambda: lab.configure(image=normal))
                 self.app.show_toast(
-                    "Copied — Ctrl+V pastes the image (or the file)", 2200)
+                    "Copied — Ctrl+V pastes the image (or the file)", 2200,
+                    kind="saved")
             else:
                 self.app.show_toast("Couldn't copy that — clipboard busy",
-                                    2200)
+                                    2200, kind="error")
 
         lab.bind("<Enter>", on_enter)
         lab.bind("<Leave>", on_leave)
@@ -1490,10 +1912,11 @@ class ShotsWindow:
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         r = self.app.root
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        x = r.winfo_x() + self.app.width - w        # right edges aligned
-        y = r.winfo_y() - h - 10                    # prefer above the pill
+        bx, by, bw, bh = self.app.pill_rect()
+        x = bx + bw - w                             # right edges aligned
+        y = by - h - 10                             # prefer above the pill
         if y < 8:
-            y = r.winfo_y() + self.app.height + 10
+            y = by + bh + 10
         x = max(8, min(x, sw - w - 8))
         y = max(8, min(y, sh - h - 8))
         self.win.geometry(f"+{x}+{y}")
@@ -1547,19 +1970,13 @@ class CalBadge:
     otherwise. Click = open / close the agenda dropdown."""
 
     def __init__(self, app):
-        self.app = app
         self.d = max(20, round(app.height * 0.74))
-        self.win = tk.Toplevel(app.root, bg=TRANSPARENT_HEX)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
-        self.win.attributes("-transparentcolor", TRANSPARENT_HEX)
-        self.label = tk.Label(self.win, bg=TRANSPARENT_HEX, bd=0,
-                              cursor="hand2")
-        self.label.pack()
-        self.label.bind("<ButtonRelease-1>",
-                        lambda e: app.toggle_cal_window())
-        self.label.bind("<ButtonRelease-3>",     # right-click = quiet today
-                        lambda e: app.hide_cal_badge_today())
+        badge_window(self, app)
+        for w in (self.win, self.label):
+            w.bind("<ButtonRelease-1>",
+                   lambda e: app.toggle_cal_window())
+            w.bind("<ButtonRelease-3>",          # right-click = quiet today
+                   lambda e: app.hide_cal_badge_today())
         self._frames = {}
         self._photo = None
         self._font = None
@@ -1573,31 +1990,32 @@ class CalBadge:
         if key in self._frames:
             return self._frames[key]
         s = self.d * SS
-        img = Image.new("RGBA", (s, s), C_TRANSPARENT)
-        d = ImageDraw.Draw(img)
-        ring = ICE + (235,) if soon else INK + (64,)
-        d.ellipse([SS, SS, s - SS, s - SS], fill=MENU_BG_RGB + (255,),
-                  outline=ring, width=max(2, round(SS * 1.3)))
+        img, off = badge_disc(self.d, self.pad,
+                              ICE + (235,) if soon else INK + (64,),
+                              self.app._layered)
         txt = "9+" if count > 9 else str(count)
         if self._font is None:
             self._font = pil_font(s * 0.42, names=(
                 "CascadiaMono.ttf", "CascadiaCode.ttf", "consola.ttf",
                 "seguisb.ttf", "segoeui.ttf"))
         fill = ICE + (255,) if soon else INK + (190,)
-        d.text((s / 2, s / 2 + SS * 0.3), txt, font=self._font,
-               fill=fill, anchor="mm")
-        ph = tk_photo(img.resize((self.d, self.d), Image.LANCZOS))
+        over(img, lambda o: o.text((off + s / 2, off + s / 2 + SS * 0.3),
+                                   txt, font=self._font, fill=fill,
+                                   anchor="mm"))
+        ph = badge_finish(img, self.d, self.pad, self.app._layered)
         self._frames[key] = ph
         return ph
 
     def place(self):
         """Sit on the pill's top-left shoulder, wherever the pill goes."""
         r = self.app.root
-        x = r.winfo_x() - round(self.d * 0.40)
-        y = r.winfo_y() - round(self.d * 0.42)
-        x = max(0, min(x, r.winfo_screenwidth() - self.d))
-        y = max(0, min(y, r.winfo_screenheight() - self.d))
-        self.win.geometry(f"{self.d}x{self.d}+{x}+{y}")
+        bx, by, bw, bh = self.app.pill_rect()
+        size = self.d + 2 * self.pad
+        x = bx - round(self.d * 0.40) - self.pad
+        y = by - round(self.d * 0.42) - self.pad
+        x = max(0, min(x, r.winfo_screenwidth() - size))
+        y = max(0, min(y, r.winfo_screenheight() - size))
+        self.win.geometry(f"{size}x{size}+{x}+{y}")
 
     def hide(self):
         if self.visible:
@@ -1619,12 +2037,12 @@ class CalBadge:
             self.hide()
             return
         soon = bool(self.app._cal_soon_events())
-        self._photo = self._frame(len(agenda), soon)
-        self.label.configure(image=self._photo)
+        frame = self._frame(len(agenda), soon)
         self.place()
         if not self.visible:
             self.win.deiconify()
             self.visible = True
+        badge_apply(self, frame)
         self.win.lift()
 
 
@@ -1760,10 +2178,11 @@ class CalWindow:
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         r = self.app.root
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        x = r.winfo_x()                             # left edges aligned
-        y = r.winfo_y() - h - 10                    # prefer above the pill
+        bx, by, bw, bh = self.app.pill_rect()
+        x = bx                                      # left edges aligned
+        y = by - h - 10                             # prefer above the pill
         if y < 8:
-            y = r.winfo_y() + self.app.height + 10
+            y = by + bh + 10
         x = max(8, min(x, sw - w - 8))
         y = max(8, min(y, sh - h - 8))
         self.win.geometry(f"+{x}+{y}")
@@ -1813,17 +2232,11 @@ class NotesBadge:
     once the list has been opened. Click = open / close the recent list."""
 
     def __init__(self, app):
-        self.app = app
         self.d = max(20, round(app.height * 0.74))
-        self.win = tk.Toplevel(app.root, bg=TRANSPARENT_HEX)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
-        self.win.attributes("-transparentcolor", TRANSPARENT_HEX)
-        self.label = tk.Label(self.win, bg=TRANSPARENT_HEX, bd=0,
-                              cursor="hand2")
-        self.label.pack()
-        for seq in ("<ButtonRelease-1>", "<ButtonRelease-3>"):
-            self.label.bind(seq, lambda e: app.toggle_notes_window())
+        badge_window(self, app)
+        for w in (self.win, self.label):
+            for seq in ("<ButtonRelease-1>", "<ButtonRelease-3>"):
+                w.bind(seq, lambda e: app.toggle_notes_window())
         self._frames = {}
         self._photo = None
         self.visible = False
@@ -1837,30 +2250,34 @@ class NotesBadge:
         if key in self._frames:
             return self._frames[key]
         s = self.d * SS
-        img = Image.new("RGBA", (s, s), C_TRANSPARENT)
-        d = ImageDraw.Draw(img)
-        ring = LIME + (235,) if fresh else INK + (64,)
-        d.ellipse([SS, SS, s - SS, s - SS], fill=MENU_BG_RGB + (255,),
-                  outline=ring, width=max(2, round(SS * 1.3)))
+        img, off = badge_disc(self.d, self.pad,
+                              LIME + (235,) if fresh else INK + (64,),
+                              self.app._layered)
         fill = LIME + (255,) if fresh else INK + (190,)
         lw = max(2, round(SS * 1.1))
+
         # three text lines, the last one short — a "note" glyph, the count
         # discs' quiet cousin
-        for i, y in enumerate((0.40, 0.52, 0.64)):
-            xr = s * 0.56 if i == 2 else s * 0.66
-            d.line([(s * 0.34, s * y), (xr, s * y)], fill=fill, width=lw)
-        ph = tk_photo(img.resize((self.d, self.d), Image.LANCZOS))
+        def glyph(o):
+            for i, y in enumerate((0.40, 0.52, 0.64)):
+                xr = s * 0.56 if i == 2 else s * 0.66
+                o.line([(off + s * 0.34, off + s * y),
+                        (off + xr, off + s * y)], fill=fill, width=lw)
+        over(img, glyph)
+        ph = badge_finish(img, self.d, self.pad, self.app._layered)
         self._frames[key] = ph
         return ph
 
     def place(self):
         """Sit on the pill's bottom-right corner, wherever the pill goes."""
         r = self.app.root
-        x = r.winfo_x() + self.app.width - round(self.d * 0.60)
-        y = r.winfo_y() + self.app.height - round(self.d * 0.42)
-        x = max(0, min(x, r.winfo_screenwidth() - self.d))
-        y = max(0, min(y, r.winfo_screenheight() - self.d))
-        self.win.geometry(f"{self.d}x{self.d}+{x}+{y}")
+        bx, by, bw, bh = self.app.pill_rect()
+        size = self.d + 2 * self.pad
+        x = bx + bw - round(self.d * 0.60) - self.pad
+        y = by + bh - round(self.d * 0.42) - self.pad
+        x = max(0, min(x, r.winfo_screenwidth() - size))
+        y = max(0, min(y, r.winfo_screenheight() - size))
+        self.win.geometry(f"{size}x{size}+{x}+{y}")
 
     def hide(self):
         if self.visible:
@@ -1875,12 +2292,12 @@ class NotesBadge:
                 and get_store().recent(1)):
             self.hide()
             return
-        self._photo = self._frame(self.app.notes_fresh)
-        self.label.configure(image=self._photo)
+        frame = self._frame(self.app.notes_fresh)
         self.place()
         if not self.visible:
             self.win.deiconify()
             self.visible = True
+        badge_apply(self, frame)
         self.win.lift()
 
     def pulse(self, times=6):
@@ -1896,11 +2313,9 @@ class NotesBadge:
         if not self.visible:
             return
         if self._pulse_left <= 0:
-            self._photo = self._frame(self.app.notes_fresh)
-            self.label.configure(image=self._photo)
+            badge_apply(self, self._frame(self.app.notes_fresh))
             return
-        self._photo = self._frame(self._pulse_left % 2 == 0)
-        self.label.configure(image=self._photo)
+        badge_apply(self, self._frame(self._pulse_left % 2 == 0))
         self._pulse_left -= 1
         try:
             self.win.after(150, self._blink)
@@ -2000,7 +2415,8 @@ class NotesWindow:
             return
         pyperclip.copy(note["body"])
         self.app.note_own_clipboard()         # our own copy — not a screenshot
-        self.app.show_toast(f"Copied — {note['title'] or '(untitled)'}", 2200)
+        self.app.show_toast(f"Copied — {note['title'] or '(untitled)'}",
+                            2200, kind="saved")
 
     # ---- window plumbing (same patterns as CalWindow) ----
 
@@ -2020,10 +2436,11 @@ class NotesWindow:
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         r = self.app.root
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        x = r.winfo_x() + self.app.width - w        # right edges aligned
-        y = r.winfo_y() + self.app.height + 10      # prefer below the pill
+        bx, by, bw, bh = self.app.pill_rect()
+        x = bx + bw - w                             # right edges aligned
+        y = by + bh + 10                            # prefer below the pill
         if y + h > sh - 8:                          # no room below -> above
-            y = r.winfo_y() - h - 10
+            y = by - h - 10
         x = max(8, min(x, sw - w - 8))
         y = max(8, min(y, sh - h - 8))
         self.win.geometry(f"+{x}+{y}")
@@ -2087,20 +2504,23 @@ class DictationApp:
         self.root.title("DictationMic")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", TRANSPARENT_HEX)
-        self.root.configure(bg=TRANSPARENT_HEX)
+        # per-pixel alpha by default (clean edges + shadow on any wallpaper);
+        # confirmed with a real blit further down, chroma-key if it fails
+        self._layered = bool(self.settings.get("layered_ui", True))
+        self.renderer = PillRenderer(self.width, self.height,
+                                     layered=self._layered)
 
+        # settings x,y = the pill BODY's top-left (the window itself may be
+        # larger — it also holds the shadow), so old positions carry over
         x, y = self.settings.get("x"), self.settings.get("y")
         if x is None or y is None:
             x = (self.root.winfo_screenwidth() - self.width) // 2
             y = self.root.winfo_screenheight() - self.height - 100
         x = max(0, min(int(x), self.root.winfo_screenwidth() - self.width))
         y = max(0, min(int(y), self.root.winfo_screenheight() - self.height))
-        self.root.geometry(f"{self.width}x{self.height}+{x}+{y}")
-
-        self.renderer = PillRenderer(self.width, self.height)
-        self.label = tk.Label(self.root, bg=TRANSPARENT_HEX, bd=0, cursor="hand2")
-        self.label.pack()
+        self.label = tk.Label(self.root, bg=TRANSPARENT_HEX, bd=0,
+                              cursor="hand2")
+        self._apply_pill_mode(x, y)
         self._photo = None
 
         self.hover = False
@@ -2124,13 +2544,17 @@ class DictationApp:
         self._stop_when_ready = False
         self._suppress_removers = []   # per-key hooks that swallow OS side-effects
 
-        self.label.bind("<ButtonPress-1>", self.on_press)
-        self.label.bind("<B1-Motion>", self.on_motion)
-        self.label.bind("<ButtonRelease-1>", self.on_release)
-        self.label.bind("<ButtonRelease-2>", lambda e: self.save_clipboard_note())
-        self.label.bind("<ButtonRelease-3>", self.on_right_click)
-        self.label.bind("<Enter>", self.on_enter)
-        self.label.bind("<Leave>", self.on_leave)
+        # events on BOTH windows: legacy mode the packed label covers the
+        # window; layered mode the (unpacked) label is 0-sized and the root
+        # itself takes the pointer
+        for w in (self.root, self.label):
+            w.bind("<ButtonPress-1>", self.on_press)
+            w.bind("<B1-Motion>", self.on_motion)
+            w.bind("<ButtonRelease-1>", self.on_release)
+            w.bind("<ButtonRelease-2>", lambda e: self.save_clipboard_note())
+            w.bind("<ButtonRelease-3>", self.on_right_click)
+            w.bind("<Enter>", self.on_enter)
+            w.bind("<Leave>", self.on_leave)
         self._install_drop_targets()
 
         # voice commands ("open claude in a terminal" runs it, not types it)
@@ -2186,6 +2610,20 @@ class DictationApp:
         # the pointer against the pill without touching Tk (not thread-safe)
         self._hwnd = (ctypes.windll.user32.GetParent(self.root.winfo_id())
                       or self.root.winfo_id())
+        # prove per-pixel alpha with a real blit before trusting it — the
+        # wrapper hwnd only exists once the window has been mapped
+        if self._layered:
+            self.root.update()
+            hw = layered_ready(self.root)
+            if hw and layered_paint(hw, self.renderer.idle(False, dim=True)):
+                self._hwnd = hw
+            else:
+                dbg("layered pill unavailable — chroma-key fallback")
+                self._layered = False
+                self.renderer = PillRenderer(self.width, self.height)
+                self._apply_pill_mode(x, y)
+                self._hwnd = (ctypes.windll.user32.GetParent(
+                    self.root.winfo_id()) or self.root.winfo_id())
         self._paste_t = 0.0
 
         self._badge = ShotBadge(self)
@@ -2728,7 +3166,8 @@ class DictationApp:
             if self.transcriber.error:
                 dbg(f"model load error: {self.transcriber.error}")
                 self.show_toast("The speech model failed to load — "
-                                "exit and start me again", 4000)
+                                "exit and start me again", 4000,
+                                kind="error")
         elif name == "dl_done":
             self.state = LOADING
             threading.Thread(target=self._load_model, daemon=True).start()
@@ -2752,10 +3191,10 @@ class DictationApp:
             if self.state == STARTING:
                 self.state = IDLE
             self.beep(300, 120)
-            self.show_toast(f"Mic error: {payload}", 3000)
+            self.show_toast(f"Mic error: {payload}", 3000, kind="error")
         elif name == "wake":
             self.beep(920, 90)
-            self.show_toast("🎯 Hey Mike — what shall I open?", 4000)
+            self.show_toast("Hey Mike — what shall I open?", 4000)
         elif name == "flash":
             self.flash_until = time.time() + 1.1
         elif name == "shot":
@@ -2786,7 +3225,13 @@ class DictationApp:
             if self._notes_win is not None:
                 self._notes_win.rebuild()
         elif name == "toast":
-            self.show_toast(payload, 3500)
+            if isinstance(payload, dict):     # {"text", "detail", "kind", "ms"}
+                self.show_toast(payload.get("text", ""),
+                                payload.get("ms", 3500),
+                                kind=payload.get("kind", "info"),
+                                detail=payload.get("detail"))
+            else:
+                self.show_toast(payload, 3500)
         elif name == "sync_status":
             if payload.get("sync") == "needs-signin":
                 self.show_toast("Phone sync needs a fresh sign-in — "
@@ -2807,7 +3252,10 @@ class DictationApp:
                 self.state = IDLE
                 if self.settings["mode"] == "clipboard" and self.session_text:
                     full = " ".join(self.session_text)
-                    self.show_toast("Copied: " + (full[:70] + "…" if len(full) > 70 else full), 3000)
+                    self.show_toast("Copied to the clipboard", 3000,
+                                    kind="saved",
+                                    detail=(full[:70] + "…"
+                                            if len(full) > 70 else full))
                 elif not self.session_text:
                     self.show_toast("Didn't catch anything", 1800)
                 full = " ".join(self.session_text).strip()
@@ -2877,6 +3325,28 @@ class DictationApp:
 
     # ---------------- pointer ----------------
 
+    def _apply_pill_mode(self, x, y):
+        """Window chrome for the render mode. Layered: padded window (the
+        ULW bitmap IS the window, shadow included), nothing packed.
+        Chroma-key: transparentcolor + packed label, body-sized window."""
+        r = self.renderer
+        if self._layered:
+            self.root.configure(bg="black", cursor="hand2")
+            self.root.geometry(f"{r.win_w}x{r.win_h}"
+                               f"+{x - r.pad_x}+{y - r.pad_t}")
+        else:
+            self.root.attributes("-transparentcolor", TRANSPARENT_HEX)
+            self.root.configure(bg=TRANSPARENT_HEX, cursor="hand2")
+            self.label.pack()
+            self.root.geometry(f"{self.width}x{self.height}+{x}+{y}")
+
+    def pill_rect(self):
+        """The pill BODY's screen rect (x, y, w, h) — badges, cards and
+        toasts anchor to the capsule, not to the shadow padding around it."""
+        r = self.renderer
+        return (self.root.winfo_x() + r.pad_x,
+                self.root.winfo_y() + r.pad_t, self.width, self.height)
+
     def on_enter(self, e):
         self.hover = True
         self._tooltip_job = self.root.after(650, self.show_tooltip)
@@ -2919,8 +3389,9 @@ class DictationApp:
 
     def on_release(self, e):
         if self.dragging:
-            self.settings["x"] = self.root.winfo_x()
-            self.settings["y"] = self.root.winfo_y()
+            bx, by, _, _ = self.pill_rect()   # persist the BODY's corner
+            self.settings["x"] = bx
+            self.settings["y"] = by
             save_settings(self.settings)
         elif e.state & 0x0005:      # Shift (0x1) or Ctrl (0x4) held — open the
             if self._mod_down:      # menu; laptop touchpads make right-click hard
@@ -2946,14 +3417,14 @@ class DictationApp:
                 self.root.attributes("-topmost", True)
                 make_non_activating(self.root)
                 self.root.lift()
-            except Exception:
+                self._frame_key = None    # repaint the layered surface after
+            except Exception:             # the unmap/remap round-trip
                 pass
             self._badge.refresh()
             self._cal_badge.refresh()
             self._notes_badge.refresh()
 
-        r = self.root
-        anchor = (r.winfo_x(), r.winfo_y(), self.width, self.height)
+        anchor = self.pill_rect()
         self._menu = PopupMenu(self.root, self._menu_items(), on_close=closed)
         # hide the pill BEFORE the card takes focus — withdrawing after
         # would fire the card's FocusOut and close it on arrival
@@ -3008,14 +3479,16 @@ class DictationApp:
         return getattr(event, "action", "copy")
 
     def _saved_toast(self, title, real_file=False):
-        suffix = " — syncing to your phone" if (
-            self.settings.get("sync_enabled")
-            and self.settings.get("sync_refresh_token")) else ""
+        bits = [title[:44] + ("…" if len(title) > 44 else "")]
         if real_file:
-            suffix = " (file kept — see My files)" + suffix
-        preview = title[:44] + ("…" if len(title) > 44 else "")
+            bits.append("file kept in My files")
+        if (self.settings.get("sync_enabled")
+                and self.settings.get("sync_refresh_token")):
+            bits.append("syncing to your phone")
         self.events.put(("flash", None))   # blue ring: the pill caught it
-        self.events.put(("toast", f"Saved to notes: {preview}{suffix}"))
+        self.events.put(("toast", {"text": "Saved to notes",
+                                   "detail": " · ".join(bits),
+                                   "kind": "saved", "ms": 2600}))
 
     def _ingest_paths(self, paths):
         import dropnotes
@@ -3037,10 +3510,12 @@ class DictationApp:
                 saved_title = title
                 real = real or body.startswith("data:")
             except ValueError as ex:
-                self.events.put(("toast", str(ex)))
+                self.events.put(("toast", {"text": str(ex),
+                                           "kind": "error"}))
             except Exception:
-                self.events.put(("toast", "Couldn't save "
-                                          + os.path.basename(str(p))))
+                self.events.put(("toast", {"text": "Couldn't save "
+                                           + os.path.basename(str(p)),
+                                           "kind": "error"}))
         if saved == 1:
             self._saved_toast(saved_title, real_file=real)
         elif saved:
@@ -3053,9 +3528,10 @@ class DictationApp:
             get_store().create(title, body)
             self._saved_toast(title)
         except ValueError as ex:
-            self.events.put(("toast", str(ex)))
+            self.events.put(("toast", {"text": str(ex), "kind": "error"}))
         except Exception:
-            self.events.put(("toast", "Couldn't save that"))
+            self.events.put(("toast", {"text": "Couldn't save that",
+                                       "kind": "error"}))
 
     def _pointer_over_pill(self):
         """Win32-only hit test (safe from the keyboard-hook thread)."""
@@ -3068,8 +3544,10 @@ class DictationApp:
                     and ctypes.windll.user32.GetWindowRect(
                         self._hwnd, ctypes.byref(rect))):
                 return False
-            return (rect.left <= pt.x < rect.right
-                    and rect.top <= pt.y < rect.bottom)
+            # inset the shadow padding — only the capsule itself counts
+            r = self.renderer
+            return (rect.left + r.pad_x <= pt.x < rect.right - r.pad_x
+                    and rect.top + r.pad_t <= pt.y < rect.bottom - r.pad_b)
         except Exception:
             return False
 
@@ -3098,10 +3576,13 @@ class DictationApp:
                     self._ingest_paths([p for p in clip if isinstance(p, str)])
                     return
             except ValueError as ex:
-                self.events.put(("toast", str(ex)))
+                self.events.put(("toast", {"text": str(ex),
+                                           "kind": "error"}))
                 return
             except Exception as ex:
-                self.events.put(("toast", f"Couldn't save that image — {ex}"))
+                self.events.put(("toast",
+                                 {"text": f"Couldn't save that image — {ex}",
+                                  "kind": "error"}))
                 return
             try:
                 text = (pyperclip.paste() or "").strip()
@@ -3116,7 +3597,8 @@ class DictationApp:
                 trimmed = " ".join(text.split())
                 self._saved_toast(trimmed)
             except Exception as ex:
-                self.events.put(("toast", f"Couldn't save that — {ex}"))
+                self.events.put(("toast", {"text": f"Couldn't save that — {ex}",
+                                           "kind": "error"}))
         threading.Thread(target=work, daemon=True).start()
 
     # ---------------- screenshot shelf ----------------
@@ -3479,9 +3961,11 @@ class DictationApp:
                         "allDay": bool(when["all_day"]),
                         "addedAt": int(time.time() * 1000),
                         "bodyHash": e.get("hash") if e else None})
-                self.events.put(("toast", "Added to your calendar — "
-                                 + self._fmt_event_time(start_ms,
-                                                        when["all_day"])))
+                self.events.put(("toast",
+                                 {"text": "Added to your calendar",
+                                  "detail": self._fmt_event_time(
+                                      start_ms, when["all_day"]),
+                                  "kind": "saved"}))
             except Exception as ex:
                 dbg(f"calendar worker: {ex!r}")
             finally:
@@ -3849,7 +4333,8 @@ class DictationApp:
         import webbrowser
         url = self._notes_url()
         if url is None:
-            self.show_toast("Couldn't open your notes — try again", 3000)
+            self.show_toast("Couldn't open your notes — try again", 3000,
+                            kind="error")
             return
         webbrowser.open(url)
 
@@ -3883,7 +4368,8 @@ class DictationApp:
         phone sync is on, the token-gated localhost viewer otherwise."""
         url = self._notes_url()
         if url is None:
-            self.show_toast("Couldn't open the app — try again", 3000)
+            self.show_toast("Couldn't open the app — try again", 3000,
+                            kind="error")
             return
         edge = self._edge_path()
         if edge:
@@ -4077,8 +4563,9 @@ class DictationApp:
             keyboard.unhook_all()
         except Exception:
             pass
-        self.settings["x"] = self.root.winfo_x()
-        self.settings["y"] = self.root.winfo_y()
+        bx, by, _, _ = self.pill_rect()       # persist the BODY's corner
+        self.settings["x"] = bx
+        self.settings["y"] = by
         save_settings(self.settings)
         self.root.destroy()
 
@@ -4106,6 +4593,7 @@ class DictationApp:
                              daemon=True).start()
 
     def _popup(self, text, font=None):
+        """Legacy card: an opaque Tk label (chroma-key fallback only)."""
         t = tk.Toplevel(self.root, bg=MENU_BG)
         t.overrideredirect(True)
         try:
@@ -4119,10 +4607,11 @@ class DictationApp:
                  font=font or (UI_FAMILY, 10),
                  padx=14, pady=8, justify="left").pack()
         t.update_idletasks()
-        x = self.root.winfo_x() + self.width // 2 - t.winfo_width() // 2
-        y = self.root.winfo_y() - t.winfo_height() - 10
+        bx, by, bw, bh = self.pill_rect()
+        x = bx + bw // 2 - t.winfo_width() // 2
+        y = by - t.winfo_height() - 10
         if y < 0:
-            y = self.root.winfo_y() + self.height + 10
+            y = by + bh + 10
         x = max(0, min(x, self.root.winfo_screenwidth() - t.winfo_width()))
         t.geometry(f"+{x}+{y}")
         round_corners(t)
@@ -4130,13 +4619,66 @@ class DictationApp:
         make_non_activating(t)
         return t
 
-    def show_toast(self, text, ms=2400):
+    def _popup_card(self, img, title=""):
+        """Floating PIL card with real elevation, faded in over ~110ms via
+        the layered blend alpha. Click-through: a toast must never eat a
+        click that was meant for whatever is under it. None if unavailable
+        (caller falls back to the legacy label popup)."""
+        try:
+            t = tk.Toplevel(self.root)
+            t.overrideredirect(True)
+            try:
+                t.title("DM|" + title[:80])
+            except Exception:
+                pass
+            t.attributes("-topmost", True)
+            w, h = img.size
+            s = TK_SCALE
+            shadow_pad = round(16 * s)          # render_card's margin
+            bx, by, bw, bh = self.pill_rect()
+            x = bx + bw // 2 - w // 2
+            y = by - (h - shadow_pad) - round(10 * s)   # card bottom ~10 above
+            if y + shadow_pad < 0:
+                y = by + bh + round(10 * s) - shadow_pad
+            x = max(-shadow_pad,
+                    min(x, self.root.winfo_screenwidth() - w + shadow_pad))
+            t.geometry(f"{w}x{h}+{x}+{y}")
+            make_non_activating(t)
+            t.update()                          # map — the wrapper must exist
+            hwnd = layered_ready(t, click_through=True)
+            if not (hwnd and layered_paint(hwnd, img, alpha=50)):
+                t.destroy()
+                return None
+
+            def fade(i=2, steps=5):
+                try:
+                    layered_paint(hwnd, img, alpha=int(255 * i / steps))
+                    if i < steps:
+                        t.after(16, fade, i + 1)
+                except Exception:
+                    pass
+            t.after(16, fade)
+            return t
+        except Exception:
+            return None
+
+    def show_toast(self, text, ms=2400, kind="info", detail=None):
         if self.toast is not None:
             try:
                 self.toast.destroy()
             except Exception:
                 pass
-        self.toast = self._popup(text)
+            self.toast = None
+        if self._layered:
+            title = text
+            if detail is None and "\n" in text:   # old two-line callers
+                title, detail = text.split("\n", 1)
+                detail = " ".join(detail.split())
+            img = render_card(title=title, detail=detail, kind=kind)
+            self.toast = self._popup_card(img, title=title)
+        if self.toast is None:
+            self.toast = self._popup(text if detail is None
+                                     else f"{text}\n{detail}")
         ref = self.toast
 
         def _expire():
@@ -4148,20 +4690,28 @@ class DictationApp:
                 self.toast = None
         ref.after(ms, _expire)
 
+    TOOLTIP_ROWS = (
+        ("Click or tap {key}", "start / stop"),
+        ("Hold the key", "push-to-talk"),
+        ("Hold + drag", "move me"),
+        ("Drop files, text or images", "synced as notes"),
+        ("Ctrl+V over me / middle-click", "save the clipboard"),
+        ("Screenshots pin to my shoulder", "click the badge"),
+        ("Right-click or Shift+click", "menu & the full app"))
+
     def show_tooltip(self):
         if self.tooltip is not None or self.state not in (IDLE, LOADING, DOWNLOADING):
             return
         if self._menu is not None or self._shots_win is not None:
             return                 # never float help over an open card
-        self.tooltip = self._popup(
-            f"Click or tap {self.hotkey_label()} — start / stop\n"
-            "Hold the key — push-to-talk\n"
-            "Hold + drag — move me\n"
-            "Drop files, text or images on me — synced as notes\n"
-            "Ctrl+V over me (or middle-click) — save the clipboard\n"
-            "Screenshots pin to my shoulder — click the badge\n"
-            "Right-click or Shift+click — menu & the full app",
-            (UI_FAMILY, 9))
+        rows = [(a.format(key=self.hotkey_label()), b)
+                for a, b in self.TOOLTIP_ROWS]
+        if self._layered:
+            self.tooltip = self._popup_card(render_card(rows=rows),
+                                            title="help")
+        if self.tooltip is None:
+            self.tooltip = self._popup(
+                "\n".join(f"{a} — {b}" for a, b in rows), (UI_FAMILY, 9))
 
     def hide_tooltip(self):
         if self._tooltip_job:      # a pending hover timer would re-show it
@@ -4235,8 +4785,11 @@ class DictationApp:
         if key is not None and key == self._frame_key:
             return
         self._frame_key = key
-        self._photo = maker()
-        self.label.configure(image=self._photo)
+        if self._layered:
+            layered_paint(self._hwnd, maker())
+        else:
+            self._photo = maker()
+            self.label.configure(image=self._photo)
 
     def draw(self):
         r = self.renderer
