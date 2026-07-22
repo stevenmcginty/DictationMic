@@ -197,10 +197,11 @@ export class App {
 
   // ---------------- select mode (bulk delete) ----------------
 
-  _enterSelect() {
+  _enterSelect(all = false) {
     if (this.selecting) return;
     this.selecting = true;
     this.selected.clear();
+    if (all) for (const n of this._shown) this.selected.add(n.id);
     document.body.classList.add("selecting");
     this.renderList();
   }
@@ -711,6 +712,7 @@ export class App {
 
     // select mode: tick many, delete once (same armed two-tap as every delete)
     $("selectBtn").addEventListener("click", () => this._enterSelect());
+    $("selectAllNowBtn").addEventListener("click", () => this._enterSelect(true));
     $("selectCancelBtn").addEventListener("click", () => this._exitSelect());
     $("selectAllBtn").addEventListener("click", () => {
       if (this._bulkBusy) return;
