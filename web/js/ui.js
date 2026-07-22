@@ -22,6 +22,9 @@ const STAR_SVG = `<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="t
 // a small calendar page — the chip on notes that live in the calendar too
 const CAL_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 2.8v4M16 2.8v4"/></svg>`;
 
+// the tick inside a select-mode ring
+const TICK_SVG = `<svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true"><path d="M4.5 12.5 10 18 19.5 6.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
 export class App {
   constructor(adapter, opts = {}) {
     this.adapter = adapter;
@@ -31,6 +34,10 @@ export class App {
     this.activeId = null;
     this._saveBody = debounce(() => this._commitBody(), 700);
     this._disarmTimer = null;
+    this.selecting = false;        // select mode: tap rows to tick them
+    this.selected = new Set();     // ids ticked for bulk delete
+    this._shown = [];              // what the list is showing (filter applied)
+    this._bulkBusy = false;
   }
 
   async start() {
@@ -88,6 +95,7 @@ export class App {
     const shown = q
       ? this.notes.filter(n => searchText(n).toLowerCase().includes(q))
       : this.notes;
+    this._shown = shown;
     const pending = this.adapter.pendingIds();
 
     list.textContent = "";
@@ -104,6 +112,7 @@ export class App {
       const li = document.createElement("li");
       li.className = "note-row" + (n.id === this.activeId ? " active" : "")
         + (n.starred ? " starred" : "")
+        + (this.selecting && this.selected.has(n.id) ? " checked" : "")
         + (!n.calendar ? ""
            : n.calendar.status === "ok" ? " calendared" : " cal-failed");
       li.dataset.id = n.id;
@@ -114,6 +123,12 @@ export class App {
 
       const top = document.createElement("div");
       top.className = "note-row-top";
+      if (this.selecting) {
+        const check = document.createElement("span");
+        check.className = "row-check";
+        check.innerHTML = TICK_SVG;
+        top.append(check);
+      }
       const title = document.createElement("span");
       title.className = "note-row-title";
       title.textContent = n.title;
@@ -177,6 +192,91 @@ export class App {
     const parts = [`${this.notes.length} note${this.notes.length === 1 ? "" : "s"}`];
     if (pending.size) parts.push(`${pending.size} queued`);
     $("noteCount").textContent = parts.join(" · ");
+    this._syncSelectUI();
+  }
+
+  // ---------------- select mode (bulk delete) ----------------
+
+  _enterSelect() {
+    if (this.selecting) return;
+    this.selecting = true;
+    this.selected.clear();
+    document.body.classList.add("selecting");
+    this.renderList();
+  }
+
+  _exitSelect() {
+    if (!this.selecting || this._bulkBusy) return;
+    this.selecting = false;
+    this.selected.clear();
+    this._disarmBulk();
+    document.body.classList.remove("selecting");
+    this.renderList();
+  }
+
+  _toggleSelect(id) {
+    if (this._bulkBusy) return;
+    if (this.selected.has(id)) this.selected.delete(id);
+    else this.selected.add(id);
+    const li = [...$("noteList").children].find(el => el.dataset?.id === id);
+    li?.classList.toggle("checked", this.selected.has(id));
+    this._disarmBulk();
+    this._syncSelectUI();
+  }
+
+  _syncSelectUI() {
+    if (!this.selecting) return;
+    const n = this.selected.size;
+    $("selCount").textContent = `${n} selected`;
+    const all = this._shown.length
+      && this._shown.every(x => this.selected.has(x.id));
+    $("selectAllBtn").textContent = all ? "None" : "All";
+    const btn = $("deleteSelBtn");
+    if (!this._bulkBusy && !btn.classList.contains("armed")) {
+      btn.textContent = n ? `Delete ${n}` : "Delete";
+      btn.disabled = !n;
+    }
+  }
+
+  _disarmBulk() {
+    clearTimeout(this._bulkTimer);
+    const btn = $("deleteSelBtn");
+    if (this._bulkBusy || !btn.classList.contains("armed")) return;
+    btn.classList.remove("armed");
+    this._syncSelectUI();
+  }
+
+  // Delete every ticked note, one adapter.remove() at a time — each one is
+  // the same op a row's × fires, so sync/undelete rules are identical. Keep
+  // going past a failure; report the score at the end.
+  async _deleteSelected() {
+    const ids = [...this.selected];
+    if (!ids.length || this._bulkBusy) return;
+    this._bulkBusy = true;
+    const btn = $("deleteSelBtn");
+    btn.classList.remove("armed");
+    btn.disabled = true;
+    let ok = 0;
+    for (const id of ids) {
+      btn.textContent = `Deleting ${ok + 1}/${ids.length}…`;
+      try {
+        await this.adapter.remove(id);
+        this.selected.delete(id);
+        this.notes = this.notes.filter(n => n.id !== id);
+        if (this.activeId === id) location.hash = "#/";
+        ok++;
+      } catch { /* counted below */ }
+    }
+    this._bulkBusy = false;
+    const failed = ids.length - ok;
+    if (failed) {
+      this._syncSelectUI();      // the survivors stay ticked for a retry
+      this.renderList();
+      this.toast(`Deleted ${ok} — ${failed} wouldn't delete`);
+    } else {
+      this._exitSelect();
+      this.toast(`Deleted ${ok} note${ok === 1 ? "" : "s"}`);
+    }
   }
 
   // The event chip on a calendared row. The note keeps its normal place in
@@ -265,6 +365,12 @@ export class App {
 
   _onRemote(notes) {
     this.notes = notes;
+    if (this.selecting) {          // drop ticks on notes deleted elsewhere
+      const live = new Set(notes.map(n => n.id));
+      for (const id of [...this.selected]) {
+        if (!live.has(id)) this.selected.delete(id);
+      }
+    }
     this.renderList();
     if (this.activeId) {
       const n = this.notes.find(n => n.id === this.activeId);
@@ -557,6 +663,11 @@ export class App {
   _bind() {
     // list interactions (the row × arms first — a stray tap can't delete)
     $("noteList").addEventListener("click", e => {
+      if (this.selecting) {        // in select mode a tap ticks, never opens
+        const row = e.target.closest(".note-row");
+        if (row) this._toggleSelect(row.dataset.id);
+        return;
+      }
       const star = e.target.closest(".row-star");
       if (star) {
         e.stopPropagation();
@@ -593,8 +704,39 @@ export class App {
       const li = e.target.closest(".note-row");
       if (li && (e.key === "Enter" || e.key === " ")) {
         e.preventDefault();
-        location.hash = `#/note/${li.dataset.id}`;
+        if (this.selecting) this._toggleSelect(li.dataset.id);
+        else location.hash = `#/note/${li.dataset.id}`;
       }
+    });
+
+    // select mode: tick many, delete once (same armed two-tap as every delete)
+    $("selectBtn").addEventListener("click", () => this._enterSelect());
+    $("selectCancelBtn").addEventListener("click", () => this._exitSelect());
+    $("selectAllBtn").addEventListener("click", () => {
+      if (this._bulkBusy) return;
+      const all = this._shown.length
+        && this._shown.every(n => this.selected.has(n.id));
+      for (const n of this._shown) {
+        if (all) this.selected.delete(n.id);
+        else this.selected.add(n.id);
+      }
+      this._disarmBulk();
+      this.renderList();
+    });
+    $("deleteSelBtn").addEventListener("click", () => {
+      const btn = $("deleteSelBtn");
+      if (!this.selected.size || this._bulkBusy) return;
+      if (!btn.classList.contains("armed")) {
+        btn.classList.add("armed");
+        btn.textContent = `Sure? ${this.selected.size}`;
+        this._bulkTimer = setTimeout(() => this._disarmBulk(), 2600);
+      } else {
+        clearTimeout(this._bulkTimer);
+        this._deleteSelected();
+      }
+    });
+    addEventListener("keydown", e => {
+      if (e.key === "Escape" && this.selecting) this._exitSelect();
     });
 
     // search (desktop + mobile inputs stay in step)

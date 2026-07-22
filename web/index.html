@@ -46,12 +46,19 @@ if (location.protocol === "file:") {
   <section class="pane pane-list" id="listPane" aria-label="Notes">
     <div class="list-head">
       <span class="eyebrow">Notes</span>
-      <span class="head-tools">
+      <span class="head-tools main-tools">
         <span class="count mono" id="noteCount"></span>
         <button class="capsule small" id="pcBtn" aria-label="Send a command to the PC" hidden>PC</button>
+        <button class="capsule small" id="selectBtn" aria-label="Select notes to delete">Select</button>
         <button class="capsule small" id="addImageBtn" aria-label="Add an image">+ Image</button>
         <button class="capsule small" id="addFileBtn" aria-label="Add a file">+ File</button>
         <button class="capsule small" id="newNoteBtn" aria-label="New note">+ New</button>
+      </span>
+      <span class="head-tools select-tools">
+        <span class="count mono" id="selCount">0 selected</span>
+        <button class="capsule small" id="selectAllBtn" aria-label="Select every note shown">All</button>
+        <button class="capsule small danger" id="deleteSelBtn" disabled>Delete</button>
+        <button class="capsule small ghost" id="selectCancelBtn">Cancel</button>
       </span>
       <input id="imageInput" type="file" accept="image/*" multiple hidden>
       <input id="fileInput" type="file" multiple hidden>
