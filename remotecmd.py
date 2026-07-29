@@ -346,7 +346,9 @@ class RemoteCommands:
         if not text:
             return "failed", "Empty command"
         try:
-            msg = self.voicecmds.try_run(text)         # exact hot words
+            # loose=True: a command sent from the phone was typed on purpose,
+            # so there's nothing to protect from being launched by accident
+            msg = self.voicecmds.try_run(text, loose=True)
         except Exception as ex:
             self.dbg(f"remotecmd try_run: {ex!r}")
             msg = None

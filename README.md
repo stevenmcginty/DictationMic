@@ -172,21 +172,34 @@ venv\Scripts\python.exe bench_stt.py clip.wav [clip.txt with the true words]
 
 ## Voice commands & "Hey Mike"
 
-Two layers, both hands-free:
+Three layers, all hands-free.
 
-**Exact hot words** (offline, instant). If a whole spoken phrase matches
-one in `commands.json` — say *"open claude in a terminal"* — the pill
-runs the task instead of typing the words. Right-click the pill →
-*Edit my voice commands…* to add your own; the file reloads on save.
-`{folder}` in a phrase matches a real Desktop folder by sound
-("folder one" finds `folder1`), and `"tab": true` opens a tab in the
-terminal window you already have.
+**Exact hot words** (offline, instant, no wake word). If a whole spoken
+phrase matches one in `commands.json` — say *"open claude in a
+terminal"* — the pill runs the task instead of typing the words.
+Right-click the pill → *Edit my voice commands…* to add your own; the
+file reloads on save. `{folder}` in a phrase matches a real Desktop
+folder by sound ("folder one" finds `folder1`), `"tab": true` opens a
+tab in the terminal window you already have, and `"count"` opens
+several at once.
 
-**"Hey Mike"** (natural language, needs internet). Say **"Hey Mike"**
-mid-dictation and the pill stops typing and listens for a command
-instead: *"open Chrome and go to fifa.com"*, *"open four tabs with
-claude in each"*, *"open Notepad"*, *"open the wankers folder"* —
-phrased however you like. Powered by the Gemini API's **free tier**
+**"Hey Mike" + any wording** (offline, instant). After the wake word you
+don't need a phrase in `commands.json` at all — *"open a new instance of
+Claude Code"*, *"open up four new tabs of claude code"*, *"fire up a
+terminal in folder one"* and any other arrangement of those words all
+start Claude Code (or a plain terminal) on the Desktop. This looseness
+stays behind the wake word on purpose: dictate *"open claude code"* into
+a chat with no "Hey Mike" and it's simply typed.
+
+Terminals open **PowerShell** (pwsh 7 if you have it), starting in the
+folder asked for, with `claude` run exactly as if you'd typed it — and
+the prompt stays put when you exit, ready for the next command.
+
+**"Hey Mike" + the brain** (natural language, needs internet). Anything
+the two layers above don't recognise goes to Gemini: *"open Chrome and
+go to fifa.com"*, *"open Notepad"*, *"open the wankers folder"*, *"make
+a folder called invoices"* — phrased however you like. Powered by the
+Gemini API's **free tier**
 (hundreds of commands a day, £0): grab a key from
 [aistudio.google.com/apikey](https://aistudio.google.com/apikey), then
 pill menu → **My Gemini API key…** and paste it in. It's checked with

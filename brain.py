@@ -6,7 +6,8 @@ list of launcher actions:
 
     open_app       target = app name ("chrome", "notepad", "word")
     open_url       target = full URL (invented from a spoken description)
-    open_terminal  tabs = how many, dir = folder, run = command ("claude")
+    open_terminal  tabs = how many, window = separate window not a tab,
+                   dir = folder, run = command ("claude")
     open_folder    target = folder name or path
     create_folder  target = new folder's name (made on the Desktop)
     run_command    run = one PowerShell command (full computer control)
@@ -51,10 +52,14 @@ SCHEMA = {
                                       "none"]},
                     "target": {"type": "STRING"},
                     "tabs": {"type": "INTEGER"},
+                    "window": {"type": "BOOLEAN"},
                     "dir": {"type": "STRING"},
                     "run": {"type": "STRING"},
                 },
-                "required": ["kind"],
+                # "run" is required so the model can't quietly drop it and
+                # turn "four tabs of Claude Code" into four bare terminals;
+                # actions that don't need it just send "".
+                "required": ["kind", "run"],
             },
         },
         "say": {"type": "STRING"},
@@ -76,10 +81,14 @@ Actions:
   description: "fifa dot com" -> "https://www.fifa.com",
   "the BBC sport website" -> "https://www.bbc.co.uk/sport",
   "gemini" (the AI) -> "https://gemini.google.com".
-- open_terminal: Windows Terminal tab(s). tabs = how many (default 1).
-  dir = a folder name from the Desktop list below, or empty for the
-  Desktop itself. run = command each tab runs, e.g. "claude" for
-  Claude Code; empty = a plain terminal.
+- open_terminal: PowerShell in Windows Terminal. tabs = how many
+  (default 1). run = the command each one runs — set it to "claude"
+  whenever Claude Code is mentioned at all, and leave it empty ONLY
+  for a plain terminal. window = true ONLY if they asked for a
+  separate window or a new instance ("a new instance of claude code",
+  "another claude window"); it MUST be false whenever they said "tab"
+  or "tabs", which means tabs in the terminal already open. dir = a
+  folder name from the Desktop list below, or empty for the Desktop.
 - open_folder: target = folder name from the list below (or a path);
   opens in Explorer.
 - create_folder: target = the name for a NEW folder ("make a folder
@@ -108,7 +117,9 @@ Actions:
   dictation, conversation, or you can't tell. WHEN IN DOUBT, "none".
 
 Several things at once is fine: "open chrome and notepad" = two
-actions. "open four tabs with claude" = one open_terminal, tabs 4.
+actions. "open four tabs with claude" = one open_terminal, tabs 4, run
+"claude", window false. "open a new instance of claude code" = one
+open_terminal, tabs 1, run "claude", window true.
 
 Set "say" to a short, friendly confirmation of what you're doing
 (or why nothing), under ten words.

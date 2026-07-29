@@ -3246,7 +3246,9 @@ class DictationApp:
             self.events.put(("toast", "Back to dictation — carry on"))
             return
         try:
-            msg = self.voicecmds.try_run(text)
+            # loose=True: after "Hey Mike" any wording of a launch counts,
+            # because nothing said in command mode was ever going to be typed
+            msg = self.voicecmds.try_run(text, loose=True)
         except Exception:
             msg = None
         if msg is not None:

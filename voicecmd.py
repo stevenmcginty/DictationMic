@@ -16,12 +16,21 @@ A pattern may contain one {folder} wildcard. The captured words are
 matched against the real folders inside the command's "dir" — spoken
 "folder one" finds "folder1", "Folder One" or "folder-one".
 
+After the "Hey Mike" wake word, matching gets far more forgiving:
+parse_launch understands however you happen to word a launch — "open
+Claude Code", "open up a new instance of claude", "four new tabs of
+claude code", "fire up a terminal in folder one". That looseness is
+deliberately kept behind the wake word, so dictating "open claude code"
+into a chat still types the words. Terminals always run PowerShell, so
+`claude` starts exactly as if it had been typed at a prompt.
+
 commands.json fields per command:
     say      list of phrases that trigger it (may contain {folder})
     terminal command line run in a NEW terminal window ("" = just
              open the terminal)
     tab      true = open a new TAB in the terminal window you already
              have (most recent one) instead of a new window
+    count    how many windows/tabs to open (1-8, default 1)
     open     a file, app or web address to open instead of a terminal
     dir      working directory (~ = home; may contain {folder})
     toast    the little message the pill shows ({folder} filled in)
@@ -63,9 +72,16 @@ DEFAULT_COMMANDS = {
         "inside 'dir' (saying 'folder one' finds 'folder1').",
         "Fields: say = trigger phrases | terminal = command to run in a",
         "new terminal window ('' = just open one) | tab = true opens a",
-        "new TAB in your existing terminal window instead | open =",
-        "file/app/web address to open instead | dir = starting folder",
-        "(~ = home) | toast = the message the pill shows.",
+        "new TAB in your existing terminal window instead | count = how",
+        "many windows/tabs (1-8) | open = file/app/web address to open",
+        "instead | dir = starting folder (~ = home) | toast = the",
+        "message the pill shows.",
+        "Say 'Hey Mike' first and you don't need a phrase here at all -",
+        "any wording starts Claude Code or a terminal ('open up a new",
+        "instance of claude', 'four new tabs of claude code', 'fire up",
+        "a terminal in folder one'). Without 'Hey Mike' only the exact",
+        "phrases below fire, so dictation is never launched by",
+        "accident. Terminals run PowerShell.",
         "Edit and save this file freely - it reloads automatically.",
     ],
     "commands": [
@@ -179,35 +195,171 @@ def compile_pattern(pat):
     return re.compile(rx + r"\Z")
 
 
+_shell = None
+
+
+def shell_command():
+    """The shell voice-launched terminals run in: PowerShell 7 (pwsh) when
+    it's installed, else Windows PowerShell. Never cmd."""
+    global _shell
+    if _shell is None:
+        _shell = (shutil.which("pwsh") or shutil.which("powershell")
+                  or "powershell.exe")
+    return _shell
+
+
 def launch_terminal(workdir, command, tab=False):
     """New terminal window at workdir — or, with tab=True, a new TAB in
     the most recently used Windows Terminal window (a window is created
-    if none is open). Optionally runs a command and stays open."""
+    if none is open). Optionally runs a command and stays open.
+
+    The shell is PowerShell, so `claude` starts exactly as if it had been
+    typed at a PowerShell prompt, and the prompt stays afterwards."""
+    ps = shell_command()
+    # -NoExit keeps the session alive after the command finishes, so the
+    # window behaves like one Steve opened and typed into himself.
+    run = [ps, "-NoExit"] + (["-Command", command] if command else [])
     wt = shutil.which("wt")
     if wt:
         where = ["-w", "last", "new-tab"] if tab else ["-w", "new"]
-        args = [wt] + where + ["-d", workdir]
-        if command:
-            args += ["cmd", "/k", command]
-        subprocess.Popen(args)
+        subprocess.Popen([wt] + where + ["-d", workdir] + run)
     else:
         # plain consoles have no tabs — a fresh window is the best we can do
-        args = ["cmd", "/k", command] if command else ["cmd"]
-        subprocess.Popen(args, cwd=workdir,
+        subprocess.Popen(run, cwd=workdir,
                          creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+
+# ---------------------------------------------------------------------------
+# The loose launcher: "open Claude Code", however you happen to say it
+# ---------------------------------------------------------------------------
+#
+# The exact phrase lists above are unforgiving — a single stray "up" or
+# "of" and nothing fires. This second pass understands ANY arrangement of
+# the words below, so "open Claude Code", "open up a new instance of
+# claude", "four new tabs of claude code" and "fire up two claude windows
+# in folder one" all work without listing every wording.
+#
+# It only runs AFTER the wake word (try_run's loose=True) — nothing said
+# to Mike was ever going to be typed, so being generous there is free.
+# Even then, EVERY word of the utterance has to be one of these known
+# words (the only exception is a folder name straight after "in"/"at",
+# and that folder has to really exist). One unknown word and it isn't a
+# command.
+
+LAUNCH_VERBS = {"open", "start", "launch", "run", "fire", "boot", "spin",
+                "pop", "bring", "load", "give", "get", "make", "create",
+                "new", "another"}
+
+# words that carry no meaning here and can appear anywhere
+LAUNCH_FILLER = {"a", "an", "the", "up", "me", "my", "for", "of", "with",
+                 "and", "to", "in", "on", "into", "at", "just", "please",
+                 "code", "fresh", "new", "another", "it", "more", "some",
+                 "running", "there", "over"}
+
+LAUNCH_COUNTS = dict(NUMBER_WORDS, a="1", an="1", couple="2", few="3")
+
+TAB_WORDS = {"tab", "tabs"}
+WINDOW_WORDS = {"window", "windows", "instance", "instances", "session",
+                "sessions", "copy", "copies", "version", "versions"}
+TERMINAL_WORDS = {"terminal", "terminals", "console", "powershell", "shell",
+                  "prompt", "command", "cmd"}
+DESKTOP_WORDS = {"desktop"}
+# an unknown word is only allowed as a folder name straight after one of these
+LOCATION_WORDS = {"in", "inside", "at", "on", "into", "under", "within",
+                  "from", "for"}
+
+
+def parse_launch(utterance):
+    """Understand a spoken launch request that the exact phrases missed.
+
+    Takes an already-normalized utterance. Returns (command-dict,
+    spoken folder) ready for VoiceCommands._execute, or None when the
+    words aren't a launch request at all."""
+    words = utterance.split()
+    if not words or words[0] not in LAUNCH_VERBS:
+        return None
+    count = tab = window = claude = terminal = None
+    folder_words = []
+    i = 1
+    while i < len(words):
+        w = words[i]
+        if w in LAUNCH_COUNTS:
+            count = int(LAUNCH_COUNTS[w])
+        elif w.isdigit():
+            count = int(w)
+        elif w in TAB_WORDS:
+            tab = True
+        elif w in WINDOW_WORDS:
+            window = True
+        elif w == "claude":
+            claude = True
+        elif w in TERMINAL_WORDS:
+            terminal = True
+        elif w in DESKTOP_WORDS:
+            pass                      # the Desktop is where we start anyway
+        elif w in LAUNCH_FILLER:
+            pass
+        elif words[i - 1] in LOCATION_WORDS:
+            folder_words = words[i:]  # "…in folder one" — the rest is a name
+            break
+        else:
+            return None               # a word I don't know: ordinary speech
+        i += 1
+    if not (claude or terminal):
+        return None                   # nothing to actually open
+    n = max(1, min(count or 1, 8))
+    tab = bool(tab) and not window    # "instance"/"window" beats "tab"
+    what = "Claude Code" if claude else "a terminal"
+    where = "in {folder}" if folder_words else "on the Desktop"
+    if n > 1:
+        toast = f"{n} {'tabs' if tab else 'windows'} — {what} {where}"
+    elif tab:
+        toast = f"New tab — {what} {where}"
+    else:
+        toast = f"Starting {what} {where}"
+    cmd = {
+        "terminal": "claude" if claude else "",
+        "tab": tab,
+        "count": n,
+        "dir": "~/Desktop/{folder}" if folder_words else "~/Desktop",
+        "toast": toast,
+    }
+    return cmd, " ".join(folder_words)
 
 
 # ---------------------------------------------------------------------------
 # "Hey Mike" — wake word + the executor for the brain's actions
 # ---------------------------------------------------------------------------
 
+# Speech recognition rarely writes "Mike" — it writes whatever it thought
+# it heard. Any wake phrase ending in one of these is matched with all of
+# them, so "hey mic", "hey muck" and "hey mack" all wake Mike. "Mikey" is
+# deliberately absent: it's a name, not a mis-hearing.
+MIKE_HEARD = ("mike", "mic", "mick", "myke", "mac", "mack", "muck", "nike",
+              "mick", "mikes", "mick")
+
+_MIKE_LEAD = re.compile(r"^[\W_]*(?:%s)(?:[\W_]+|$)" % "|".join(set(MIKE_HEARD)),
+                        re.IGNORECASE)
+
+
+def _wake_variants(phrase):
+    """['hey', 'mike'] -> one word-list per way 'mike' gets transcribed."""
+    words = normalize(phrase).split()
+    if not words:
+        return []
+    if words[-1] in MIKE_HEARD:
+        return [words[:-1] + [alt] for alt in dict.fromkeys(MIKE_HEARD)]
+    return [words]
+
+
 def wake_regex(wake_words):
     """One regex matching any wake phrase, tolerant of 'Hey, Mike!'."""
     alts = []
     for phrase in wake_words:
-        words = normalize(phrase).split()
-        if words:
-            alts.append(r"[\W_]+".join(re.escape(w) for w in words))
+        for words in _wake_variants(phrase):
+            rx = r"[\W_]+".join(re.escape(w) for w in words)
+            if rx not in alts:
+                alts.append(rx)
     if not alts:
         return None
     return re.compile(r"(?:^|[\W_])(?:%s)(?:[\W_]+|$)" % "|".join(alts),
@@ -223,7 +375,15 @@ def split_wake(text, wake_words):
     m = rx.search(text)
     if m is None:
         return None
-    return text[:m.start()], text[m.end():]
+    after = text[m.end():]
+    # "hey muck mic, open chrome" — one wake word heard twice. Drop the
+    # spare so it doesn't end up inside the command.
+    for _ in range(2):
+        trimmed = _MIKE_LEAD.sub("", after, count=1)
+        if trimmed == after:
+            break
+        after = trimmed
+    return text[:m.start()], after
 
 
 # apps whose real exe name isn't what you'd say
@@ -348,6 +508,9 @@ def execute_actions(actions, say, dbg=lambda m: None):
                     done += 1
             elif kind == "open_terminal":
                 tabs = max(1, min(int(a.get("tabs") or 1), 8))
+                # a "new instance"/"separate window" gets its own window;
+                # anything else lands as a tab in the terminal already open
+                as_tab = not a.get("window")
                 raw = (a.get("dir") or "").strip()
                 if raw and os.path.isabs(raw) and os.path.isdir(raw):
                     workdir = raw
@@ -360,7 +523,7 @@ def execute_actions(actions, say, dbg=lambda m: None):
                 else:
                     workdir = desktop
                 for i in range(tabs):
-                    launch_terminal(workdir, a.get("run") or "", tab=True)
+                    launch_terminal(workdir, a.get("run") or "", tab=as_tab)
                     if i < tabs - 1:
                         time.sleep(0.35)   # let wt process tabs in order
                 done += 1
@@ -468,9 +631,14 @@ class VoiceCommands:
         self._compiled = compiled
         self.dbg(f"voice commands loaded: {len(compiled)} phrases")
 
-    def try_run(self, text):
+    def try_run(self, text, loose=False):
         """Return None if text is ordinary dictation, else the toast to
-        show (the task has been launched, or the error explained)."""
+        show (the task has been launched, or the error explained).
+
+        Only the exact phrases in commands.json fire while you're just
+        dictating. The forgiving parse_launch matching needs loose=True,
+        which the pill only passes once you've said "Hey Mike" — so a
+        sentence like "open claude code" typed into a chat stays typed."""
         self._reload_if_changed()
         utterance = normalize(text)
         if not utterance:
@@ -479,6 +647,14 @@ class VoiceCommands:
             m = rx.fullmatch(utterance)
             if m:
                 return self._execute(cmd, m.groupdict().get("folder"))
+        guess = parse_launch(utterance) if loose else None
+        if guess is not None:
+            cmd, spoken_folder = guess
+            if spoken_folder:
+                desktop = os.path.expanduser("~/Desktop").replace("/", os.sep)
+                if resolve_folder(desktop, spoken_folder) is None:
+                    return None      # no such folder — so it wasn't a command
+            return self._execute(cmd, spoken_folder)
         return None
 
     def _execute(self, cmd, spoken_folder):
@@ -496,12 +672,16 @@ class VoiceCommands:
             return f"That folder doesn't exist: {workdir}"
         toast = cmd.get("toast") or "Running your voice command"
         toast = toast.replace("{folder}", folder or spoken_folder or "")
+        count = max(1, min(int(cmd.get("count") or 1), 8))
         try:
             if cmd.get("open"):
                 os.startfile(cmd["open"].replace("{folder}", folder or ""))
             elif "terminal" in cmd:
-                launch_terminal(workdir, cmd.get("terminal", ""),
-                                tab=bool(cmd.get("tab")))
+                for i in range(count):
+                    launch_terminal(workdir, cmd.get("terminal", ""),
+                                    tab=bool(cmd.get("tab")))
+                    if i < count - 1:
+                        time.sleep(0.35)   # let wt place the tabs in order
             else:
                 return None     # a command with nothing to do — ignore it
         except Exception as ex:
