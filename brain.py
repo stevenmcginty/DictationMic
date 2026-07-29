@@ -6,8 +6,9 @@ list of launcher actions:
 
     open_app       target = app name ("chrome", "notepad", "word")
     open_url       target = full URL (invented from a spoken description)
-    open_terminal  tabs = how many, window = separate window not a tab,
-                   dir = folder, run = command ("claude")
+    open_terminal  tabs = how many (tabs in one window by default),
+                   window = separate windows instead, dir = folder,
+                   run = command ("claude")
     open_folder    target = folder name or path
     create_folder  target = new folder's name (made on the Desktop)
     run_command    run = one PowerShell command (full computer control)
@@ -84,11 +85,14 @@ Actions:
 - open_terminal: PowerShell in Windows Terminal. tabs = how many
   (default 1). run = the command each one runs — set it to "claude"
   whenever Claude Code is mentioned at all, and leave it empty ONLY
-  for a plain terminal. window = true ONLY if they asked for a
-  separate window or a new instance ("a new instance of claude code",
-  "another claude window"); it MUST be false whenever they said "tab"
-  or "tabs", which means tabs in the terminal already open. dir = a
-  folder name from the Desktop list below, or empty for the Desktop.
+  for a plain terminal. window = whether to open SEPARATE WINDOWS
+  instead of tabs, and it is FALSE almost always: tabs in the one
+  window are what the speaker wants. Set window true ONLY if they
+  actually said "window", "windows" or "separate" ("open claude in a
+  new window", "two separate windows"). Words like "instance",
+  "instances", "session" or "copy" do NOT mean a window — "four new
+  instances of claude code" is tabs 4, window FALSE. dir = a folder
+  name from the Desktop list below, or empty for the Desktop.
 - open_folder: target = folder name from the list below (or a path);
   opens in Explorer.
 - create_folder: target = the name for a NEW folder ("make a folder
@@ -118,8 +122,10 @@ Actions:
 
 Several things at once is fine: "open chrome and notepad" = two
 actions. "open four tabs with claude" = one open_terminal, tabs 4, run
-"claude", window false. "open a new instance of claude code" = one
-open_terminal, tabs 1, run "claude", window true.
+"claude", window false. "open up four new instances of claude code" =
+one open_terminal, tabs 4, run "claude", window FALSE (instances are
+still tabs). "open claude code in a new window" = one open_terminal,
+tabs 1, run "claude", window true.
 
 Set "say" to a short, friendly confirmation of what you're doing
 (or why nothing), under ten words.
