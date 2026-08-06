@@ -25,6 +25,10 @@ const CAL_SVG = `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5"
 // the tick inside a select-mode ring
 const TICK_SVG = `<svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="true"><path d="M4.5 12.5 10 18 19.5 6.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
+// What "+ New" calls a note before it has any words in it. A placeholder, not
+// a name — _commitBody replaces it with the opening words as you write.
+const NEW_NOTE_TITLE = "New note";
+
 export class App {
   constructor(adapter, opts = {}) {
     this.adapter = adapter;
@@ -38,6 +42,7 @@ export class App {
     this.selected = new Set();     // ids ticked for bulk delete
     this._shown = [];              // what the list is showing (filter applied)
     this._bulkBusy = false;
+    this._autoTitle = null;        // {id, title} — a title we derived, ours to keep updating
   }
 
   async start() {
@@ -389,7 +394,7 @@ export class App {
   // a blank note for typing or pasting — same note flow as everything else
   async newNote() {
     try {
-      const n = await this.adapter.create({ title: "New note", body: "" });
+      const n = await this.adapter.create({ title: NEW_NOTE_TITLE, body: "" });
       this._cache(n);
       this.renderList();
       location.hash = `#/note/${n.id}`;
@@ -554,13 +559,31 @@ export class App {
     const body = $("noteBody").value;
     if (current && body === current.body) return current;   // nothing new to save
     try {
-      const updated = await this.adapter.update(id, body);
-      if (updated) {
-        this._cache(updated);
-        this.renderList();
-        if (this.activeId === id) this._renderMeta(updated);
+      let saved = await this.adapter.update(id, body);
+      // "+ New" makes the note before there are any words to name it after, and
+      // nothing ever went back to fix that — so it stayed "New note" forever, on
+      // every device. Keep deriving the title from what's being written for as
+      // long as it's still the placeholder or still the last one we derived; the
+      // moment it's renamed by hand it stops being ours to touch.
+      const ours = saved && (saved.title === NEW_NOTE_TITLE
+        || (this._autoTitle?.id === id && this._autoTitle.title === saved.title));
+      if (ours && body.trim()) {
+        const derived = noteTitleFrom(body);
+        if (derived !== saved.title) {
+          saved = (await this.adapter.rename(id, derived)) || saved;
+          this._autoTitle = { id, title: saved.title };
+          // don't yank the field out from under someone typing in it
+          if (this.activeId === id && document.activeElement !== $("noteTitle")) {
+            $("noteTitle").value = saved.title;
+          }
+        }
       }
-      return updated;
+      if (saved) {
+        this._cache(saved);
+        this.renderList();
+        if (this.activeId === id) this._renderMeta(saved);
+      }
+      return saved;
     } catch (e) { this.toast(e.message || "Couldn't save"); return null; }
   }
 
@@ -582,6 +605,7 @@ export class App {
     await this._commitBody();
     try {
       const updated = await this.adapter.rename(id, wanted);
+      this._autoTitle = null;      // named by hand — stop deriving it
       if (updated) {
         this._cache(updated);
         $("noteTitle").value = updated.title;   // server may suffix " (2)"
