@@ -43,6 +43,8 @@ export class App {
     this._shown = [];              // what the list is showing (filter applied)
     this._bulkBusy = false;
     this._autoTitle = null;        // {id, title} — a title we derived, ours to keep updating
+    this._listSig = null;          // what the list last drew — skip identical redraws
+    this._renderedIds = null;      // …and which rows were already on screen
   }
 
   async start() {
@@ -103,6 +105,23 @@ export class App {
     this._shown = shown;
     const pending = this.adapter.pendingIds();
 
+    // Typing or dictating commits every 700ms, and each commit came through
+    // here and rebuilt every row from scratch — replaying the staggered entry
+    // animation on all of them, which reads as the whole list flashing. Two
+    // guards: skip the rebuild entirely when nothing on screen would differ,
+    // and below, don't re-animate a row that was already there.
+    const sig = JSON.stringify([
+      q, this.activeId, this.selecting, [...this.selected].sort(),
+      this.notes.length, pending.size,
+      Math.floor(Date.now() / 60000),          // so "5m ago" still ticks over
+      shown.map(n => [n.id, n.title, n.updatedAt, !!n.starred,
+                      pending.has(n.id), n.calendar || null,
+                      n.body.slice(0, 220)]),
+    ]);
+    if (sig === this._listSig) { this._syncSelectUI(); return; }
+    this._listSig = sig;
+    const already = this._renderedIds;
+
     list.textContent = "";
     let lastDay = null;                 // notes are newest-first, so each
     shown.forEach((n, i) => {           // day's notes sit together already
@@ -124,7 +143,10 @@ export class App {
       li.tabIndex = 0;
       // image/file rows can be dragged straight out of the list as real files
       if (isImageBody(n.body) || isFileBody(n.body)) li.draggable = true;
-      li.style.animationDelay = `${Math.min(i, 14) * 12}ms`;
+      // A row that was already on screen updates in place — only genuinely new
+      // rows get the entry animation, so a save never restages the whole list.
+      if (already?.has(n.id)) li.style.animation = "none";
+      else li.style.animationDelay = `${Math.min(i, 14) * 12}ms`;
 
       const top = document.createElement("div");
       top.className = "note-row-top";
@@ -187,6 +209,7 @@ export class App {
       }
       list.append(li);
     });
+    this._renderedIds = new Set(shown.map(n => n.id));
 
     $("emptyState").hidden = shown.length > 0;
     if (!shown.length) {
