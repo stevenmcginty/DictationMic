@@ -46,6 +46,16 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
+def _read_available(raw, size=65536):
+    """Whatever bytes have arrived on a streaming response, without waiting for
+    more. b"" means the server hung up. urllib3 2.x gives us read1(); older
+    builds only have the socket's own read1 underneath."""
+    read1 = getattr(raw, "read1", None)
+    if read1 is not None:
+        return read1(size, decode_content=True)
+    return raw._fp.read1(size)
+
+
 def send_password_reset(email):
     """Ask Firebase to email a password-reset link. Returns (ok, message) —
     the message is ready to show the user either way."""
@@ -245,40 +255,60 @@ class CloudSync:
             try:
                 token = self._token()
                 if token is None:
+                    # No refresh token at all means sync is off — nothing to
+                    # stream. A token we HAVE but couldn't exchange is a
+                    # transient failure (Firebase 5xx/429, captive wifi); the
+                    # push side already retries those, so the pull side must
+                    # too. Returning here used to kill this thread outright,
+                    # leaving the laptop pushing happily while never again
+                    # receiving a single phone note until a restart.
                     self._set_state("needs-signin")
-                    return
+                    if not self.settings.get("sync_refresh_token"):
+                        return
+                    raise ConnectionError("no id token")
                 with requests.get(self._notes_url(token=token), stream=True,
                                   headers={"Accept": "text/event-stream"},
                                   timeout=(10, 60)) as r:
                     if r.status_code == 401:
                         self._id_token = None
-                        continue
+                        raise ConnectionError("401 on the event stream")
                     r.raise_for_status()
                     backoff = 1
                     self._resp = r
                     event = None
-                    # chunk_size=None hands us each HTTP chunk the moment it
-                    # lands — which on this stream is one whole SSE event. No
-                    # waiting for a read buffer to fill, and none of the
-                    # per-byte Python cost of chunk_size=1 (which is what
-                    # made the ~1MB first snapshot peg a core for minutes,
-                    # queueing every live event behind it). Lines are split
-                    # out of a bytearray rather than by iter_lines, which
-                    # re-scans its whole pending buffer on every read (O(n²)).
+                    # read1() hands us whatever has arrived, the moment it
+                    # arrives. Everything else stalls on this stream:
+                    # iter_content(chunk_size=None) asks urllib3 to read to
+                    # EOF, which on a stream that never ends means it blocks
+                    # until the read timeout and yields NOTHING — no snapshot,
+                    # no events, phone notes silently never landing. A fixed
+                    # chunk_size is no better: the response is unchunked, so
+                    # read(n) waits for a full n bytes and a small live event
+                    # sits in the buffer until enough later traffic pushes it
+                    # out. Lines are split out of a bytearray rather than by
+                    # iter_lines, which re-scans its whole pending buffer on
+                    # every read (O(n²)) — `scanned` keeps that honest here,
+                    # since the first snapshot is one very long line.
                     buf = bytearray()
+                    scanned = 0
                     done = False
-                    for chunk in r.iter_content(chunk_size=None):
+                    while not done:
                         if self._stop.is_set():
                             return
+                        chunk = _read_available(r.raw)
+                        if chunk == b"":
+                            break                     # server closed the stream
                         if not chunk:
                             continue
                         buf += chunk
                         while not done:
-                            nl = buf.find(b"\n")
+                            nl = buf.find(b"\n", scanned)
                             if nl < 0:
+                                scanned = len(buf)
                                 break
                             raw = bytes(buf[:nl]).decode("utf-8", "replace")
                             del buf[:nl + 1]
+                            scanned = 0
                             raw = raw.rstrip("\r")
                             if raw == "":
                                 continue
@@ -297,8 +327,6 @@ class CloudSync:
                                     done = True
                                 elif event == "cancel":
                                     done = True
-                        if done:
-                            break
             except Exception as ex:
                 self.dbg(f"cloudsync sse: {ex}")
                 self._set_state("offline")
