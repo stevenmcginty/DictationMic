@@ -44,6 +44,8 @@ let liveNoteId = null;       // the note this session is filling in, once made
 let livePushTimer = null;
 let livePushing = false;     // one upload in flight
 let livePushAgain = false;   // …and newer text arrived while it was
+let livePush = Promise.resolve();   // that upload, so Save/Discard can wait
+let liveEpoch = 0;           // bumped by discard/reset — voids in-flight pushes
 // NOTE: no page-held getUserMedia keep-alive stream here. Holding the mic
 // used to silence Chrome's per-run chime, but Android Chrome now refuses to
 // feed SpeechRecognition while the page owns the mic — runs hear nothing,
@@ -200,14 +202,36 @@ function schedulePublish() {
   }, LIVE_PUSH_MS);
 }
 
-async function publishLive() {
-  if (livePushing) { livePushAgain = true; return; }
+// Returns the upload in flight so Save and Discard can wait on it rather than
+// racing it — a Save that overtook a create would make a second note for the
+// same dictation, on the desktop as well as here.
+function publishLive() {
+  if (livePushing) { livePushAgain = true; return livePush; }
+  livePush = doPublish();
+  return livePush;
+}
+
+async function doPublish() {
   const text = committed.replace(/\s+/g, " ").trim();
   if (!text || !app?.adapter) return;
+  // Discard can land while this upload is in flight. It can't cancel the
+  // request, so it bumps the epoch instead and we clean up after ourselves —
+  // otherwise a create that finishes late resurrects a note the user has
+  // already thrown away, on the desktop as well as here.
+  const epoch = liveEpoch;
   livePushing = true;
   try {
-    if (liveNoteId) await app.adapter.update(liveNoteId, text);
-    else liveNoteId = (await app.adapter.create({ body: text })).id;
+    if (liveNoteId) {
+      await app.adapter.update(liveNoteId, text);
+    } else {
+      const made = await app.adapter.create({ body: text });
+      if (epoch !== liveEpoch) {
+        await app.adapter.remove(made.id).catch(() => {});
+        return;
+      }
+      liveNoteId = made.id;
+    }
+    if (epoch !== liveEpoch) return;
     app.notes = await app.adapter.list();
     app.renderList();
   } catch {
@@ -215,7 +239,10 @@ async function publishLive() {
     // next utterance (or the Save) tries again. Never interrupt dictation.
   } finally {
     livePushing = false;
-    if (livePushAgain) { livePushAgain = false; schedulePublish(); }
+    if (livePushAgain) {
+      livePushAgain = false;
+      if (epoch === liveEpoch) schedulePublish();
+    }
   }
 }
 
@@ -224,6 +251,8 @@ async function publishLive() {
 async function discardLive() {
   clearTimeout(livePushTimer);
   livePushTimer = null;
+  liveEpoch++;                  // any upload still in flight now cleans up
+  await livePush.catch(() => {});   // …once it has actually landed
   const id = liveNoteId;
   liveNoteId = null;
   if (!id) return;
@@ -254,13 +283,15 @@ function reset() {
   committed = "";
   utterance = "";
   liveNoteId = null;          // next dictation starts a note of its own
+  liveEpoch++;                // and a late push can't attach itself to it
   paint();
 }
 
 async function save() {
-  commitUtterance();
+  commitUtterance();          // session is over, so this kicks a push straight off
   clearTimeout(livePushTimer);
   livePushTimer = null;
+  await livePush.catch(() => {});
   const text = committed.replace(/\s+/g, " ").trim();
   if (!text) { await discardLive(); reset(); render(); return; }
   try {
