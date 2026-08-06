@@ -215,6 +215,25 @@ def shell_command():
     return _shell
 
 
+# Variables an agent (Claude Code) exports into every process it spawns.
+# If the pill itself was ever started from inside such a session it inherits
+# them and — because Popen hands the parent's environment to its children —
+# passes them on to every terminal it opens, for as long as it runs.
+# NO_COLOR=1 strips the colour out of anything launched that way, and
+# CLAUDE_CODE_CHILD_SESSION makes a fresh Claude Code think it's a nested
+# child and stop saving its transcript. A voice-opened terminal must look
+# exactly like one opened by hand, so these are stripped on the way out —
+# that way it no longer matters how the pill itself got launched.
+INHERITED_AGENT_VARS = ("NO_COLOR", "CLAUDECODE",
+                        "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT")
+
+
+def clean_env():
+    """A copy of our environment without the agent variables above."""
+    return {k: v for k, v in os.environ.items()
+            if k not in INHERITED_AGENT_VARS}
+
+
 def launch_terminal(workdir, command, tab=True, count=1):
     """Open `count` PowerShell terminals at workdir, optionally running a
     command and staying open afterwards.
@@ -240,7 +259,7 @@ def launch_terminal(workdir, command, tab=True, count=1):
     if not wt:
         # plain consoles have no tabs — fresh windows are the best we can do
         for i in range(count):
-            subprocess.Popen(run, cwd=workdir,
+            subprocess.Popen(run, cwd=workdir, env=clean_env(),
                              creationflags=subprocess.CREATE_NEW_CONSOLE)
             if i < count - 1:
                 time.sleep(0.35)
@@ -254,10 +273,11 @@ def launch_terminal(workdir, command, tab=True, count=1):
             if i:
                 args.append(";")
             args += ["new-tab", "-d", workdir] + run
-        subprocess.Popen(args)
+        subprocess.Popen(args, env=clean_env())
     else:
         for i in range(count):
-            subprocess.Popen([wt, "-w", "new", "-d", workdir] + run)
+            subprocess.Popen([wt, "-w", "new", "-d", workdir] + run,
+                             env=clean_env())
             if i < count - 1:
                 time.sleep(0.35)   # let each window claim itself first
 
