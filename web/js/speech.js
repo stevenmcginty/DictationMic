@@ -16,12 +16,15 @@
 //   with growing spacing (fewer chimes in silence), speech snaps it back
 //   to fast restarts, and only real mic errors or the user end the session
 
+import { noteTitleFrom } from "./util.js";
+
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 const $ = id => document.getElementById(id);
 const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const RUN_WATCHDOG_MS = 15000; // a run silent this long is hung — recycle it
-const AUTO_STOP_MS = 120000;   // silence that ends the session
+const AUTO_STOP_MS = 20000;    // silence that ends the session
+const LIVE_PUSH_MS = 1500;     // at most one live upload per this, newest wins
 const METER_BARS = 24;
 
 let app = null;
@@ -37,6 +40,10 @@ let idleTimer = null;
 let wakeLock = null;
 let silentRuns = 0;          // consecutive runs that heard nothing
 let runHadText = false;
+let liveNoteId = null;       // the note this session is filling in, once made
+let livePushTimer = null;
+let livePushing = false;     // one upload in flight
+let livePushAgain = false;   // …and newer text arrived while it was
 // NOTE: no page-held getUserMedia keep-alive stream here. Holding the mic
 // used to silence Chrome's per-run chime, but Android Chrome now refuses to
 // feed SpeechRecognition while the page owns the mic — runs hear nothing,
@@ -59,7 +66,11 @@ function bind() {
 
   $("micMainBtn").addEventListener("click", () => active ? stop() : start());
   $("micSaveBtn").addEventListener("click", save);
-  $("micDiscardBtn").addEventListener("click", () => { reset(); render(); });
+  $("micDiscardBtn").addEventListener("click", async () => {
+    await discardLive();                   // it's already on the desktop — pull it back
+    reset();
+    render();
+  });
 
   addEventListener("hashchange", () => {
     if (location.hash !== "#/mic" && active) stop();
@@ -171,7 +182,56 @@ function commitUtterance() {
     committed = fold(committed, utterance);
     utterance = "";
     paint();
+    // Nothing used to leave the phone until the Save tap, so the desktop pill
+    // was a whole dictation plus a decision behind. Every finished utterance
+    // now goes up as it lands and the pill fills in live. When the session is
+    // ending, don't sit on the last one — send it at once.
+    if (active) schedulePublish(); else publishLive();
   }
+}
+
+// One upload per LIVE_PUSH_MS, always carrying the newest text: a burst of
+// short utterances collapses into a single push rather than queueing.
+function schedulePublish() {
+  if (livePushTimer) return;
+  livePushTimer = setTimeout(() => {
+    livePushTimer = null;
+    publishLive();
+  }, LIVE_PUSH_MS);
+}
+
+async function publishLive() {
+  if (livePushing) { livePushAgain = true; return; }
+  const text = committed.replace(/\s+/g, " ").trim();
+  if (!text || !app?.adapter) return;
+  livePushing = true;
+  try {
+    if (liveNoteId) await app.adapter.update(liveNoteId, text);
+    else liveNoteId = (await app.adapter.create({ body: text })).id;
+    app.notes = await app.adapter.list();
+    app.renderList();
+  } catch {
+    // offline, or the desktop is asleep — the outbox is holding it and the
+    // next utterance (or the Save) tries again. Never interrupt dictation.
+  } finally {
+    livePushing = false;
+    if (livePushAgain) { livePushAgain = false; schedulePublish(); }
+  }
+}
+
+// Throw away the note this session has been building — used by Discard, which
+// has to reach the desktop too now that the note got there before the decision.
+async function discardLive() {
+  clearTimeout(livePushTimer);
+  livePushTimer = null;
+  const id = liveNoteId;
+  liveNoteId = null;
+  if (!id) return;
+  try { await app.adapter.remove(id); } catch { /* outbox retries the delete */ }
+  try {
+    app.notes = await app.adapter.list();
+    app.renderList();
+  } catch { /* list refresh is cosmetic */ }
 }
 
 function stop() {
@@ -193,15 +253,29 @@ function finishRun() {
 function reset() {
   committed = "";
   utterance = "";
+  liveNoteId = null;          // next dictation starts a note of its own
   paint();
 }
 
 async function save() {
   commitUtterance();
+  clearTimeout(livePushTimer);
+  livePushTimer = null;
   const text = committed.replace(/\s+/g, " ").trim();
-  if (!text) { reset(); render(); return; }
+  if (!text) { await discardLive(); reset(); render(); return; }
   try {
-    await app.adapter.create({ body: text });
+    if (liveNoteId) {
+      await app.adapter.update(liveNoteId, text);
+      // The title was derived from the first utterance, which may have been
+      // only a word or two. Settle it on the finished wording — rename pushes
+      // title and body together, so this is one op, not two.
+      const title = noteTitleFrom(text);
+      const cur = await app.adapter.get(liveNoteId).catch(() => null);
+      if (cur && cur.title !== title) await app.adapter.rename(liveNoteId, title);
+    } else {
+      await app.adapter.create({ body: text });
+    }
+    liveNoteId = null;
     reset();
     app.notes = await app.adapter.list();
     app.renderList();

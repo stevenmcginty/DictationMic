@@ -1,6 +1,10 @@
 # secrets & personal data — never commit these
 settings.json
 gemini.key
+# android signing: the keystore and the passwords that open it
+*.jks
+android/keystore.properties
+android/local.properties
 notes/
 shots/
 debug.log
@@ -16,8 +20,11 @@ dist/
 # packaged app (rebuilt from source; too big for git)
 _internal/
 DictationMic.exe
+DictationMic-Android.apk
 models/
 selftest_out.txt
+.gradle/
+.kotlin/
 
 # deploy staging — regenerated with: robocopy web hosting /MIR /XD downloads
 # (hosting/downloads holds the 110MB friend zip, over GitHub's file limit)

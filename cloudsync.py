@@ -92,6 +92,7 @@ class CloudSync:
         self._token_exp = 0.0
         self._sse_thread = None
         self._worker_thread = None
+        self._resp = None               # the live stream, for _kick_stream
         self._state = "off"             # off | ok | offline | needs-signin | error
         self._last_sync = 0
         self._purged = False
@@ -225,6 +226,18 @@ class CloudSync:
     # SSE pull
     # ------------------------------------------------------------------
 
+    def _kick_stream(self):
+        """Hang up on the live stream so the reader reconnects at once. The
+        socket read is blocking, so closing the response from another thread is
+        what makes it return — nothing else will."""
+        r = self._resp
+        if r is None:
+            return
+        try:
+            r.close()
+        except Exception:
+            pass
+
     def _sse_reader(self):
         import requests
         backoff = 1
@@ -242,43 +255,55 @@ class CloudSync:
                         continue
                     r.raise_for_status()
                     backoff = 1
+                    self._resp = r
                     event = None
-                    # Byte-at-a-time so a small live event is never stuck
-                    # waiting for a read buffer to fill — but assembled into
-                    # a bytearray ourselves: iter_lines(chunk_size=1) re-scans
-                    # its whole pending buffer on every byte (O(n²)), which
-                    # pegged the CPU for minutes on the ~1MB first snapshot
-                    # and queued every live event behind it.
+                    # chunk_size=None hands us each HTTP chunk the moment it
+                    # lands — which on this stream is one whole SSE event. No
+                    # waiting for a read buffer to fill, and none of the
+                    # per-byte Python cost of chunk_size=1 (which is what
+                    # made the ~1MB first snapshot peg a core for minutes,
+                    # queueing every live event behind it). Lines are split
+                    # out of a bytearray rather than by iter_lines, which
+                    # re-scans its whole pending buffer on every read (O(n²)).
                     buf = bytearray()
-                    for ch in r.iter_content(chunk_size=1):
+                    done = False
+                    for chunk in r.iter_content(chunk_size=None):
                         if self._stop.is_set():
                             return
-                        if not ch:
+                        if not chunk:
                             continue
-                        if ch != b"\n":
-                            buf += ch
-                            continue
-                        raw = buf.decode("utf-8", "replace").rstrip("\r")
-                        buf.clear()
-                        if raw == "":
-                            continue
-                        if raw.startswith("event:"):
-                            event = raw[6:].strip()
-                        elif raw.startswith("data:"):
-                            data = raw[5:].strip()
-                            if event in ("put", "patch"):
-                                try:
-                                    self._q.put(("remote", (event, json.loads(data))))
-                                except ValueError:
-                                    pass
-                            elif event == "auth_revoked":
-                                self._id_token = None
+                        buf += chunk
+                        while not done:
+                            nl = buf.find(b"\n")
+                            if nl < 0:
                                 break
-                            elif event == "cancel":
-                                break
+                            raw = bytes(buf[:nl]).decode("utf-8", "replace")
+                            del buf[:nl + 1]
+                            raw = raw.rstrip("\r")
+                            if raw == "":
+                                continue
+                            if raw.startswith("event:"):
+                                event = raw[6:].strip()
+                            elif raw.startswith("data:"):
+                                data = raw[5:].strip()
+                                if event in ("put", "patch"):
+                                    try:
+                                        self._q.put(
+                                            ("remote", (event, json.loads(data))))
+                                    except ValueError:
+                                        pass
+                                elif event == "auth_revoked":
+                                    self._id_token = None
+                                    done = True
+                                elif event == "cancel":
+                                    done = True
+                        if done:
+                            break
             except Exception as ex:
                 self.dbg(f"cloudsync sse: {ex}")
                 self._set_state("offline")
+            finally:
+                self._resp = None
             if self._stop.wait(backoff):
                 return
             backoff = min(backoff * 2, 60)
@@ -289,11 +314,24 @@ class CloudSync:
 
     def _worker(self):
         last_scan = 0.0
+        last_tick = time.time()
         while not self._stop.is_set():
             try:
                 item = self._q.get(timeout=SCAN_TICK_S)
             except queue.Empty:
                 item = None
+            # A wall-clock jump far bigger than the tick means the machine was
+            # asleep. The stream's socket is dead but sitting in a blocking
+            # recv and won't find out for another read-timeout, so hang up on
+            # it now — otherwise the first phone note after a lid-open can go
+            # unseen for a minute or more. (Wall clock, not monotonic: on
+            # Windows the monotonic clock doesn't count time spent suspended.)
+            now = time.time()
+            if now - last_tick > SCAN_TICK_S * 3:
+                self.dbg(f"cloudsync: {now - last_tick:.0f}s gap — "
+                         "reconnecting the live stream")
+                self._kick_stream()
+            last_tick = now
             try:
                 if item and item[0] == "remote":
                     self._handle_remote(*item[1])
