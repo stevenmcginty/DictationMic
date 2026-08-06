@@ -355,23 +355,74 @@ body.horizon-collapsed .h-toggle svg { transform: rotate(180deg); }
 .pane-note { flex: 1; display: flex; flex-direction: column; }
 
 .list-head {
-  display: flex; align-items: baseline; justify-content: space-between;
-  padding: 22px 20px 10px;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px;
+  padding: 18px 16px 12px;
   /* pinned: + Image / + File / + New stay reachable however far you scroll */
   position: sticky; top: 0; z-index: 6;
   background: rgba(11, 12, 10, .88);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 rgba(127, 176, 230, .10);
 }
 .eyebrow {
   font-family: var(--mono);
   font-size: 10px; letter-spacing: .28em; text-transform: uppercase;
   color: var(--muted);
 }
+.list-head > .eyebrow {
+  color: var(--horizon-accent);
+  text-shadow: 0 0 16px rgba(127, 176, 230, .22);
+}
 .count { font-size: 10px; letter-spacing: .12em; color: var(--faint); text-transform: uppercase; }
 .head-tools {
   display: inline-flex; align-items: center; gap: 12px;
   flex-wrap: wrap; justify-content: flex-end; row-gap: 6px;
+}
+.main-tools { gap: 6px; }
+.main-tools .capsule.small {
+  background: rgba(236, 238, 231, .035);
+  border-color: rgba(236, 238, 231, .11);
+  color: var(--muted);
+  transition: transform .12s var(--ease), border-color .2s, background .2s,
+              color .2s, box-shadow .2s;
+}
+.main-tools .capsule.small:hover {
+  background: rgba(236, 238, 231, .08);
+  border-color: rgba(236, 238, 231, .26);
+  color: var(--ink);
+}
+.main-tools #pcBtn,
+.main-tools #addFileBtn {
+  color: var(--horizon-accent);
+  background: var(--horizon-accent-dim);
+  border-color: rgba(127, 176, 230, .28);
+}
+.main-tools #pcBtn:hover,
+.main-tools #addFileBtn:hover {
+  background: rgba(127, 176, 230, .23);
+  border-color: rgba(127, 176, 230, .52);
+  box-shadow: 0 0 14px rgba(127, 176, 230, .10);
+}
+.main-tools #addImageBtn {
+  color: #D1B7FF;
+  background: rgba(177, 130, 255, .10);
+  border-color: rgba(177, 130, 255, .24);
+}
+.main-tools #addImageBtn:hover {
+  background: rgba(177, 130, 255, .18);
+  border-color: rgba(177, 130, 255, .46);
+}
+.main-tools #newNoteBtn {
+  color: var(--volt);
+  background: var(--volt-dim);
+  border-color: rgba(182, 238, 63, .34);
+  font-weight: 600;
+}
+.main-tools #newNoteBtn:hover {
+  background: rgba(182, 238, 63, .22);
+  border-color: rgba(182, 238, 63, .62);
+  box-shadow: 0 0 16px rgba(182, 238, 63, .12);
 }
 .capsule.small { height: 28px; padding: 0 12px; font-size: 12px; border-radius: 14px; }
 
