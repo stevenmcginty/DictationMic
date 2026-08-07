@@ -33,3 +33,5 @@ Looking for the Android app? It's on the
 ---
 
 SHA-256 of `DictationMic-Windows.zip`: `__SHA256__`
+
+<!-- Republish trigger: 2026-08-07 (new build uploaded 2026-08-06) -->
