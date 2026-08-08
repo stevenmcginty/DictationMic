@@ -27,11 +27,14 @@ import org.json.JSONArray
 object Updater {
     private const val RELEASES =
         "https://api.github.com/repos/stevenmcginty/DictationMic/releases"
-    private const val CHANNEL = "updates"
+    // Not the old "updates" channel: importance is baked in at creation and
+    // that one was LOW — a silent row folded into the shade, which is why an
+    // update could sit there unseen. This one gets a heads-up banner.
+    private const val CHANNEL = "app-updates"
     private const val NOTIF_ID = 2
-    // Short on purpose: "there's an update" should arrive on the first launch
-    // after a release goes out, not up to six hours later.
-    private const val CHECK_GAP_MS = 900_000L      // 15 minutes
+    // Only rate-limits the GitHub call. A release that's already been found is
+    // re-announced on every open regardless (see pendingUpdate).
+    private const val CHECK_GAP_MS = 300_000L      // 5 minutes
 
     const val ACTION_INSTALL = "org.dictationmic.android.INSTALL_UPDATE"
     const val EXTRA_APK_URL = "apkUrl"
@@ -39,15 +42,30 @@ object Updater {
 
     data class Release(val version: String, val apkUrl: String?, val pageUrl: String)
 
-    fun checkQuietly(ctx: Context, currentVersion: String) {
+    // Called on every resume. Refreshes the release cache (rate-limited), and
+    // returns the update that should be offered right now — from the cache, so
+    // closing and reopening the app re-offers it instantly instead of going
+    // quiet inside the check gap. Also posts the notification as a fallback
+    // for when the app isn't open.
+    fun pendingUpdate(ctx: Context, currentVersion: String): Release? {
         val p = ctx.getSharedPreferences("app", Context.MODE_PRIVATE)
         val last = p.getLong("lastUpdateCheck", 0L)
-        if (System.currentTimeMillis() - last < CHECK_GAP_MS) return
-        p.edit().putLong("lastUpdateCheck", System.currentTimeMillis()).apply()
-
-        val rel = latestAndroidRelease() ?: return
-        if (!isNewer(rel.version, currentVersion)) return
+        if (System.currentTimeMillis() - last >= CHECK_GAP_MS) {
+            p.edit().putLong("lastUpdateCheck", System.currentTimeMillis()).apply()
+            latestAndroidRelease()?.let { rel ->
+                p.edit()
+                    .putString("pendingVersion", rel.version)
+                    .putString("pendingApkUrl", rel.apkUrl)
+                    .putString("pendingPageUrl", rel.pageUrl)
+                    .apply()
+            }
+        }
+        val v = p.getString("pendingVersion", null) ?: return null
+        if (!isNewer(v, currentVersion)) return null
+        val rel = Release(v, p.getString("pendingApkUrl", null),
+            p.getString("pendingPageUrl", "") ?: "")
         notify(ctx, rel)
+        return rel
     }
 
     // Releases are tagged android-v0.3 / windows-latest in the same repo, so
@@ -125,9 +143,10 @@ object Updater {
 
     private fun notify(ctx: Context, rel: Release) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
+        nm.deleteNotificationChannel("updates")    // the old silent channel
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL, "App updates",
-                NotificationManager.IMPORTANCE_LOW))
+                NotificationManager.IMPORTANCE_HIGH))
         // Tap installs in-app. Only a release with no APK attached — which the
         // ship checklist says should never happen — falls back to the browser.
         val open = if (rel.apkUrl != null) {

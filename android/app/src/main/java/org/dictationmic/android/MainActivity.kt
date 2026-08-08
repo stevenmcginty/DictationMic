@@ -279,6 +279,26 @@ class MainActivity : ComponentActivity() {
     private fun hasMic() = ContextCompat.checkSelfPermission(
         this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
+    // The unmissable version of "there's an update": a dialog in the app
+    // itself, offered once per version per launch. "Later" costs nothing —
+    // the next open offers it again.
+    private var offeredUpdate: String? = null
+    private fun offerUpdate(rel: Updater.Release) {
+        if (isFinishing || offeredUpdate == rel.version) return
+        if (DictationState.running.value) return   // never interrupt a dictation
+        offeredUpdate = rel.version
+        android.app.AlertDialog.Builder(this)
+            .setTitle("DictationMic ${rel.version} is ready")
+            .setMessage("Install it now? It updates in place and keeps your notes.")
+            .setPositiveButton("Install") { _, _ ->
+                val url = rel.apkUrl
+                if (url != null) installUpdate(url, rel.version)
+                else startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(rel.pageUrl)))
+            }
+            .setNegativeButton("Later", null)
+            .show()
+    }
+
     // Download in the background, then let Android's installer take over. Same
     // signing key, so it installs over the top and keeps the account and notes.
     private fun installUpdate(url: String, version: String) {
@@ -300,10 +320,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Every return to the app is a chance to notice a new release — the
-        // 15-minute gap inside checkQuietly keeps it from hammering GitHub.
+        // Every return to the app re-offers a known update immediately — a
+        // dialog, so it works even with notifications blocked. Only the
+        // GitHub call itself is rate-limited.
         lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            Updater.checkQuietly(applicationContext, appVersion())
+            val rel = Updater.pendingUpdate(applicationContext, appVersion())
+            if (rel != null) withContext(kotlinx.coroutines.Dispatchers.Main) {
+                offerUpdate(rel)
+            }
         }
         // The recorder runs in a service and keeps going with this activity
         // gone, so the page is only ever a mirror of it. Poll while we're on
