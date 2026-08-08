@@ -59,6 +59,14 @@ export class App {
     // minute tick: "today" rolls over at midnight, finished tiles dim
     setInterval(() => this.horizon.render(this.notes), 60000);
     if (this.opts.showMic) $("micFab").hidden = false;
+    // "?dictate=1" — the manifest's Dictate shortcut, and anything else that
+    // launches us by voice. Go straight to the mic and start listening without
+    // a tap. Consumed here so a later visit to #/mic is an ordinary one.
+    if (this.opts.showMic
+        && new URLSearchParams(location.search).get("dictate") === "1") {
+      this._handsFree = true;
+      history.replaceState(null, "", location.pathname + "#/mic");
+    }
     this.route();
     addEventListener("hashchange", () => this.route());
   }
@@ -75,7 +83,9 @@ export class App {
     } else if (h === "#/mic" && this.opts.showMic) {
       document.body.classList.add("view-mic");
       $("micPane").hidden = false;
-      this.opts.openMic?.(this);
+      const handsFree = this._handsFree === true;
+      this._handsFree = false;
+      this.opts.openMic?.(this, { handsFree });
     } else {
       this.activeId = null;
       this._saveBody.flush();

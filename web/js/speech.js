@@ -24,6 +24,9 @@ const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const RUN_WATCHDOG_MS = 15000; // a run silent this long is hung — recycle it
 const AUTO_STOP_MS = 20000;    // silence that ends the session
+// Hands-free is for talking with the phone out of sight, so a pause to think
+// must not end the session the way a 20-second gap does on screen.
+const HANDS_FREE_STOP_MS = 300000;
 const LIVE_PUSH_MS = 1500;     // at most one live upload per this, newest wins
 const METER_BARS = 24;
 
@@ -46,6 +49,7 @@ let livePushing = false;     // one upload in flight
 let livePushAgain = false;   // …and newer text arrived while it was
 let livePush = Promise.resolve();   // that upload, so Save/Discard can wait
 let liveEpoch = 0;           // bumped by discard/reset — voids in-flight pushes
+let handsFree = false;       // opened by voice: speak state, don't time out fast
 // NOTE: no page-held getUserMedia keep-alive stream here. Holding the mic
 // used to silence Chrome's per-run chime, but Android Chrome now refuses to
 // feed SpeechRecognition while the page owns the mic — runs hear nothing,
@@ -54,10 +58,43 @@ let liveEpoch = 0;           // bumped by discard/reset — voids in-flight push
 
 export function micAvailable() { return !!SR; }
 
-export function openMic(appInstance) {
+export function openMic(appInstance, opts = {}) {
   app = appInstance;
   if (!bound) { bind(); bound = true; }
   render();
+  // Launched hands-free (voice, or the "Dictate" launcher shortcut): the screen
+  // is in a pocket, so every state change has to be audible instead of visible.
+  if (opts.handsFree && !active) {
+    handsFree = true;
+    say("Listening", () => { if (!active) start(); });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Spoken status — the whole hands-free flow rests on this. An installed PWA is
+// granted autoplay by Chrome, so this is audible over Bluetooth without a tap;
+// in a browser tab it may be silently dropped, which costs nothing.
+//
+// Never speak while a run is live: the recogniser has the mic to itself and
+// would happily transcribe our own voice back into the note. Callers that are
+// about to start dictating pass `then` and start from there.
+function say(text, then) {
+  const synth = window.speechSynthesis;
+  if (!synth || !text) { then?.(); return; }
+  let done = false;
+  const go = () => { if (!done) { done = true; then?.(); } };
+  try {
+    synth.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-GB";
+    u.rate = 1.05;
+    u.onend = go;
+    u.onerror = go;
+    synth.speak(u);
+    // Android sometimes fires neither event (no voice pack, output switching
+    // to the buds mid-utterance). Never let the session hang on it.
+    setTimeout(go, 400 + text.length * 90);
+  } catch { go(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -66,8 +103,13 @@ function bind() {
   const meter = $("micMeter");
   for (let i = 0; i < METER_BARS; i++) meter.append(document.createElement("i"));
 
-  $("micMainBtn").addEventListener("click", () => active ? stop() : start());
-  $("micSaveBtn").addEventListener("click", save);
+  // A tap means the screen is in hand — drop back to the on-screen behaviour
+  // (short silence timeout, no spoken status) for the rest of the session.
+  $("micMainBtn").addEventListener("click", () => {
+    handsFree = false;
+    active ? stop() : start();
+  });
+  $("micSaveBtn").addEventListener("click", () => save());
   $("micDiscardBtn").addEventListener("click", async () => {
     await discardLive();                   // it's already on the desktop — pull it back
     reset();
@@ -75,7 +117,9 @@ function bind() {
   });
 
   addEventListener("hashchange", () => {
-    if (location.hash !== "#/mic" && active) stop();
+    if (location.hash === "#/mic") return;
+    handsFree = false;
+    if (active) stop();
   });
   document.addEventListener("visibilitychange", async () => {
     if (!document.hidden && active && wakeLock === null) acquireWake();
@@ -134,7 +178,9 @@ function startRun() {
   rec.onerror = e => {
     if (e.error === "audio-capture") {
       active = false;
-      app?.toast("Can't reach the microphone — is another app using it?", 3500);
+      const msg = "Can't reach the microphone — is another app using it?";
+      app?.toast(msg, 3500);
+      if (handsFree) { handsFree = false; say(msg); }
       finishRun();
       render();
       return;
@@ -142,6 +188,10 @@ function startRun() {
     if (e.error === "not-allowed" || e.error === "service-not-allowed") {
       active = false;
       app?.toast("Microphone blocked — allow it in Chrome's site settings", 3500);
+      if (handsFree) {
+        handsFree = false;
+        say("The microphone is blocked. Open DictationMic and allow it.");
+      }
       finishRun();
       render();
     }
@@ -179,11 +229,22 @@ function armRunWatchdog() {
                              RUN_WATCHDOG_MS);
 }
 
+// The only way to finish a note when the phone is in a pocket. Matched on the
+// tail of a finished utterance so it can't fire off a word said mid-sentence,
+// and stripped out so it never lands in the note.
+const STOP_PHRASE = /[\s,.]*\b(?:end note|save note|stop dictation|finish note)\b[\s,.!]*$/i;
+
 function commitUtterance() {
   if (utterance) {
+    let ending = false;
+    if (handsFree && STOP_PHRASE.test(utterance)) {
+      utterance = utterance.replace(STOP_PHRASE, "");
+      ending = true;
+    }
     committed = fold(committed, utterance);
     utterance = "";
     paint();
+    if (ending) { setTimeout(endHandsFreeOrStop, 0); return; }
     // Nothing used to leave the phone until the Save tap, so the desktop pill
     // was a whole dictation plus a decision behind. Every finished utterance
     // now goes up as it lands and the pill fills in live. When the session is
@@ -287,13 +348,19 @@ function reset() {
   paint();
 }
 
-async function save() {
+async function save({ spoken = false } = {}) {
   commitUtterance();          // session is over, so this kicks a push straight off
   clearTimeout(livePushTimer);
   livePushTimer = null;
   await livePush.catch(() => {});
   const text = committed.replace(/\s+/g, " ").trim();
-  if (!text) { await discardLive(); reset(); render(); return; }
+  if (!text) {
+    await discardLive();
+    reset();
+    render();
+    if (spoken) say("Nothing to save");
+    return;
+  }
   try {
     if (liveNoteId) {
       await app.adapter.update(liveNoteId, text);
@@ -311,11 +378,15 @@ async function save() {
     app.notes = await app.adapter.list();
     app.renderList();
     app.toast("Saved — it'll appear on your computer");
+    if (spoken) say(`Saved. ${wordCount(text)} words, on your computer.`);
     location.hash = "#/";
   } catch (e) {
     app.toast(e.message || "Couldn't save");
+    if (spoken) say("Couldn't save that — it's still on the phone");
   }
 }
+
+const wordCount = s => (s.match(/\S+/g) || []).length;
 
 // ---------------------------------------------------------------------------
 
@@ -340,7 +411,19 @@ function render() {
 
 function armIdleTimer() {
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => { if (active) stop(); }, AUTO_STOP_MS);
+  idleTimer = setTimeout(
+    () => { if (active) endHandsFreeOrStop(); },
+    handsFree ? HANDS_FREE_STOP_MS : AUTO_STOP_MS);
+}
+
+// With no screen there is no Save button to reach for, so a hands-free session
+// that ends — by the spoken stop phrase or by running out of silence — commits
+// itself and says so.
+function endHandsFreeOrStop() {
+  stop();
+  if (!handsFree) return;
+  handsFree = false;
+  save({ spoken: true });
 }
 
 function startMeter() {
