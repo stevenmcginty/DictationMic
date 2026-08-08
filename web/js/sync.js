@@ -20,6 +20,7 @@ let lastBeat = 0;             // last time the live stream produced ANY event
 let watchdog = null;          // force-reconnects a stream that's gone silent
 let streamLive = false;       // is the live pull actually connected right now
 let reconnectTimer = null;    // one pending reconnect (avoids retry storms)
+let streamOpenedAt = 0;       // when the current stream connected — see reconcile
 
 function scheduleRetry() {
   if (retryTimer) return;
@@ -123,7 +124,12 @@ export async function flush() {
         // record and nothing to reconcile here.
       } else {
         const note = await notesDb.get(e.id);
-        if (note) await notesDb.put({ ...note, syncedRev: rev, updatedAt: rev });
+        // syncedAt is our own clock, not the server's, and it exists purely so
+        // reconcile can tell "this note went up after the snapshot was taken"
+        // from "this note was purged on another device".
+        if (note) await notesDb.put({
+          ...note, syncedRev: rev, updatedAt: rev, syncedAt: Date.now(),
+        });
       }
       await outboxDb.del(e.key);
       lastSync = Date.now();
@@ -154,7 +160,9 @@ async function connect() {
   es.addEventListener("auth_revoked", () => hardReconnect());
   es.addEventListener("cancel", () => hardReconnect());
   es.onopen = () => {
-    esBackoff = 1000; lastBeat = Date.now(); streamLive = true; setState("ok");
+    esBackoff = 1000; lastBeat = Date.now(); streamLive = true;
+    streamOpenedAt = Date.now();
+    setState("ok");
   };
   es.onerror = () => {
     streamLive = false;
@@ -373,11 +381,24 @@ async function reconcile(snapshot) {
       await applyOne(id, record);
     }
   }
-  // synced notes missing from the snapshot were deleted+purged elsewhere
+  // Synced notes missing from the snapshot were deleted and purged elsewhere —
+  // but only if the snapshot is new enough to have known about them.
+  //
+  // The root "put" is the whole tree as it stood when the stream connected, and
+  // it arrives a moment later. Tap "+ New" inside that gap and the note is
+  // created, flushed, and stamped synced before the snapshot lands — so it has
+  // a syncedRev, no outbox entry, and no place in a snapshot that predates it.
+  // Every guard below passed and the sweep deleted it: the editor you had just
+  // opened slammed shut and the note was gone, most reliably on the first "+
+  // New" after a launch, which is exactly when the stream is connecting.
+  //
+  // A note that reached the cloud after this stream opened cannot be one the
+  // snapshot deliberately omitted, so it is never swept.
   for (const n of await notesDb.all()) {
-    if (!seen.has(n.id) && (n.syncedRev || 0) > 0 && !pending.has(n.id)) {
-      await notesDb.del(n.id);
-    }
+    if (seen.has(n.id) || pending.has(n.id)) continue;
+    if ((n.syncedRev || 0) <= 0) continue;              // never reached the cloud
+    if ((n.syncedAt || 0) > streamOpenedAt) continue;   // younger than the snapshot
+    await notesDb.del(n.id);
   }
 }
 

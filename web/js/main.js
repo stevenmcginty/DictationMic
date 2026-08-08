@@ -7,6 +7,12 @@ import { App } from "./ui.js";
 const $ = id => document.getElementById(id);
 const isLocal = ["127.0.0.1", "localhost"].includes(location.hostname);
 
+// Bumped with every deploy, shown under the email in the account popup. A
+// phone runs whatever the service worker last cached, which is not necessarily
+// what was last deployed — so "have you actually got the fix yet" was a
+// guess. Now it's a number you can read off the screen.
+const BUILD = 28;
+
 function grabToken() {
   // the pill opens us as /#t=<per-run token>; keep it for this tab only
   const m = location.hash.match(/^#t=([\w-]+)/);
@@ -24,6 +30,8 @@ async function wireAccountPop() {
   $("statusCapsule").addEventListener("click", e => {
     e.stopPropagation();
     $("accountEmail").textContent = email() || "(unknown)";
+    $("accountBuild").textContent =
+      `build ${BUILD}` + (shell() ? ` · app ${nativeVersion()}` : "");
     pop.hidden = !pop.hidden;
   });
   $("signOutBtn").addEventListener("click", () => {
@@ -59,12 +67,14 @@ async function drainSharedFiles(app) {
 }
 
 // The service worker claims this page the moment it activates (skipWaiting +
-// clients.claim), which fires "controllerchange". Reloading on that blindly is
-// what made a freshly-tapped "+ New" note vanish a few seconds after opening:
-// the reload landed on #/note/<id> before the note had come back from the
-// adapter, openNote() found nothing and bounced to the list.
+// clients.claim), which fires "controllerchange". Reloading on that blindly
+// throws away whatever the user was doing — an open editor, a half-typed note —
+// for a version they'd get on the next launch anyway.
 //
-// Two guards now:
+// (This was once blamed for "+ New" closing itself. It wasn't the cause; that
+// was the reconcile sweep in sync.js. It is still a bad reload.)
+//
+// Two guards:
 //   - the very first claim (no controller at boot: fresh install, cleared
 //     storage, first launch after the SW was unregistered) changes nothing
 //     about the files this page is already running. Never reload for it.
@@ -97,6 +107,9 @@ function wireServiceWorker() {
 // Everything else about the app is identical either way — that's the point of
 // the shell: one app, one sign-in, and a hosting deploy updates both.
 const shell = () => !!window.DictationMicNative;
+const nativeVersion = () => {
+  try { return window.DictationMicNative.version() || "?"; } catch { return "?"; }
+};
 
 // One sign-in, two consumers. The page owns the account — it has the form, it
 // talks to Identity Toolkit, it holds the refresh token. The shell's recorder

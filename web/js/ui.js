@@ -413,13 +413,26 @@ export class App {
     this.renderList();
     if (this.activeId) {
       const n = this.notes.find(n => n.id === this.activeId);
-      if (!n) {                                     // deleted elsewhere
-        location.hash = "#/";
+      if (!n) {
+        // Gone from the list we're holding. "Deleted elsewhere" is one reason;
+        // the other is a sync pass that landed between creating a note and it
+        // reaching this list, and closing the editor under a note that still
+        // exists is far worse than leaving a deleted one on screen a moment
+        // longer. Confirm against the store before throwing the view away.
+        this._closeIfReallyGone(this.activeId);
       } else if (document.activeElement !== $("noteBody")
                  && document.activeElement !== $("noteTitle")) {
         this._fillEditor(n);                        // don't stomp on typing
       }
     }
+  }
+
+  async _closeIfReallyGone(id) {
+    const n = await Promise.resolve(this.adapter.get(id)).catch(() => null);
+    if (this.activeId !== id) return;               // moved on while we waited
+    if (!n) { location.hash = "#/"; return; }
+    this._cache(n);                                 // it was only missing here
+    this.renderList();
   }
 
   // ---------------- editor ----------------
@@ -517,7 +530,25 @@ export class App {
 
   openNote(id) {
     const n = this.notes.find(n => n.id === id);
-    if (!n) { location.hash = "#/"; return; }
+    if (n) this._showNote(id, n); else this._openUnlisted(id);
+  }
+
+  // The id isn't in the list we're holding. That is almost always timing
+  // rather than a missing note — the router runs on a hash we arrived at
+  // before the list came back, which is exactly what happens on any reload
+  // that lands on #/note/<id>. Bouncing straight to "#/" here is what made a
+  // freshly created note slam shut seconds after it opened, so ask the store
+  // for the note itself before giving up on it.
+  async _openUnlisted(id) {
+    const n = await Promise.resolve(this.adapter.get(id)).catch(() => null);
+    if (location.hash !== `#/note/${id}`) return;   // moved on while we waited
+    if (!n) { location.hash = "#/"; return; }       // genuinely gone
+    this._cache(n);
+    this.renderList();
+    this._showNote(id, n);
+  }
+
+  _showNote(id, n) {
     this._saveBody.flush();
     this.activeId = id;
     this._fillEditor(n);
