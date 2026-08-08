@@ -83,12 +83,43 @@ class DictationService : Service() {
         // listening perfectly to someone who has no screen to check.
         private const val NUDGE_AFTER_MS = 12_000L
 
+        // How long the finaliser gets to confirm a stop phrase heard in a
+        // partial before we end the session on the partial text instead. The
+        // finaliser is usually quicker than this; when it isn't — or when it
+        // answers with a no-match — waiting for it is the difference between
+        // "end note" ending the note and appearing to be ignored.
+        private const val STOP_GRACE_MS = 900L
+
         // The only way to finish a note when the phone is in a pocket. Matched
         // at the end of a finished phrase so it can't fire off a word said
         // mid-sentence, and stripped out so it never lands in the note.
+        //
+        // Spelling variants matter more than they look: the recogniser hears
+        // "end note" and writes "endnote", "end notes" or "and note" about as
+        // often as the literal two words, and each miss used to leave the
+        // session running with the phrase typed into the note.
         val STOP_PHRASE = Regex(
-            """[\s,.]*\b(?:end (?:the )?note|save (?:the )?note|end dictation|stop dictat(?:ion|ing)|finish(?:ed)? note|note (?:done|finished)|stop recording|end recording)\b[\s,.!]*$""",
+            """[\s,."']*\b(?:(?:end|and)\s*(?:the\s+)?(?:notes?|knots?)|end\s*of\s*(?:the\s+)?note|save\s+(?:the\s+)?note|end\s+(?:the\s+)?dictation|stop\s+dictat(?:ion|ing)|finish(?:ed)?\s+note|note\s+(?:done|finished)|stop\s+recording|end\s+recording)\b[\s,.!?"']*$""",
             RegexOption.IGNORE_CASE)
+
+        // Fallback sweep for the case where the finaliser rewrote the phrase we
+        // matched in the partial into something STOP_PHRASE no longer matches.
+        // We know a stop was asked for, so trailing stop-ish words are debris,
+        // not dictation. Bounded to a few words so it can't eat a sentence.
+        private val STOP_TAIL = Regex(
+            """[\s,."']*\b(?:end|ends|and|save|saved|stop|stopped|finish|finished|note|notes|knot|knots|dictation|dictating|recording|of|the)\b[\s,.!?"']*$""",
+            RegexOption.IGNORE_CASE)
+
+        // Strip the stop phrase from text that is about to be saved.
+        fun stripStopPhrase(text: String): String {
+            if (STOP_PHRASE.containsMatchIn(text)) return STOP_PHRASE.replace(text, "")
+            var out = text
+            repeat(3) {
+                if (!STOP_TAIL.containsMatchIn(out)) return out
+                out = STOP_TAIL.replace(out, "")
+            }
+            return out
+        }
 
         fun start(ctx: Context, handsFree: Boolean = false) {
             val i = Intent(ctx, DictationService::class.java)
@@ -110,6 +141,10 @@ class DictationService : Service() {
     @Volatile private var recording = false
     @Volatile private var handsFree = false  // opened by voice: speak the state
     private var listening = false            // a startListening is in flight
+    // A stop phrase was heard in a partial; the session ends on whatever comes
+    // back next, result or error. Without it the request lived only in the
+    // final text, and any rewrite by the finaliser silently dropped it.
+    @Volatile private var pendingStop = false
     private var lastVoiceAt = 0L             // for the "stop after silence" timer
     private var autoStopMs = 0L
     // the note this session is filling in, created on the first finished phrase
@@ -158,6 +193,7 @@ class DictationService : Service() {
         DictationState.partial.value = ""
         DictationState.running.value = true
         recording = true
+        pendingStop = false
         lastVoiceAt = System.currentTimeMillis()
         autoStopMs = getSharedPreferences("app", MODE_PRIVATE)
             .getInt("autoStopSecs", 0) * 1000L
@@ -280,24 +316,27 @@ class DictationService : Service() {
                 lastVoiceAt = System.currentTimeMillis()
                 // The stop phrase lands in a partial first, and acting on it
                 // only at the final meant waiting out the end-of-speech silence
-                // — the clunk. Force the recogniser to finalise now; onResults
-                // does the actual stripping and stopping.
-                if (STOP_PHRASE.containsMatchIn(it)) {
+                // — the clunk. Force the recogniser to finalise now and hold
+                // the decision in pendingStop, so the session ends on whatever
+                // comes back. The grace timer ends it on this partial if
+                // nothing comes back in time.
+                if (!pendingStop && STOP_PHRASE.containsMatchIn(it)) {
+                    pendingStop = true
                     runCatching { recognizer?.stopListening() }
+                    main.postDelayed(stopGrace, STOP_GRACE_MS)
                 }
             }
         }
 
         override fun onResults(results: Bundle?) {
+            main.removeCallbacks(stopGrace)
             var text = firstResult(results)
-            var ending = false
             // Honoured in every session, not only hands-free ones — a session
             // started by tap used to write "end note" into the note instead of
             // ending it.
-            if (!text.isNullOrBlank() && STOP_PHRASE.containsMatchIn(text)) {
-                text = STOP_PHRASE.replace(text, "")
-                ending = true
-            }
+            val ending = pendingStop ||
+                (!text.isNullOrBlank() && STOP_PHRASE.containsMatchIn(text))
+            if (ending && !text.isNullOrBlank()) text = stripStopPhrase(text)
             if (!text.isNullOrBlank()) {
                 DictationState.finals.value =
                     (DictationState.finals.value + " " + text).trim()
@@ -318,8 +357,17 @@ class DictationService : Service() {
         }
 
         override fun onError(error: Int) {
+            main.removeCallbacks(stopGrace)
+            val stopping = pendingStop
             DictationState.partial.value = ""
             listening = false
+            // A stop phrase forced the finaliser and it came back empty — a
+            // no-match, not a change of mind. Ending here is what stops the
+            // request being silently dropped and the session running on.
+            if (stopping) {
+                if (handsFree) Speaker.speak("Got it. Saving.")
+                stopSession(); return
+            }
             if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                 if (handsFree) {
                     handsFree = false      // stopSession must not also announce
@@ -335,6 +383,24 @@ class DictationService : Service() {
         }
 
         override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
+    // The finaliser had its chance and said nothing. Save what the partial
+    // already showed — the text is on screen and in the phrase we matched, so
+    // waiting longer only makes "end note" feel broken.
+    private val stopGrace = Runnable {
+        if (!recording || !pendingStop) return@Runnable
+        val text = stripStopPhrase(DictationState.partial.value).trim()
+        if (text.isNotBlank()) {
+            DictationState.finals.value =
+                (DictationState.finals.value + " " + text).trim()
+            updateNotification(DictationState.finals.value)
+            pushTicks?.trySend(Unit)
+        }
+        DictationState.partial.value = ""
+        listening = false
+        if (handsFree) Speaker.speak("Got it. Saving.")
+        stopSession()
     }
 
     private fun firstResult(b: Bundle?): String? =
@@ -370,6 +436,8 @@ class DictationService : Service() {
     private fun stopSession() {
         if (!recording) { stopSelf(); return }
         recording = false
+        pendingStop = false
+        main.removeCallbacks(stopGrace)
         main.post {
             listening = false
             runCatching { recognizer?.stopListening() }

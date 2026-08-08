@@ -58,6 +58,23 @@
             android:exported="false"
             android:foregroundServiceType="microphone" />
 
+        <!-- Quick Settings tile: the one lock-screen way into a dictation that
+             doesn't go through the fingerprint. TOGGLEABLE_TILE is what lets it
+             be tapped while locked instead of prompting to unlock first. -->
+        <service
+            android:name=".DictationTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_tile_mic"
+            android:label="@string/tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+        </service>
+
         <!-- Serves the downloaded update APK (app cache is private otherwise)
              to the system installer. Paths whitelisted in res/xml/file_paths. -->
         <provider
