@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">DictationMic</string>
+    <!-- Two words on purpose. Spoken, "open dictation mic" is transcribed as
+         two words; the assistant matches app names against that text, and a
+         one-word "DictationMic" missed — so Gemini fell back to its own
+         dictation feature ("fire away") instead of launching the app. -->
+    <string name="app_name">Dictation Mic</string>
     <string name="shortcut_dictate_short">Dictate</string>
     <string name="shortcut_dictate_long">Start dictating</string>
 </resources>
