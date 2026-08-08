@@ -73,8 +73,29 @@ Commit to `main` (this repo's history is entirely direct-to-main) and
 
 ## Notes
 
-- **Android is dead.** Steve wants the PWA only — it does email sign-in sync and
-  works on iOS. Never build, rebuild, or offer an APK.
+- **Android is alive again, and a hosting deploy is most of its update.** The
+  APK is a WebView shell over `https://dictationmic-sync.web.app` — the same
+  origin the PWA loads — so steps 1–4 above ship the phone app's entire
+  interface too. Nothing extra to do for a web-only change.
+- **When to rebuild the APK.** Only when something under `android/` changes:
+  the recorder, the bridge, permissions, the manifest. Then:
+
+  ```powershell
+  $env:JAVA_HOME = "C:\Program Files\Microsoft\jdk-21.0.11.10-hotspot"
+  & "$env:USERPROFILE\.gradle\wrapper\dists\gradle-8.11.1-all\*\gradle-8.11.1\bin\gradle.bat" `
+      :app:assembleRelease --console=plain   # run from android\
+  ```
+
+  Bump `versionCode`/`versionName` in `android/app/build.gradle.kts`, copy
+  `android/app/build/outputs/apk/release/app-release.apk` to
+  `DictationMic-Android.apk`, then
+  `gh release create android-v<version> DictationMic-Android.apk`. The tag
+  prefix matters — `Updater.kt` scans releases for `android-v*` and notifies
+  the phone.
+- **Firebase Hosting can't serve the APK.** The Spark plan rejects executables
+  ("Executable files are forbidden on the Spark billing plan"), so
+  `hosting/downloads/` is for the Windows zip only. GitHub Releases is the
+  Android download.
 - The desktop app (`app.py`, `cloudsync.py`) is not part of a deploy — it ships
   as a rebuilt exe. Changes there only need the commit and push.
 - If the working tree has changes from another agent, they go too. Say what they
