@@ -232,19 +232,21 @@ function armRunWatchdog() {
 // The only way to finish a note when the phone is in a pocket. Matched on the
 // tail of a finished utterance so it can't fire off a word said mid-sentence,
 // and stripped out so it never lands in the note.
-const STOP_PHRASE = /[\s,.]*\b(?:end note|save note|stop dictation|finish note)\b[\s,.!]*$/i;
+const STOP_PHRASE = /[\s,.]*\b(?:end (?:the )?note|save (?:the )?note|end dictation|stop dictat(?:ion|ing)|finish(?:ed)? note|note (?:done|finished)|stop recording|end recording)\b[\s,.!]*$/i;
 
 function commitUtterance() {
   if (utterance) {
     let ending = false;
-    if (handsFree && STOP_PHRASE.test(utterance)) {
+    // Every session honours the stop phrase — a tap-started one used to write
+    // "end note" into the note instead of ending it.
+    if (STOP_PHRASE.test(utterance)) {
       utterance = utterance.replace(STOP_PHRASE, "");
       ending = true;
     }
     committed = fold(committed, utterance);
     utterance = "";
     paint();
-    if (ending) { setTimeout(endHandsFreeOrStop, 0); return; }
+    if (ending) { setTimeout(endBySpokenCommand, 0); return; }
     // Nothing used to leave the phone until the Save tap, so the desktop pill
     // was a whole dictation plus a decision behind. Every finished utterance
     // now goes up as it lands and the pill fills in live. When the session is
@@ -417,13 +419,23 @@ function armIdleTimer() {
 }
 
 // With no screen there is no Save button to reach for, so a hands-free session
-// that ends — by the spoken stop phrase or by running out of silence — commits
-// itself and says so.
+// that runs out of silence commits itself and says so. On-screen, the idle
+// timeout just pauses — Save and Discard are right there.
 function endHandsFreeOrStop() {
   stop();
   if (!handsFree) return;
   handsFree = false;
   save({ spoken: true });
+}
+
+// The spoken stop phrase always means "save this" — whoever said it asked for
+// exactly that, hands-free or not. Spoken confirmation only where there's no
+// screen being looked at.
+function endBySpokenCommand() {
+  const spoken = handsFree;
+  handsFree = false;
+  stop();
+  save({ spoken });
 }
 
 function startMeter() {

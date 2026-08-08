@@ -81,13 +81,13 @@ class DictationService : Service() {
         // Nothing heard at all for this long: say so. Without it, a session that
         // never got the microphone is indistinguishable from one that is
         // listening perfectly to someone who has no screen to check.
-        private const val NUDGE_AFTER_MS = 25_000L
+        private const val NUDGE_AFTER_MS = 12_000L
 
         // The only way to finish a note when the phone is in a pocket. Matched
         // at the end of a finished phrase so it can't fire off a word said
         // mid-sentence, and stripped out so it never lands in the note.
         val STOP_PHRASE = Regex(
-            """[\s,.]*\b(?:end note|save note|stop dictation|finish note)\b[\s,.!]*$""",
+            """[\s,.]*\b(?:end (?:the )?note|save (?:the )?note|end dictation|stop dictat(?:ion|ing)|finish(?:ed)? note|note (?:done|finished)|stop recording|end recording)\b[\s,.!]*$""",
             RegexOption.IGNORE_CASE)
 
         fun start(ctx: Context, handsFree: Boolean = false) {
@@ -169,12 +169,12 @@ class DictationService : Service() {
                 Speaker.init(applicationContext)
                 main.postDelayed({
                     if (!recording) return@postDelayed
-                    // Everything you need with no screen, in one breath: that it
-                    // opened, that it's your turn, and how to end it.
-                    Speaker.speak(
-                        "DictationMic ready. Start talking whenever you like, " +
-                            "and say end note when you're done."
-                    ) { main.post { if (recording) { listen(); armNudge() } } }
+                    // One word, then listen. The old greeting explained the whole
+                    // flow every time — five seconds of talking before the mic
+                    // opened, and anything said over it was lost.
+                    Speaker.speak("Ready.") {
+                        main.post { if (recording) { listen(); armNudge() } }
+                    }
                 }, ASSISTANT_HANDOVER_MS)
             } else {
                 listen()
@@ -265,13 +265,23 @@ class DictationService : Service() {
             firstResult(partialResults)?.let {
                 DictationState.partial.value = it
                 lastVoiceAt = System.currentTimeMillis()
+                // The stop phrase lands in a partial first, and acting on it
+                // only at the final meant waiting out the end-of-speech silence
+                // — the clunk. Force the recogniser to finalise now; onResults
+                // does the actual stripping and stopping.
+                if (STOP_PHRASE.containsMatchIn(it)) {
+                    runCatching { recognizer?.stopListening() }
+                }
             }
         }
 
         override fun onResults(results: Bundle?) {
             var text = firstResult(results)
             var ending = false
-            if (handsFree && !text.isNullOrBlank() && STOP_PHRASE.containsMatchIn(text)) {
+            // Honoured in every session, not only hands-free ones — a session
+            // started by tap used to write "end note" into the note instead of
+            // ending it.
+            if (!text.isNullOrBlank() && STOP_PHRASE.containsMatchIn(text)) {
                 text = STOP_PHRASE.replace(text, "")
                 ending = true
             }
@@ -287,7 +297,7 @@ class DictationService : Service() {
             if (ending) {
                 // Answer before the pause: saving pushes the note and waits on
                 // the network, and silence in headphones reads as a failure.
-                Speaker.speak("Got it. Saving.")
+                if (handsFree) Speaker.speak("Got it. Saving.")
                 stopSession()
                 return
             }

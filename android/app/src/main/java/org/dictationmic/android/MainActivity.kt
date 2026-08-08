@@ -151,9 +151,10 @@ class MainActivity : ComponentActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 loaded = true
-                if (startDictatingOnLoad) {
-                    startDictatingOnLoad = false
-                    requestMicThen { beginHandsFree() }
+                // Dictation no longer waits for this — the service is already
+                // running. All the page has to do is catch up and show it.
+                if (DictationState.running.value) {
+                    view.evaluateJavascript("location.hash = '#/mic'", null)
                 }
             }
 
@@ -211,7 +212,10 @@ class MainActivity : ComponentActivity() {
         val auto = asked || (autoStartWithHeadphones() &&
             AudioRoute.headphonesConnected(this) && !DictationState.running.value)
         if (!auto) return
-        if (loaded) requestMicThen { beginHandsFree() } else startDictatingOnLoad = true
+        // Start the recorder NOW — it's a service and needs nothing from the
+        // WebView. Waiting for the page to load here was seconds of talking to
+        // a dead microphone on every voice launch.
+        requestMicThen { beginHandsFree() }
     }
 
     private fun autoStartWithHeadphones() =
@@ -226,7 +230,9 @@ class MainActivity : ComponentActivity() {
     private fun beginHandsFree() {
         if (DictationState.running.value) return
         DictationService.start(this, handsFree = true)
-        web.evaluateJavascript("location.hash = '#/mic'", null)
+        // Before the first page load this is a no-op; onPageFinished sees the
+        // running service and routes to the mic screen itself.
+        if (loaded) web.evaluateJavascript("location.hash = '#/mic'", null)
     }
 
     private fun hasMic() = ContextCompat.checkSelfPermission(
