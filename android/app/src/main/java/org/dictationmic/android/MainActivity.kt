@@ -15,6 +15,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,6 +24,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 // The app is the web app.
@@ -111,10 +113,6 @@ class MainActivity : ComponentActivity() {
 
         web.loadUrl(TRUSTED_ORIGIN + "/")
         handleIntent(intent)
-
-        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
-            Updater.checkQuietly(applicationContext, appVersion())
-        }
     }
 
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
@@ -206,6 +204,15 @@ class MainActivity : ComponentActivity() {
     // PWA. The "Dictate" shortcut — and a voice launch with the buds in — goes
     // straight to recording without waiting for a tap on a screen you can't see.
     private fun handleIntent(intent: Intent?) {
+        // The update notification's tap: fetch the APK and hand it to the
+        // installer, right here in the app.
+        if (intent?.action == Updater.ACTION_INSTALL) {
+            val url = intent.getStringExtra(Updater.EXTRA_APK_URL)
+            if (url != null) {
+                installUpdate(url, intent.getStringExtra(Updater.EXTRA_VERSION) ?: "")
+            }
+            return
+        }
         val asked = intent?.getBooleanExtra(EXTRA_DICTATE, false) == true ||
             intent?.action == Intent.ACTION_ASSIST ||
             intent?.data?.getQueryParameter("dictate") == "1"
@@ -238,10 +245,32 @@ class MainActivity : ComponentActivity() {
     private fun hasMic() = ContextCompat.checkSelfPermission(
         this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
+    // Download in the background, then let Android's installer take over. Same
+    // signing key, so it installs over the top and keeps the account and notes.
+    private fun installUpdate(url: String, version: String) {
+        Toast.makeText(this,
+            "Downloading DictationMic ${version.ifBlank { "update" }}…",
+            Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val apk = Updater.download(applicationContext, url)
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                if (apk != null) Updater.install(this@MainActivity, apk)
+                else Toast.makeText(this@MainActivity,
+                    "Couldn't download the update — try again later",
+                    Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
     // ---- pushing recorder state into the page ------------------------------
 
     override fun onResume() {
         super.onResume()
+        // Every return to the app is a chance to notice a new release — the
+        // 15-minute gap inside checkQuietly keeps it from hammering GitHub.
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            Updater.checkQuietly(applicationContext, appVersion())
+        }
         // The recorder runs in a service and keeps going with this activity
         // gone, so the page is only ever a mirror of it. Poll while we're on
         // screen: a flow collector would need the page to be alive to receive

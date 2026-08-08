@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- In-app updates: hand a downloaded APK to the system installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Text-to-speech: the spoken status the hands-free flow depends on.
          Android 11+ hides other packages unless they're declared. -->
@@ -55,5 +57,17 @@
             android:name=".DictationService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!-- Serves the downloaded update APK (app cache is private otherwise)
+             to the system installer. Paths whitelisted in res/xml/file_paths. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="org.dictationmic.android.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

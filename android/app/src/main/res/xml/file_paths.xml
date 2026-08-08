@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the FileProvider may serve: only the updates folder in cache, where
+     Updater.download puts a fresh APK for the system installer to read. -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

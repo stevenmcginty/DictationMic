@@ -91,7 +91,12 @@ Commit to `main` (this repo's history is entirely direct-to-main) and
   `DictationMic-Android.apk`, then
   `gh release create android-v<version> DictationMic-Android.apk`. The tag
   prefix matters — `Updater.kt` scans releases for `android-v*` and notifies
-  the phone.
+  the phone. **The `.apk` asset must be attached to the release**: since 0.6
+  the phone updates in-app (the notification's tap downloads that asset and
+  opens Android's installer), and a release without one falls back to sending
+  Steve to the browser, which he has explicitly said he doesn't want.
+  **Always say in the end-of-ship summary when a new APK release went out**,
+  so Steve knows an update notification is coming to the phone.
 - **Firebase Hosting can't serve the APK.** The Spark plan rejects executables
   ("Executable files are forbidden on the Spark billing plan"), so
   `hosting/downloads/` is for the Windows zip only. GitHub Releases is the
