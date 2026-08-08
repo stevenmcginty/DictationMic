@@ -132,11 +132,24 @@ class DictationService : Service() {
     private fun startSession(handsFreeLaunch: Boolean) {
         handsFree = handsFreeLaunch
         createChannel()
-        ServiceCompat.startForeground(
-            this, NOTIF_ID, buildNotification("Listening…"),
-            if (Build.VERSION.SDK_INT >= 30)
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0,
-        )
+        // Without RECORD_AUDIO, startForeground with the MICROPHONE type throws
+        // a SecurityException that takes the whole app down — this was the
+        // tap-to-record crash. MainActivity asks for the permission before ever
+        // starting us; this is the last line of defence, and it bails out
+        // cleanly instead of crashing.
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            stopSelf()
+            return
+        }
+        val fg = runCatching {
+            ServiceCompat.startForeground(
+                this, NOTIF_ID, buildNotification("Listening…"),
+                if (Build.VERSION.SDK_INT >= 30)
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0,
+            )
+        }
+        if (fg.isFailure) { stopSelf(); return }
         wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dictationmic:rec")
             .apply { acquire() }

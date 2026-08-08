@@ -63,7 +63,9 @@ class MainActivity : ComponentActivity() {
     private var pendingMicRequest: PermissionRequest? = null
     private var stateJob: Job? = null
     private var loaded = false
-    private var startDictatingOnLoad = false
+    // A dictation waiting on the mic-permission dialog: null = none, otherwise
+    // the handsFree flag it should start with once the permission lands.
+    private var pendingDictation: Boolean? = null
 
     private val micPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission()) { granted ->
@@ -72,8 +74,19 @@ class MainActivity : ComponentActivity() {
         if (req != null) {
             if (granted) req.grant(req.resources) else req.deny()
         }
-        if (granted && startDictatingOnLoad) beginHandsFree()
-        startDictatingOnLoad = false
+        val handsFree = pendingDictation
+        pendingDictation = null
+        if (handsFree == null) return@registerForActivityResult
+        if (granted) {
+            beginDictation(handsFree)
+        } else {
+            // Refusing must be visible, not a silent dead button.
+            Toast.makeText(this,
+                "DictationMic can't record without the microphone — " +
+                    "allow it in Settings › Apps › DictationMic",
+                Toast.LENGTH_LONG).show()
+            if (handsFree) Speaker.speak("The microphone is blocked, so I can't record.")
+        }
     }
 
     private val filePick = registerForActivityResult(
@@ -133,7 +146,14 @@ class MainActivity : ComponentActivity() {
             userAgentString = userAgentString + " DictationMicShell"
         }
         w.addJavascriptInterface(
-            NativeBridge(applicationContext, appVersion()) { syncSoon() },
+            NativeBridge(
+                applicationContext, appVersion(),
+                onAccount = { syncSoon() },
+                // Bridge calls land on a WebView thread, and the permission
+                // dialog can only be launched from the UI thread.
+                onStartDictation = { hf ->
+                    runOnUiThread { startDictationWithPermission(hf) }
+                }),
             "DictationMicNative")
 
         w.webViewClient = object : WebViewClient() {
@@ -154,6 +174,16 @@ class MainActivity : ComponentActivity() {
                 if (DictationState.running.value) {
                     view.evaluateJavascript("location.hash = '#/mic'", null)
                 }
+            }
+
+            // The page's renderer process can be killed by the system (out of
+            // memory, a WebView update mid-flight). Unhandled, that takes the
+            // whole app down with it — rebuild the activity instead.
+            override fun onRenderProcessGone(
+                view: WebView, detail: android.webkit.RenderProcessGoneDetail,
+            ): Boolean {
+                recreate()
+                return true
             }
 
             // Only the very first launch can land here: after that the site's
@@ -222,24 +252,28 @@ class MainActivity : ComponentActivity() {
         // Start the recorder NOW — it's a service and needs nothing from the
         // WebView. Waiting for the page to load here was seconds of talking to
         // a dead microphone on every voice launch.
-        requestMicThen { beginHandsFree() }
+        startDictationWithPermission(handsFree = true)
     }
 
     private fun autoStartWithHeadphones() =
         getSharedPreferences("app", MODE_PRIVATE).getBoolean("autoStartHeadphones", true)
 
-    private fun requestMicThen(run: () -> Unit) {
-        if (hasMic()) { run(); return }
-        startDictatingOnLoad = true          // the permission result picks it up
+    // Every way a dictation starts — voice launch, the page's mic buttons —
+    // funnels through here, so the permission is always asked for before the
+    // service runs. Starting the microphone service without it is a crash,
+    // not a refusal, on Android 14+.
+    private fun startDictationWithPermission(handsFree: Boolean) {
+        if (hasMic()) { beginDictation(handsFree); return }
+        pendingDictation = handsFree         // the permission result picks it up
         micPermission.launch(Manifest.permission.RECORD_AUDIO)
     }
 
-    private fun beginHandsFree() {
+    private fun beginDictation(handsFree: Boolean) {
         if (DictationState.running.value) return
-        DictationService.start(this, handsFree = true)
+        DictationService.start(this, handsFree)
         // Before the first page load this is a no-op; onPageFinished sees the
         // running service and routes to the mic screen itself.
-        if (loaded) web.evaluateJavascript("location.hash = '#/mic'", null)
+        if (handsFree && loaded) web.evaluateJavascript("location.hash = '#/mic'", null)
     }
 
     private fun hasMic() = ContextCompat.checkSelfPermission(

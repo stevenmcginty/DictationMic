@@ -33,8 +33,8 @@ export function openMic(appInstance, opts = {}) {
   app = appInstance;
   if (!bound) { bind(); bound = true; }
   pull();                                  // redraw against a session already running
-  if (opts.handsFree && !last.running) {
-    handsFree = true;
+  if ((opts.handsFree || opts.autoStart) && !last.running) {
+    handsFree = !!opts.handsFree;
     start();
   }
 }

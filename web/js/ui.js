@@ -84,8 +84,10 @@ export class App {
       document.body.classList.add("view-mic");
       $("micPane").hidden = false;
       const handsFree = this._handsFree === true;
+      const autoStart = this._autoStart === true;
       this._handsFree = false;
-      this.opts.openMic?.(this, { handsFree });
+      this._autoStart = false;
+      this.opts.openMic?.(this, { handsFree, autoStart });
     } else {
       this.activeId = null;
       this._saveBody.flush();
@@ -966,7 +968,12 @@ export class App {
       }
     });
 
-    $("micFab").addEventListener("click", () => { location.hash = "#/mic"; });
+    // The mic button means "record", not "show me the mic screen" — it used
+    // to open a screen that sat there saying Ready, waiting for a second tap.
+    $("micFab").addEventListener("click", () => {
+      this._autoStart = true;
+      location.hash = "#/mic";
+    });
     $("newNoteBtn").addEventListener("click", () => this.newNote());
 
     // PC command panel — hosted PWA + signed in only (local/desktop hides it)

@@ -67,6 +67,8 @@ export function openMic(appInstance, opts = {}) {
   if (opts.handsFree && !active) {
     handsFree = true;
     say("Listening", () => { if (!active) start(); });
+  } else if (opts.autoStart && !active) {
+    start();                     // tapped the mic button: record, no ceremony
   }
 }
 

@@ -19,6 +19,7 @@ class NativeBridge(
     private val ctx: Context,
     private val versionName: String,
     private val onAccount: () -> Unit,
+    private val onStartDictation: (Boolean) -> Unit,
 ) {
     // Lets the web app tell a shell launch from a browser tab and switch the
     // mic screen over to the native recorder.
@@ -52,10 +53,14 @@ class NativeBridge(
         CloudSync.signOut(ctx)
     }
 
+    // Routed through the activity rather than starting the service here: the
+    // activity owns the mic-permission dialog, and starting the microphone
+    // service without the permission crashes the app on Android 14+ instead
+    // of refusing.
     @JavascriptInterface
     fun startDictation(handsFree: Boolean) {
         if (DictationState.running.value) return
-        DictationService.start(ctx, handsFree)
+        onStartDictation(handsFree)
     }
 
     @JavascriptInterface
