@@ -45,7 +45,7 @@ object Speaker {
             })
             while (pending.isNotEmpty()) {
                 val (text, then) = pending.removeFirst()
-                speak(text, then)
+                speak(text, then = then)
             }
         }
     }
@@ -58,13 +58,17 @@ object Speaker {
     // `then` runs once the words have finished playing. Callers that are about
     // to start recognising need that: the recogniser has the microphone to
     // itself and would happily transcribe our own announcement into the note.
-    fun speak(text: String, then: (() -> Unit)? = null) {
+    // `flush` false queues behind whatever is already playing. A closing line
+    // ("Saved, forty words") must not cut off the line that preceded it
+    // ("Got it, saving") — from the outside that sounds like a crash.
+    fun speak(text: String, flush: Boolean = true, then: (() -> Unit)? = null) {
         if (text.isBlank()) { then?.invoke(); return }
         val engine = tts
         if (engine == null || !ready) { pending.addLast(text to then); return }
         val id = "dm-${seq++}"
         if (then != null) synchronized(doneCallbacks) { doneCallbacks[id] = then }
-        val res = engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
+        val mode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        val res = engine.speak(text, mode, null, id)
         // A rejected utterance never produces a progress callback, so a caller
         // waiting to start dictating would wait forever.
         if (res != TextToSpeech.SUCCESS) fire(id)

@@ -74,6 +74,14 @@ class DictationService : Service() {
         // Hands-free is for talking with the phone out of sight, so a pause to
         // think must not end the session. Only a long true silence does.
         private const val HANDS_FREE_STOP_MS = 300_000L
+        // Assistant is still saying "Opening DictationMic" when we get here, and
+        // it holds audio focus — speak over it and the opening line is clipped
+        // or dropped entirely, which reads as the app not having started.
+        private const val ASSISTANT_HANDOVER_MS = 900L
+        // Nothing heard at all for this long: say so. Without it, a session that
+        // never got the microphone is indistinguishable from one that is
+        // listening perfectly to someone who has no screen to check.
+        private const val NUDGE_AFTER_MS = 25_000L
 
         // The only way to finish a note when the phone is in a pocket. Matched
         // at the end of a finished phrase so it can't fire off a word said
@@ -159,7 +167,15 @@ class DictationService : Service() {
             // "Listening" straight into the note.
             if (handsFree) {
                 Speaker.init(applicationContext)
-                Speaker.speak("Listening") { main.post { if (recording) listen() } }
+                main.postDelayed({
+                    if (!recording) return@postDelayed
+                    // Everything you need with no screen, in one breath: that it
+                    // opened, that it's your turn, and how to end it.
+                    Speaker.speak(
+                        "DictationMic ready. Start talking whenever you like, " +
+                            "and say end note when you're done."
+                    ) { main.post { if (recording) { listen(); armNudge() } } }
+                }, ASSISTANT_HANDOVER_MS)
             } else {
                 listen()
             }
@@ -185,6 +201,22 @@ class DictationService : Service() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         }
+
+    // "Is it actually hearing me?" is the one question you can't answer without
+    // a screen. Stay quiet while words are arriving; speak up only if the very
+    // start of a session produces nothing at all, which is what a refused
+    // microphone or a recogniser wedged on another app looks like from outside.
+    private fun armNudge() {
+        main.removeCallbacks(nudge)
+        main.postDelayed(nudge, NUDGE_AFTER_MS)
+    }
+
+    private val nudge = Runnable {
+        if (!recording || !handsFree) return@Runnable
+        if (DictationState.finals.value.isNotBlank() ||
+            DictationState.partial.value.isNotBlank()) return@Runnable
+        Speaker.speak("I'm not hearing anything yet. I'm still listening.")
+    }
 
     private fun listen() {
         if (!recording || listening) return
@@ -252,7 +284,13 @@ class DictationService : Service() {
             }
             DictationState.partial.value = ""
             listening = false
-            if (ending) { stopSession(); return }
+            if (ending) {
+                // Answer before the pause: saving pushes the note and waits on
+                // the network, and silence in headphones reads as a failure.
+                Speaker.speak("Got it. Saving.")
+                stopSession()
+                return
+            }
             continueOrStop(recreate = false)
         }
 
@@ -318,17 +356,12 @@ class DictationService : Service() {
         pushTicks?.close()                   // the loop finishes its last pass
         val spoken = handsFree
         handsFree = false
+        main.removeCallbacks(nudge)
         scope.launch {
             val text = DictationState.fullText.trim()
             DictationState.running.value = false
             DictationState.partial.value = ""
             DictationState.level.value = 0f
-            if (spoken) {
-                val words = Regex("""\S+""").findAll(text).count()
-                Speaker.speak(
-                    if (words == 0) "Nothing to save"
-                    else "Saved. $words words, on your computer.")
-            }
             if (text.isNotBlank()) {
                 // fold the trailing partial into the note the session has been
                 // filling in — or make one, if sync is off or nothing finalised
@@ -338,8 +371,24 @@ class DictationService : Service() {
                 DictationState.savedNoteAt.value = System.currentTimeMillis()
                 // the finished wording goes up on its own first; the backlog
                 // and the download follow behind it, off the critical path
-                runCatching { CloudSync.pushNote(applicationContext, id) }
+                val landed = runCatching {
+                    CloudSync.pushNote(applicationContext, id)
+                }.getOrDefault(false)
                 runCatching { CloudSync.syncNow(applicationContext, firstId = id) }
+                // Said after the upload, not before it, so "on your computer"
+                // is a fact rather than a hope. With no screen this is the only
+                // way to know a dictation in a dead spot didn't reach the laptop.
+                if (spoken) {
+                    val words = Regex("""\S+""").findAll(text).count()
+                    Speaker.speak(
+                        if (landed) "Saved. $words words, on your computer."
+                        else "Saved on the phone, $words words. It'll reach your " +
+                            "computer when there's signal.",
+                        flush = false)
+                }
+            } else if (spoken) {
+                Speaker.speak("I didn't catch anything, so there's nothing to save.",
+                    flush = false)
             }
             liveJob?.cancel()
             liveNoteId = null
@@ -353,6 +402,7 @@ class DictationService : Service() {
 
     override fun onDestroy() {
         recording = false
+        main.removeCallbacks(nudge)
         main.post { runCatching { recognizer?.destroy() }; recognizer = null }
         wakeLock?.let { if (it.isHeld) it.release() }
         scope.cancel()
