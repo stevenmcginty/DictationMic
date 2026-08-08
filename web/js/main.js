@@ -55,6 +55,41 @@ async function drainSharedFiles(app) {
   } catch { /* never block boot on a share drop */ }
 }
 
+// The service worker claims this page the moment it activates (skipWaiting +
+// clients.claim), which fires "controllerchange". Reloading on that blindly is
+// what made a freshly-tapped "+ New" note vanish a few seconds after opening:
+// the reload landed on #/note/<id> before the note had come back from the
+// adapter, openNote() found nothing and bounced to the list.
+//
+// Two guards now:
+//   - the very first claim (no controller at boot: fresh install, cleared
+//     storage, first launch after the SW was unregistered) changes nothing
+//     about the files this page is already running. Never reload for it.
+//   - a genuine update only reloads while the user is on the list with nothing
+//     open. Otherwise it waits — the new worker is already in charge, so the
+//     next launch runs the new code regardless.
+function wireServiceWorker() {
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+  if (!hadController) return;
+
+  let pending = false;
+  const idle = () => {
+    const h = location.hash;
+    return h === "" || h === "#/";
+  };
+  const apply = () => {
+    if (!pending || !idle()) return;
+    pending = false;
+    location.reload();
+  };
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    pending = true;
+    apply();
+  });
+  addEventListener("hashchange", apply);
+}
+
 function fail(msg) {
   $("noteList").textContent = "";
   $("emptyState").hidden = false;
@@ -72,17 +107,7 @@ async function boot() {
       const app = new App(adapter, { showMic: false });
       await app.start();
     } else {
-      if ("serviceWorker" in navigator) {
-        navigator.serviceWorker.register("sw.js").catch(() => {});
-        // a new version just took over (sw.js skipWaiting + claim): reload so
-        // this very launch runs it — never while a recording is in progress
-        let reloaded = false;
-        navigator.serviceWorker.addEventListener("controllerchange", () => {
-          if (reloaded || location.hash === "#/mic") return;
-          reloaded = true;
-          location.reload();
-        });
-      }
+      if ("serviceWorker" in navigator) wireServiceWorker();
       const { FirebaseAdapter, showAuthIfNeeded } = await import("./adapters/firebase.js");
       const adapter = new FirebaseAdapter();
       await showAuthIfNeeded(adapter);          // resolves once signed in
