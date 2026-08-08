@@ -28,6 +28,9 @@ async function wireAccountPop() {
   });
   $("signOutBtn").addEventListener("click", () => {
     signOut();
+    // The shell's recorder holds its own copy of the token — clear that too, or
+    // dictations would keep uploading to an account the page has forgotten.
+    if (shell()) { try { window.DictationMicNative.signOut(); } catch { } }
     location.reload();          // boot() shows the sign-in screen again
   });
   document.addEventListener("click", e => {
@@ -90,6 +93,26 @@ function wireServiceWorker() {
   addEventListener("hashchange", apply);
 }
 
+// The Android shell (MainActivity) loads this very page and injects a bridge.
+// Everything else about the app is identical either way — that's the point of
+// the shell: one app, one sign-in, and a hosting deploy updates both.
+const shell = () => !!window.DictationMicNative;
+
+// One sign-in, two consumers. The page owns the account — it has the form, it
+// talks to Identity Toolkit, it holds the refresh token. The shell's recorder
+// needs the same account to upload notes while the page is asleep, so hand the
+// token down once we know we're signed in. Cheap and idempotent: the bridge
+// ignores it when nothing has changed.
+async function handOverAccount() {
+  if (!shell()) return;
+  try {
+    const { uid, email } = await import("./auth.js");
+    const stored = JSON.parse(localStorage.getItem("dictmic-auth") || "null");
+    if (!stored?.refreshToken) return;
+    window.DictationMicNative.setAccount(email() || "", stored.refreshToken, uid());
+  } catch { /* the recorder falls back to whatever it already had */ }
+}
+
 function fail(msg) {
   $("noteList").textContent = "";
   $("emptyState").hidden = false;
@@ -112,7 +135,13 @@ async function boot() {
       const adapter = new FirebaseAdapter();
       await showAuthIfNeeded(adapter);          // resolves once signed in
       await adapter.init();
-      const { micAvailable, openMic } = await import("./speech.js");
+      await handOverAccount();
+      // Inside the Android shell the recorder is a foreground service, not the
+      // Web Speech API — same screen, same buttons, but it survives the screen
+      // going off and doesn't chime before every phrase.
+      const { micAvailable, openMic } = shell()
+        ? await import("./nativemic.js")
+        : await import("./speech.js");
       const app = new App(adapter, { showMic: micAvailable(), openMic });
       await app.start();
       wireAccountPop();

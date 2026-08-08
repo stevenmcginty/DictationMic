@@ -1,409 +1,288 @@
 package org.dictationmic.android
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.ViewGroup
+import android.webkit.PermissionRequest
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.compose.ui.platform.LocalLifecycleOwner
-import kotlinx.coroutines.Dispatchers
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.text.DateFormat
-import java.util.Date
+import org.json.JSONObject
 
-private val Volt = Color(0xFFB6EE3F)
-private val Bg = Color(0xFF0B0C0A)
-private val Surface1 = Color(0xFF131512)
-private val Surface2 = Color(0xFF1A1D18)
-private val Ink = Color(0xFFECEEE7)
-private val InkDim = Color(0xFF8B9184)
-private val Amber = Color(0xFFF4C752)
-
+// The app is the web app.
+//
+// There used to be a second, native implementation of the notes list, editor,
+// sync and sign-in here, and it drifted from the hosted app the day it was
+// written: features landed on the phone's web app and never reached the APK,
+// and Steve had two accounts to sign into. So the shell now loads the same
+// hosted origin the PWA does. Every hosting deploy is an update to this app,
+// with no rebuild and nothing to install — the service worker the site already
+// ships keeps it working offline exactly as it does in the browser.
+//
+// What the APK adds is everything a web page on Android can't do: a microphone
+// that survives the screen going off, spoken status over the headphones, and a
+// launch by voice. Those live in DictationService / Speaker and are reached
+// from the page through NativeBridge.
 class MainActivity : ComponentActivity() {
+    companion object {
+        private const val TRUSTED_ORIGIN = "https://dictationmic-sync.web.app"
+        const val EXTRA_DICTATE = "org.dictationmic.android.DICTATE"
 
-    private var pendingStart = false
-
-    private val permLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { grants ->
-        if (grants[Manifest.permission.RECORD_AUDIO] == true && pendingStart) {
-            pendingStart = false
-            DictationService.start(this)
-        }
+        private const val OFFLINE_PAGE = """
+            <html><head><meta name=viewport content="width=device-width,initial-scale=1">
+            <style>html,body{height:100%;margin:0;background:#0B0C0A;color:#E8E6E1;
+            font:16px/1.5 system-ui,sans-serif;display:grid;place-items:center;text-align:center}
+            div{padding:2rem;max-width:22rem}button{margin-top:1.5rem;padding:.7rem 1.4rem;
+            border:1px solid #3A3D36;border-radius:999px;background:none;color:inherit;font:inherit}
+            </style></head><body><div><p>DictationMic couldn't reach the network on
+            this first launch.</p><p style="opacity:.6">Once it has loaded once it
+            works offline.</p><button onclick="location.href='/'">Try again</button>
+            </div></body></html>"""
     }
 
-    fun startDictation() {
-        val need = mutableListOf<String>()
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) need += Manifest.permission.RECORD_AUDIO
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-            != PackageManager.PERMISSION_GRANTED) need += Manifest.permission.POST_NOTIFICATIONS
-        if (need.isEmpty()) {
-            DictationService.start(this)
-        } else {
-            pendingStart = true
-            permLauncher.launch(need.toTypedArray())
+    private lateinit var web: WebView
+    private var filePicker: ValueCallback<Array<Uri>>? = null
+    private var pendingMicRequest: PermissionRequest? = null
+    private var stateJob: Job? = null
+    private var loaded = false
+    private var startDictatingOnLoad = false
+
+    private val micPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()) { granted ->
+        val req = pendingMicRequest
+        pendingMicRequest = null
+        if (req != null) {
+            if (granted) req.grant(req.resources) else req.deny()
         }
+        if (granted && startDictatingOnLoad) beginHandsFree()
+        startDictatingOnLoad = false
     }
 
+    private val filePick = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()) { result ->
+        val cb = filePicker
+        filePicker = null
+        cb?.onReceiveValue(
+            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
+                ?: emptyArray())
+    }
+
+    private val notifPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()) { }
+
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        CloudSync.loadAccount(this)
-        setContent {
-            MaterialTheme(
-                colorScheme = darkColorScheme(
-                    primary = Volt, background = Bg, surface = Surface1,
-                    onPrimary = Bg, onBackground = Ink, onSurface = Ink,
-                )
-            ) {
-                Surface(Modifier.fillMaxSize(), color = Bg) { AppRoot(this) }
-            }
-        }
-    }
-}
-
-@Composable
-fun AppRoot(activity: MainActivity) {
-    val scope = rememberCoroutineScope()
-
-    // pull cloud notes whenever we come back to the foreground
-    val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(Unit) {
-        val obs = LifecycleEventObserver { _, e ->
-            if (e == Lifecycle.Event.ON_RESUME) {
-                scope.launch { CloudSync.syncNow(activity.applicationContext) }
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(obs)
-    }
-
-    // Transcription is Android's built-in speech recognition now — nothing to
-    // download or warm up, so we open straight into the recorder.
-    MainScreen(activity)
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun MainScreen(activity: MainActivity) {
-    val running by DictationState.running.collectAsState()
-    val finals by DictationState.finals.collectAsState()
-    val partial by DictationState.partial.collectAsState()
-    val level by DictationState.level.collectAsState()
-    val changed by NoteStore.changed.collectAsState()
-    val syncState by CloudSync.state.collectAsState()
-    val account by CloudSync.email.collectAsState()
-    val scope = rememberCoroutineScope()
-
-    var notes by remember { mutableStateOf(NoteStore.all(activity)) }
-    // Off the main thread: a live dictation rewrites its note every second or
-    // so, and re-reading every note file on the UI thread that often janks the
-    // meter.
-    LaunchedEffect(changed, syncState) {
-        notes = withContext(Dispatchers.IO) { NoteStore.all(activity) }
-    }
-    // The service pushes as it goes and syncs again the moment a session ends,
-    // so there's nothing to do here on savedNoteAt any more — a sync from this
-    // side would only mean a second full snapshot download per dictation.
-
-    var showAccount by remember { mutableStateOf(false) }
-    var openNote by remember { mutableStateOf<Note?>(null) }
-
-    Column(Modifier.fillMaxSize().padding(20.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("DictationMic", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.weight(1f))
-            val dot = when (syncState) {
-                "ok" -> Volt; "syncing" -> Amber
-                "off" -> InkDim; else -> Color(0xFFFF5C48)
-            }
-            Box(Modifier.size(8.dp).background(dot, CircleShape))
-            Spacer(Modifier.width(8.dp))
-            Text(
-                account ?: "phone sync",
-                color = InkDim, fontSize = 13.sp,
-                modifier = Modifier.clickable { showAccount = true },
-            )
+        CloudSync.loadAccount(applicationContext)
+        Speaker.init(applicationContext)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED) {
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        Spacer(Modifier.height(20.dp))
+        web = WebView(this)
+        web.layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        setContentView(web)
+        configure(web)
 
-        // The big mic. Volt when listening (with a soft pulse), dark when idle.
-        val pulse = rememberInfiniteTransition(label = "pulse").animateFloat(
-            initialValue = 1f, targetValue = 1.06f,
-            animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
-            label = "pulse",
-        )
-        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-            Box(
-                Modifier
-                    .size(112.dp)
-                    .scale(if (running) pulse.value else 1f)
-                    .background(if (running) Volt else Surface2, CircleShape)
-                    .border(2.dp, if (running) Volt else InkDim.copy(alpha = 0.4f), CircleShape)
-                    .clickable {
-                        if (running) DictationService.stop(activity)
-                        else activity.startDictation()
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                if (running) {
-                    // simple live bars driven by mic level
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        for (i in 0..4) {
-                            val h = (10 + 26 * level * (1f - 0.15f * kotlin.math.abs(i - 2)))
-                                .coerceIn(8f, 40f)
-                            Box(
-                                Modifier.padding(horizontal = 3.dp)
-                                    .width(6.dp).height(h.dp)
-                                    .background(Bg, RoundedCornerShape(3.dp))
-                            )
-                        }
-                    }
-                } else {
-                    Text("🎙", fontSize = 40.sp)
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (web.canGoBack()) web.goBack() else finish()
+            }
+        })
+
+        web.loadUrl(TRUSTED_ORIGIN + "/")
+        handleIntent(intent)
+
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            Updater.checkQuietly(applicationContext, appVersion())
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
+    private fun configure(w: WebView) {
+        WebView.setWebContentsDebuggingEnabled(true)
+        w.setBackgroundColor(0xFF0B0C0A.toInt())
+        with(w.settings) {
+            javaScriptEnabled = true
+            domStorageEnabled = true                 // localStorage: the session
+            // The mic screen and the spoken status must not need a tap first.
+            mediaPlaybackRequiresUserGesture = false
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            setSupportMultipleWindows(false)
+            // Same string shape as Chrome, plus a marker the site could branch
+            // on. Keeping "Chrome" in it matters: Google's sign-in endpoints
+            // and more than one CDN reject unrecognised agents outright.
+            userAgentString = userAgentString + " DictationMicShell"
+        }
+        w.addJavascriptInterface(
+            NativeBridge(applicationContext, appVersion()) { syncSoon() },
+            "DictationMicNative")
+
+        w.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(
+                view: WebView, request: WebResourceRequest): Boolean {
+                val url = request.url.toString()
+                if (url.startsWith(TRUSTED_ORIGIN)) return false
+                // Anything else — a download link, a help page — belongs in the
+                // browser, not trapped in a shell with no address bar.
+                runCatching { startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+                return true
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                loaded = true
+                if (startDictatingOnLoad) {
+                    startDictatingOnLoad = false
+                    requestMicThen { beginHandsFree() }
                 }
             }
-        }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            if (running) "Listening — you can leave the app or lock the screen"
-            else "Tap to dictate",
-            color = if (running) Volt else InkDim, fontSize = 13.sp,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-        )
 
-        if (running || finals.isNotBlank() || partial.isNotBlank()) {
-            Spacer(Modifier.height(16.dp))
-            Surface(
-                color = Surface1, shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Column(Modifier.padding(14.dp)) {
-                    Text(
-                        buildString {
-                            append(finals)
-                            if (partial.isNotBlank()) {
-                                if (isNotEmpty()) append(' ')
-                                append(partial)
-                            }
-                            if (isEmpty()) append("…")
-                        },
-                        color = if (partial.isNotBlank()) Ink else InkDim,
-                        fontSize = 15.sp, lineHeight = 21.sp,
-                    )
-                }
+            // Only the very first launch can land here: after that the site's
+            // own service worker serves the shell from cache and an offline
+            // start looks no different from a normal one.
+            override fun onReceivedError(
+                view: WebView, request: WebResourceRequest,
+                error: android.webkit.WebResourceError) {
+                if (!request.isForMainFrame) return
+                view.loadDataWithBaseURL(TRUSTED_ORIGIN, OFFLINE_PAGE,
+                    "text/html", "utf-8", null)
             }
         }
 
-        Spacer(Modifier.height(20.dp))
-        AutoStopRow(activity)
-        Spacer(Modifier.height(12.dp))
+        w.webChromeClient = object : WebChromeClient() {
+            // The page asking for the microphone. The shell holds the Android
+            // permission, so grant from it rather than making Steve answer two
+            // prompts that mean the same thing.
+            override fun onPermissionRequest(request: PermissionRequest) {
+                val wantsMic = request.resources
+                    .contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)
+                if (!wantsMic) { request.deny(); return }
+                if (hasMic()) { request.grant(request.resources); return }
+                pendingMicRequest = request
+                micPermission.launch(Manifest.permission.RECORD_AUDIO)
+            }
 
-        Text("Notes", color = InkDim, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(8.dp))
-        LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(notes, key = { it.id }) { n ->
-                Surface(
-                    color = Surface1, shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth().clickable { openNote = n },
-                ) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text(n.title, color = Ink, fontSize = 15.sp,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            DateFormat.getDateTimeInstance(
-                                DateFormat.MEDIUM, DateFormat.SHORT)
-                                .format(Date(n.createdAt)),
-                            color = InkDim, fontSize = 12.sp,
-                        )
-                    }
-                }
+            override fun onShowFileChooser(
+                view: WebView, callback: ValueCallback<Array<Uri>>,
+                params: FileChooserParams): Boolean {
+                filePicker?.onReceiveValue(null)
+                filePicker = callback
+                return runCatching { filePick.launch(params.createIntent()); true }
+                    .getOrElse { filePicker = null; false }
             }
         }
     }
 
-    if (showAccount) {
-        AccountSheet(activity, onDone = { showAccount = false })
+    // ---- launching ---------------------------------------------------------
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
     }
 
-    openNote?.let { n ->
-        val clipboard = LocalClipboardManager.current
-        AlertDialog(
-            onDismissRequest = { openNote = null },
-            containerColor = Surface2,
-            title = { Text(n.title, color = Ink) },
-            text = {
-                Text(n.body.ifBlank { "(no words captured)" },
-                    color = Ink)
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    clipboard.setText(AnnotatedString(n.body))
-                    openNote = null
-                }) { Text("Copy", color = Volt) }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    NoteStore.delete(activity, n.id)
-                    openNote = null
-                    scope.launch { CloudSync.syncNow(activity.applicationContext) }
-                }) { Text("Delete", color = Color(0xFFFF5C48)) }
-            },
-        )
+    // Two ways in. The launcher icon opens the notes list, same as tapping the
+    // PWA. The "Dictate" shortcut — and a voice launch with the buds in — goes
+    // straight to recording without waiting for a tap on a screen you can't see.
+    private fun handleIntent(intent: Intent?) {
+        val asked = intent?.getBooleanExtra(EXTRA_DICTATE, false) == true ||
+            intent?.action == Intent.ACTION_ASSIST ||
+            intent?.data?.getQueryParameter("dictate") == "1"
+        val auto = asked || (autoStartWithHeadphones() &&
+            AudioRoute.headphonesConnected(this) && !DictationState.running.value)
+        if (!auto) return
+        if (loaded) requestMicThen { beginHandsFree() } else startDictatingOnLoad = true
     }
-}
 
-@Composable
-fun AutoStopRow(activity: MainActivity) {
-    val prefs = activity.getSharedPreferences("app", 0)
-    var current by remember { mutableStateOf(prefs.getInt("autoStopSecs", 0)) }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Stop after silence:", color = InkDim, fontSize = 13.sp)
-        Spacer(Modifier.width(8.dp))
-        for ((label, secs) in listOf("Off" to 0, "10s" to 10, "30s" to 30, "2m" to 120)) {
-            val sel = current == secs
-            Text(
-                label,
-                color = if (sel) Bg else InkDim, fontSize = 12.sp,
-                modifier = Modifier
-                    .padding(end = 6.dp)
-                    .background(if (sel) Volt else Surface2, RoundedCornerShape(10.dp))
-                    .clickable {
-                        current = secs
-                        prefs.edit().putInt("autoStopSecs", secs).apply()
-                    }
-                    .padding(horizontal = 10.dp, vertical = 4.dp),
-            )
-        }
+    private fun autoStartWithHeadphones() =
+        getSharedPreferences("app", MODE_PRIVATE).getBoolean("autoStartHeadphones", true)
+
+    private fun requestMicThen(run: () -> Unit) {
+        if (hasMic()) { run(); return }
+        startDictatingOnLoad = true          // the permission result picks it up
+        micPermission.launch(Manifest.permission.RECORD_AUDIO)
     }
-}
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun AccountSheet(activity: MainActivity, onDone: () -> Unit) {
-    val account by CloudSync.email.collectAsState()
-    val scope = rememberCoroutineScope()
-    var mail by remember { mutableStateOf("") }
-    var pass by remember { mutableStateOf("") }
-    var msg by remember { mutableStateOf<String?>(null) }
-    var busy by remember { mutableStateOf(false) }
+    private fun beginHandsFree() {
+        if (DictationState.running.value) return
+        DictationService.start(this, handsFree = true)
+        web.evaluateJavascript("location.hash = '#/mic'", null)
+    }
 
-    ModalBottomSheet(onDismissRequest = onDone, containerColor = Surface2) {
-        Column(Modifier.padding(24.dp)) {
-            if (account != null) {
-                Text("Signed in as $account", color = Ink, fontSize = 15.sp)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Notes sync with the computer through your own Firebase account.",
-                    color = InkDim, fontSize = 13.sp,
-                )
-                Spacer(Modifier.height(16.dp))
-                Button(
-                    onClick = { CloudSync.signOut(activity); onDone() },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Surface1, contentColor = Ink),
-                ) { Text("Sign out") }
-            } else {
-                Text("Phone sync", color = Ink, fontSize = 17.sp,
-                    fontWeight = FontWeight.Bold)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Use the same email and password as on the computer " +
-                        "(right-click the pill → Set up phone sync).",
-                    color = InkDim, fontSize = 13.sp,
-                )
-                Spacer(Modifier.height(16.dp))
-                OutlinedTextField(mail, { mail = it }, label = { Text("Email") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth())
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(pass, { pass = it }, label = { Text("Password") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth(),
-                    visualTransformation = PasswordVisualTransformation())
-                msg?.let {
-                    Spacer(Modifier.height(8.dp))
-                    Text(it, color = Amber, fontSize = 13.sp)
+    private fun hasMic() = ContextCompat.checkSelfPermission(
+        this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    // ---- pushing recorder state into the page ------------------------------
+
+    override fun onResume() {
+        super.onResume()
+        // The recorder runs in a service and keeps going with this activity
+        // gone, so the page is only ever a mirror of it. Poll while we're on
+        // screen: a flow collector would need the page to be alive to receive
+        // it, and the page is exactly the thing that isn't, half the time.
+        stateJob?.cancel()
+        stateJob = lifecycleScope.launch {
+            var last = ""
+            while (true) {
+                val snap = JSONObject().apply {
+                    put("running", DictationState.running.value)
+                    put("finals", DictationState.finals.value)
+                    put("partial", DictationState.partial.value)
+                    put("level", DictationState.level.value.toDouble())
+                    put("savedAt", DictationState.savedNoteAt.value)
+                }.toString()
+                if (snap != last) {
+                    last = snap
+                    web.evaluateJavascript(
+                        "window.DictationMicShell&&window.DictationMicShell.state($snap)",
+                        null)
                 }
-                Spacer(Modifier.height(16.dp))
-                Button(
-                    enabled = !busy && mail.isNotBlank() && pass.isNotBlank(),
-                    onClick = {
-                        busy = true
-                        scope.launch {
-                            val err = CloudSync.signIn(activity, mail.trim(), pass)
-                            busy = false
-                            if (err == null) {
-                                CloudSync.syncNow(activity.applicationContext)
-                                onDone()
-                            } else msg = err
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Volt, contentColor = Bg),
-                ) { Text(if (busy) "Signing in…" else "Sign in", fontWeight = FontWeight.Bold) }
+                delay(200)
             }
-            Spacer(Modifier.height(24.dp))
         }
     }
+
+    override fun onPause() {
+        super.onPause()
+        stateJob?.cancel()
+        stateJob = null
+    }
+
+    override fun onDestroy() {
+        stateJob?.cancel()
+        // Deliberately not stopping the service: walking out of the activity is
+        // the normal way a hands-free dictation continues.
+        web.destroy()
+        super.onDestroy()
+    }
+
+    // A fresh sign-in in the page means the recorder can upload for the first
+    // time — pull the notes down so the two sides start from the same place.
+    private fun syncSoon() {
+        lifecycleScope.launch { runCatching { CloudSync.syncNow(applicationContext) } }
+    }
+
+    private fun appVersion(): String =
+        runCatching { packageManager.getPackageInfo(packageName, 0).versionName ?: "" }
+            .getOrDefault("")
 }

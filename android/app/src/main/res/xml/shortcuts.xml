@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Long-press the icon to get "Dictate", and a name an assistant can be asked
+     to open. It goes straight into a hands-free session: spoken confirmation,
+     no tap, no screen. -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="dictate"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_dictate_short"
+        android:shortcutLongLabel="@string/shortcut_dictate_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="org.dictationmic.android"
+            android:targetClass="org.dictationmic.android.MainActivity"
+            android:data="dictationmic://dictate?dictate=1" />
+        <categories android:name="android.shortcut.conversation" />
+    </shortcut>
+</shortcuts>

@@ -64,15 +64,28 @@ class DictationService : Service() {
     companion object {
         const val ACTION_START = "org.dictationmic.android.START"
         const val ACTION_STOP = "org.dictationmic.android.STOP"
+        const val EXTRA_HANDS_FREE = "handsFree"
         private const val CHANNEL = "dictation"
         private const val NOTIF_ID = 1
         // Live upload cadence: at most one PATCH per gap, always carrying the
         // newest text. Quick enough that the laptop feels live, slow enough
         // that a long dictation isn't a hundred requests.
         private const val LIVE_PUSH_GAP_MS = 1500L
+        // Hands-free is for talking with the phone out of sight, so a pause to
+        // think must not end the session. Only a long true silence does.
+        private const val HANDS_FREE_STOP_MS = 300_000L
 
-        fun start(ctx: Context) {
-            val i = Intent(ctx, DictationService::class.java).setAction(ACTION_START)
+        // The only way to finish a note when the phone is in a pocket. Matched
+        // at the end of a finished phrase so it can't fire off a word said
+        // mid-sentence, and stripped out so it never lands in the note.
+        val STOP_PHRASE = Regex(
+            """[\s,.]*\b(?:end note|save note|stop dictation|finish note)\b[\s,.!]*$""",
+            RegexOption.IGNORE_CASE)
+
+        fun start(ctx: Context, handsFree: Boolean = false) {
+            val i = Intent(ctx, DictationService::class.java)
+                .setAction(ACTION_START)
+                .putExtra(EXTRA_HANDS_FREE, handsFree)
             ctx.startForegroundService(i)
         }
 
@@ -87,6 +100,7 @@ class DictationService : Service() {
     private var recognizer: SpeechRecognizer? = null
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var recording = false
+    @Volatile private var handsFree = false  // opened by voice: speak the state
     private var listening = false            // a startListening is in flight
     private var lastVoiceAt = 0L             // for the "stop after silence" timer
     private var autoStopMs = 0L
@@ -99,14 +113,16 @@ class DictationService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> if (!recording) startSession()
+            ACTION_START ->
+                if (!recording) startSession(intent.getBooleanExtra(EXTRA_HANDS_FREE, false))
             ACTION_STOP -> stopSession()
         }
         return START_NOT_STICKY
     }
 
     @SuppressLint("MissingPermission", "WakelockTimeout")
-    private fun startSession() {
+    private fun startSession(handsFreeLaunch: Boolean) {
+        handsFree = handsFreeLaunch
         createChannel()
         ServiceCompat.startForeground(
             this, NOTIF_ID, buildNotification("Listening…"),
@@ -124,6 +140,9 @@ class DictationService : Service() {
         lastVoiceAt = System.currentTimeMillis()
         autoStopMs = getSharedPreferences("app", MODE_PRIVATE)
             .getInt("autoStopSecs", 0) * 1000L
+        // With no screen there is nothing to notice a wedged session, so a
+        // hands-free run always gets a ceiling even when the setting says never.
+        if (handsFree && autoStopMs == 0L) autoStopMs = HANDS_FREE_STOP_MS
 
         liveNoteId = null
         // Mint the auth token now, while you're still drawing breath, so the
@@ -135,7 +154,15 @@ class DictationService : Service() {
         // Looper — the main thread. Its callbacks arrive there too.
         main.post {
             recognizer = makeRecognizer().also { it.setRecognitionListener(listener) }
-            listen()
+            // Announce first, listen after it has finished playing — the
+            // recogniser owns the microphone and would transcribe our own
+            // "Listening" straight into the note.
+            if (handsFree) {
+                Speaker.init(applicationContext)
+                Speaker.speak("Listening") { main.post { if (recording) listen() } }
+            } else {
+                listen()
+            }
         }
     }
 
@@ -210,7 +237,12 @@ class DictationService : Service() {
         }
 
         override fun onResults(results: Bundle?) {
-            val text = firstResult(results)
+            var text = firstResult(results)
+            var ending = false
+            if (handsFree && !text.isNullOrBlank() && STOP_PHRASE.containsMatchIn(text)) {
+                text = STOP_PHRASE.replace(text, "")
+                ending = true
+            }
             if (!text.isNullOrBlank()) {
                 DictationState.finals.value =
                     (DictationState.finals.value + " " + text).trim()
@@ -220,6 +252,7 @@ class DictationService : Service() {
             }
             DictationState.partial.value = ""
             listening = false
+            if (ending) { stopSession(); return }
             continueOrStop(recreate = false)
         }
 
@@ -227,6 +260,10 @@ class DictationService : Service() {
             DictationState.partial.value = ""
             listening = false
             if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                if (handsFree) {
+                    handsFree = false      // stopSession must not also announce
+                    Speaker.speak("The microphone is blocked. Open DictationMic.")
+                }
                 stopSession(); return
             }
             // busy/client leaves the recognizer wedged — swap in a fresh one;
@@ -279,11 +316,19 @@ class DictationService : Service() {
             recognizer = null
         }
         pushTicks?.close()                   // the loop finishes its last pass
+        val spoken = handsFree
+        handsFree = false
         scope.launch {
             val text = DictationState.fullText.trim()
             DictationState.running.value = false
             DictationState.partial.value = ""
             DictationState.level.value = 0f
+            if (spoken) {
+                val words = Regex("""\S+""").findAll(text).count()
+                Speaker.speak(
+                    if (words == 0) "Nothing to save"
+                    else "Saved. $words words, on your computer.")
+            }
             if (text.isNotBlank()) {
                 // fold the trailing partial into the note the session has been
                 // filling in — or make one, if sync is off or nothing finalised
