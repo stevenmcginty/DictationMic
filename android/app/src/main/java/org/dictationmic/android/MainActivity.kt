@@ -20,6 +20,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -59,6 +60,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private lateinit var web: WebView
+    // Only set when a file pick is being handed back to the WebView the old
+    // way — i.e. when the page is too old to drain the inbox itself.
     private var filePicker: ValueCallback<Array<Uri>>? = null
     private var pendingMicRequest: PermissionRequest? = null
     private var stateJob: Job? = null
@@ -89,13 +92,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // The picker behind "+ Image" / "+ File". What comes back doesn't go to the
+    // WebView — it goes to SharedInbox, the same place a share-sheet drop lands,
+    // and the page drains it from there. See onShowFileChooser for why.
     private val filePick = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()) { result ->
+        val uris = WebChromeClient.FileChooserParams
+            .parseResult(result.resultCode, result.data)
         val cb = filePicker
         filePicker = null
-        cb?.onReceiveValue(
-            WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data)
-                ?: emptyArray())
+        if (cb != null) { cb.onReceiveValue(uris ?: emptyArray()); return@registerForActivityResult }
+        if (uris.isNullOrEmpty()) return@registerForActivityResult   // cancelled
+        takeSharedUris(uris.toList())
     }
 
     private val notifPermission = registerForActivityResult(
@@ -174,6 +182,10 @@ class MainActivity : ComponentActivity() {
                 if (DictationState.running.value) {
                     view.evaluateJavascript("location.hash = '#/mic'", null)
                 }
+                // A share that arrived before the page existed — a cold start
+                // from the share sheet. The page drains at boot too; this is
+                // for anything that landed between boot and now.
+                nudgeSharedFiles()
             }
 
             // The page's renderer process can be killed by the system (out of
@@ -211,13 +223,34 @@ class MainActivity : ComponentActivity() {
                 micPermission.launch(Manifest.permission.RECORD_AUDIO)
             }
 
+            // "+ Image" and "+ File" are file inputs, and the WebView's own
+            // answer to one is to hand the page a File built from whatever the
+            // picker returned. That is where picking an image went quiet: the
+            // photo picker answers with a URI carrying no filename and no
+            // extension, the page gets a File with an empty type, and the app —
+            // which decides what a file is by its type — dropped it without a
+            // word.
+            //
+            // So the shell opens the picker (the intent the WebView builds
+            // still honours accept= and multiple), reads the bytes itself with
+            // the real MIME type from the ContentResolver, and pushes them into
+            // the page through SharedInbox — the identical route a share-sheet
+            // drop takes. The input itself is released straight away, so the
+            // same button works again the next time it's pressed.
             override fun onShowFileChooser(
                 view: WebView, callback: ValueCallback<Array<Uri>>,
                 params: FileChooserParams): Boolean {
-                filePicker?.onReceiveValue(null)
-                filePicker = callback
-                return runCatching { filePick.launch(params.createIntent()); true }
-                    .getOrElse { filePicker = null; false }
+                val handOff = SharedInbox.pageReady
+                filePicker?.onReceiveValue(null)          // a pick left hanging
+                filePicker = if (handOff) null else callback
+                if (runCatching { filePick.launch(params.createIntent()) }.isFailure) {
+                    filePicker = null
+                    return false           // let the WebView try its own way
+                }
+                // Nothing is coming back to the input itself — release it now so
+                // the same button works the next time it's pressed.
+                if (handOff) callback.onReceiveValue(null)
+                return true
             }
         }
     }
@@ -243,6 +276,16 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
+        // Sharing a screenshot to DictationMic. The PWA answered the share
+        // sheet through its manifest's share_target; the APK isn't a WebAPK, so
+        // it has to be in the share sheet on its own account (the SEND filters
+        // in the manifest) and carry the file across itself.
+        if (intent != null &&
+            (intent.action == Intent.ACTION_SEND ||
+                intent.action == Intent.ACTION_SEND_MULTIPLE)) {
+            receiveShared(intent)
+            return
+        }
         val asked = intent?.getBooleanExtra(EXTRA_DICTATE, false) == true ||
             intent?.action == Intent.ACTION_ASSIST ||
             intent?.data?.getQueryParameter("dictate") == "1"
@@ -253,6 +296,52 @@ class MainActivity : ComponentActivity() {
         // WebView. Waiting for the page to load here was seconds of talking to
         // a dead microphone on every voice launch.
         startDictationWithPermission(handsFree = true)
+    }
+
+    // ---- files from the share sheet and the file picker --------------------
+
+    private fun receiveShared(intent: Intent) {
+        val uris = if (intent.action == Intent.ACTION_SEND) {
+            listOfNotNull(IntentCompat.getParcelableExtra(
+                intent, Intent.EXTRA_STREAM, Uri::class.java))
+        } else {
+            IntentCompat.getParcelableArrayListExtra(
+                intent, Intent.EXTRA_STREAM, Uri::class.java).orEmpty().filterNotNull()
+        }
+        // Claim it. The same intent is handed back on a recreate (process
+        // death, a restore from Recents) and without this the shared image
+        // would be saved a second time.
+        intent.removeExtra(Intent.EXTRA_STREAM)
+        if (uris.isEmpty()) {
+            Toast.makeText(this, "Nothing came through from that share",
+                Toast.LENGTH_SHORT).show()
+            return
+        }
+        takeSharedUris(uris)
+    }
+
+    // Reading a content:// URI is disk (or network, for a cloud photo) — off
+    // the main thread. Then wake the page, which pulls the bytes over the
+    // bridge and saves them as notes.
+    private fun takeSharedUris(uris: List<Uri>) {
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val taken = SharedInbox.accept(applicationContext, uris)
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                if (taken == 0) {
+                    Toast.makeText(this@MainActivity,
+                        "Couldn't read that file", Toast.LENGTH_LONG).show()
+                    return@withContext
+                }
+                nudgeSharedFiles()
+            }
+        }
+    }
+
+    private fun nudgeSharedFiles() {
+        if (!loaded || SharedInbox.isEmpty()) return
+        web.evaluateJavascript(
+            "window.DictationMicShell&&window.DictationMicShell.shared" +
+                "&&window.DictationMicShell.shared()", null)
     }
 
     private fun autoStartWithHeadphones() =

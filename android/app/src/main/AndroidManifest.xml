@@ -48,6 +48,22 @@
                 <data android:scheme="dictationmic" />
             </intent-filter>
 
+            <!-- "Share > DictationMic" on a screenshot. The PWA got this free
+                 from its manifest's share_target, and installing the APK took
+                 it away: an APK isn't a WebAPK, so it has to declare its own
+                 place in the share sheet. MainActivity.receiveShared reads the
+                 stream and hands it to the page. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+
             <meta-data
                 android:name="android.app.shortcuts"
                 android:resource="@xml/shortcuts" />

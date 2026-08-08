@@ -10,6 +10,22 @@ const KEEP_ORIGINAL_BYTES = 250 * 1024;      // small enough? keep pixels as-is
 
 const IMG_BODY_RE = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|heic|heif|avif)$/i;
+
+// Is this file worth trying to make an image note out of?
+//
+// Not the same question as "is file.type an image type". Android's photo picker
+// can hand over a file whose type is empty and whose name has no extension —
+// and treating that as "not an image" is how picking a photo in the APK used to
+// do nothing at all, silently. Anything without a type that says otherwise gets
+// its chance; fileToImageBody decides for real by trying to decode it.
+export function looksLikeImage(file) {
+  const type = file.type || "";
+  if (type.startsWith("image/")) return true;
+  if (IMAGE_EXT_RE.test(file.name || "")) return true;
+  return !type || type === "application/octet-stream";
+}
+
 export function isImageBody(body) {
   return typeof body === "string"
     && body.length < MAX_IMAGE_BYTES * 2      // cheap reject before the regex
@@ -41,7 +57,7 @@ const loadImage = src => new Promise((resolve, reject) => {
 // Compress a picked/dropped/pasted image file down to a data URL that fits
 // MAX_IMAGE_BYTES. Drawing through <img> applies EXIF rotation for free.
 export async function fileToImageBody(file) {
-  if (!file.type.startsWith("image/")) throw new Error("Images only");
+  if (!looksLikeImage(file)) throw new Error("Images only");
   if (file.size > MAX_SOURCE_BYTES) throw new Error("That image is too big");
 
   // small and already web-friendly: keep the original bytes (and animation)

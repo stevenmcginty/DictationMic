@@ -91,4 +91,27 @@ class NativeBridge(
     // wearing the buds and a launch should start dictating on its own.
     @JavascriptInterface
     fun headphonesConnected(): Boolean = AudioRoute.headphonesConnected(ctx)
+
+    // ---- files handed to the app from outside the page ----------------------
+    //
+    // A screenshot shared in from Android's share sheet, or a photo picked with
+    // "+ Image". Both reach the shell as a content:// URI that JavaScript can't
+    // open, so SharedInbox reads the bytes and the page pulls them across here.
+    // See shellshare.js for the other half.
+
+    // The page announcing it can drain the inbox. Until this lands the shell
+    // leaves the file picker to the WebView — see SharedInbox.pageReady.
+    @JavascriptInterface
+    fun sharedReady() {
+        SharedInbox.pageReady = true
+    }
+
+    @JavascriptInterface
+    fun sharedFiles(): String = SharedInbox.list()
+
+    @JavascriptInterface
+    fun sharedChunk(id: String, index: Int): String = SharedInbox.chunk(id, index)
+
+    @JavascriptInterface
+    fun clearShared(id: String) = SharedInbox.clear(id)
 }

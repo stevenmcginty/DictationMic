@@ -6,7 +6,7 @@ import {
 } from "./util.js";
 import {
   isImageBody, imageKb, fileToImageBody, imageBodyToPngBlob,
-  imageBodyToFile, photoTitle,
+  imageBodyToFile, photoTitle, looksLikeImage,
 } from "./imgnote.js";
 import {
   isFileBody, fileMeta, fmtBytes, fileBodyToFile, fileToFileBody, SHEET_EXT_RE,
@@ -452,8 +452,12 @@ export class App {
 
   // ---------------- clipboard drops: images & text become notes ----------------
 
-  async saveImageFiles(files) {
-    const images = [...files].filter(f => f.type.startsWith("image/")).slice(0, 6);
+  // Filtering on file.type alone used to drop a picked photo without a word —
+  // Android's photo picker can hand over a file with no type at all. Now
+  // anything plausible is tried, and anything that fails says so.
+  async saveImageFiles(files, { quiet = false } = {}) {
+    const picked = [...files].slice(0, 6);
+    const images = picked.filter(looksLikeImage);
     let saved = 0;
     for (const f of images) {
       try {
@@ -463,11 +467,15 @@ export class App {
           ? stem.slice(0, 60) : photoTitle();
         this._cache(await this.adapter.create({ title, body }));
         saved++;
-      } catch (e) { this.toast(e.message || "Couldn't save that image"); }
+      } catch (e) {
+        if (!quiet) this.toast(e.message || "Couldn't save that image");
+      }
     }
     if (saved) {
       this.renderList();
       this.toast(saved === 1 ? "Image saved to notes" : `${saved} images saved`);
+    } else if (!quiet && picked.length && !images.length) {
+      this.toast("That isn't an image");
     }
     return saved;
   }
@@ -486,9 +494,14 @@ export class App {
   // small text -> editable text notes, any other document -> file note
   async saveAnyFiles(files) {
     for (const f of [...files].slice(0, 10)) {
-      if (f.type.startsWith("image/")) {
-        await this.saveImageFiles([f]);
-        continue;
+      // A file the system says is an image goes straight in, and says so if it
+      // can't. One with no type at all might still be a photo — that's what
+      // Android's picker and its share sheet hand over — so try it as an image
+      // quietly, and only fall through to a file note if it won't decode.
+      if (looksLikeImage(f)) {
+        const surely = (f.type || "").startsWith("image/");
+        if (await this.saveImageFiles([f], { quiet: !surely })) continue;
+        if (surely) continue;
       }
       // spreadsheets are never editable text — they stay real file notes so
       // Open can hand them to Excel (same rule as the pill's dropnotes.py)

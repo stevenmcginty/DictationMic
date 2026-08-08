@@ -11,7 +11,7 @@ const isLocal = ["127.0.0.1", "localhost"].includes(location.hostname);
 // phone runs whatever the service worker last cached, which is not necessarily
 // what was last deployed — so "have you actually got the fix yet" was a
 // guess. Now it's a number you can read off the screen.
-const BUILD = 30;
+const BUILD = 31;
 
 function grabToken() {
   // the pill opens us as /#t=<per-run token>; keep it for this tab only
@@ -159,6 +159,12 @@ async function boot() {
       await app.start();
       wireAccountPop();
       drainSharedFiles(app);
+      // Same idea, other shell: inside the APK a share (and a picked file)
+      // comes over the native bridge rather than through the service worker.
+      if (shell()) {
+        const { wireShellShare } = await import("./shellshare.js");
+        wireShellShare(app);
+      }
     }
   } catch (e) {
     fail(e.message || "Something went wrong.");

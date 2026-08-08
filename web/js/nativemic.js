@@ -58,10 +58,12 @@ function bind() {
     if (location.hash !== "#/mic") handsFree = false;
   });
 
-  // The shell pushes every change in recorder state through here.
-  window.DictationMicShell = {
+  // The shell pushes every change in recorder state through here. Merged, not
+  // assigned: shellshare.js hangs its own hook off the same object and either
+  // file can be the one that runs first.
+  window.DictationMicShell = Object.assign(window.DictationMicShell || {}, {
     state(snapshot) { apply(snapshot); },
-  };
+  });
 }
 
 function pull() {
