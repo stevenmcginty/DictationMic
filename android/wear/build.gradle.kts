@@ -26,8 +26,8 @@ android {
         // dictating into.
         minSdk = 33
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     signingConfigs {
@@ -83,4 +83,8 @@ dependencies {
     implementation("androidx.concurrent:concurrent-futures:1.2.0")
     // Complications: the mic slot on the watch face itself.
     implementation("androidx.wear.watchface:watchface-complications-data-source-ktx:1.2.1")
+    // The watch face: Steve's daily face is ours now — time, steps, heart
+    // rate, the mic dead centre, and the battery around the rim.
+    implementation("androidx.wear.watchface:watchface:1.2.1")
+    implementation("androidx.wear.watchface:watchface-complications-rendering:1.2.1")
 }

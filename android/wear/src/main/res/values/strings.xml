@@ -11,4 +11,7 @@
 
     <!-- Shown in the watch face editor's complication picker. -->
     <string name="complication_label">Dictate</string>
+
+    <!-- Shown in the watch face picker. -->
+    <string name="face_label">DictationMic</string>
 </resources>

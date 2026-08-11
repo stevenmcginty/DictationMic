@@ -104,5 +104,27 @@
                 android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
                 android:value="0" />
         </service>
+
+        <!-- The watch face itself: Steve's daily face with the mic dead
+             centre and the battery around the rim. A watch face is a
+             wallpaper service to Android — the permission and action are the
+             system's contract, not choices. -->
+        <service
+            android:name=".DictationWatchFaceService"
+            android:label="@string/face_label"
+            android:exported="true"
+            android:permission="android.permission.BIND_WALLPAPER"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.service.wallpaper.WallpaperService" />
+                <category android:name="com.google.android.wearable.watchface.category.WATCH_FACE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.wallpaper"
+                android:resource="@xml/watch_face" />
+            <meta-data
+                android:name="com.google.android.wearable.watchface.preview_circular"
+                android:resource="@drawable/tile_preview" />
+        </service>
     </application>
 </manifest>
