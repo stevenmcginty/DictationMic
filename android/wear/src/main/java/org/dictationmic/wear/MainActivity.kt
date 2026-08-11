@@ -30,6 +30,12 @@ class MainActivity : ComponentActivity() {
     // button and goes straight to the voice input.
     private var dictateRequest by mutableStateOf(false)
 
+    // A launch that came in as a dictation should leave the same way: once
+    // the note is saved (or the session ends empty), the app steps aside and
+    // the watch is back on the face. Sitting on the idle mic screen after a
+    // face-tap dictation just trades one home screen for a worse one.
+    private var exitWhenDone = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Read before the first frame is drawn. The account is what the status
@@ -44,6 +50,7 @@ class MainActivity : ComponentActivity() {
         NetworkBoost.hold(this, "app")
 
         dictateRequest = intent?.getBooleanExtra(EXTRA_DICTATE, false) == true
+        exitWhenDone = dictateRequest
 
         // No keep-screen-on any more: the talking now happens on the system's
         // own voice screen, which manages its own timeout, and this activity is
@@ -52,6 +59,7 @@ class MainActivity : ComponentActivity() {
             WatchApp(
                 dictateRequest = dictateRequest,
                 onDictateHandled = { dictateRequest = false },
+                onSessionDone = { if (exitWhenDone) finish() },
             )
         }
     }
@@ -62,7 +70,10 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.getBooleanExtra(EXTRA_DICTATE, false)) dictateRequest = true
+        if (intent.getBooleanExtra(EXTRA_DICTATE, false)) {
+            dictateRequest = true
+            exitWhenDone = true
+        }
     }
 
     override fun onDestroy() {
@@ -81,6 +92,7 @@ class MainActivity : ComponentActivity() {
 fun WatchApp(
     dictateRequest: Boolean = false,
     onDictateHandled: () -> Unit = {},
+    onSessionDone: () -> Unit = {},
 ) {
     // Two screens and no navigation library: the account screen is a one-time
     // errand, and a whole nav graph to reach it would be more code than the
@@ -101,6 +113,7 @@ fun WatchApp(
                     onAccount = { showAccount = true },
                     dictateRequest = dictateRequest,
                     onDictateHandled = onDictateHandled,
+                    onSessionDone = onSessionDone,
                 )
             }
         }

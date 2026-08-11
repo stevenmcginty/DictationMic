@@ -78,6 +78,7 @@ fun DictationScreen(
     onAccount: () -> Unit,
     dictateRequest: Boolean = false,
     onDictateHandled: () -> Unit = {},
+    onSessionDone: () -> Unit = {},
 ) {
     val ctx = LocalContext.current
     val haptic = LocalHapticFeedback.current
@@ -159,6 +160,9 @@ fun DictationScreen(
         showSaved = true
         delay(SAVED_FLASH_MS)
         showSaved = false
+        // The receipt has been read; a face-tap launch now steps aside so the
+        // wrist is back on the watch face, not parked on the idle mic screen.
+        onSessionDone()
     }
 
     // A session can also end with nothing said, which saves nothing and stamps
@@ -167,6 +171,7 @@ fun DictationScreen(
         if (!running && stopping) {
             delay(SAVED_FLASH_MS)
             stopping = false
+            onSessionDone()      // ended empty — same exit as a saved one
         }
     }
 
