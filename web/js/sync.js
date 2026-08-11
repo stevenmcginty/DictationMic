@@ -200,15 +200,51 @@ function scheduleReconnect() {
 function startWatchdog() {
   if (watchdog) return;
   watchdog = setInterval(() => {
-    if (es && lastBeat && Date.now() - lastBeat > 95000) hardReconnect();
+    if (es && lastBeat && Date.now() - lastBeat > 95000) {
+      hardReconnect();
+      resyncNow();      // don't sit on stale notes while the stream rebuilds
+    }
   }, 30000);
 }
 
 // Bring the live pull back the moment it's needed (network returned, tab
-// refocused) without waiting on the watchdog's next tick.
+// refocused) without waiting on the watchdog's next tick. Coming back to the
+// tab resets the reconnect backoff outright: a backoff that climbed to 60s
+// while the phone sat in a pocket must not make the user wait a minute for
+// notes they're now looking for.
 function ensureLive() {
-  if (!es) { esBackoff = 1000; connect(); return; }
-  if (lastBeat && Date.now() - lastBeat > 60000) { esBackoff = 1000; hardReconnect(); }
+  const fresh = es && streamLive
+    && lastBeat && Date.now() - lastBeat <= 45000;
+  if (fresh) return;
+  esBackoff = 1000;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (es) hardReconnect(); else connect();
+}
+
+// Whether the stream can be trusted to have delivered everything up to now.
+// A backgrounded phone tab quietly kills the socket without an error event,
+// so "es exists" means nothing — only a recent beat does.
+function streamStale() {
+  return !streamLive || !lastBeat || Date.now() - lastBeat > 45000;
+}
+
+// One direct GET of the snapshot, reconciled immediately — the fast path for
+// "I just opened the tab, show me what the laptop sent while I was away".
+// The reconnecting stream takes over from there; this never replaces it.
+let resyncing = false;
+export async function resyncNow() {
+  if (resyncing || !navigator.onLine || !signedIn()) return;
+  resyncing = true;
+  try {
+    const token = await idToken();
+    const asOf = Date.now();               // sweep guard: snapshot is "now"
+    const res = await fetch(notesUrl(null, token));
+    if (!res.ok) return;
+    await reconcile((await res.json()) || {}, asOf);
+    lastSync = Date.now();
+    onRemote();
+  } catch { /* the stream reconnect heals it on its own clock */ }
+  finally { resyncing = false; }
 }
 
 async function handle(kind, ev) {
@@ -367,7 +403,7 @@ async function applyPatch(id, part) {
   });
 }
 
-async function reconcile(snapshot) {
+async function reconcile(snapshot, asOf = streamOpenedAt) {
   // Only a queued *body* op protects a note from the "gone from the cloud"
   // sweep — a pending star must not (it can't meaningfully resurrect a deleted
   // note, and keeping it would diverge from cloudsync.py, which guards on the
@@ -396,8 +432,8 @@ async function reconcile(snapshot) {
   // snapshot deliberately omitted, so it is never swept.
   for (const n of await notesDb.all()) {
     if (seen.has(n.id) || pending.has(n.id)) continue;
-    if ((n.syncedRev || 0) <= 0) continue;              // never reached the cloud
-    if ((n.syncedAt || 0) > streamOpenedAt) continue;   // younger than the snapshot
+    if ((n.syncedRev || 0) <= 0) continue;    // never reached the cloud
+    if ((n.syncedAt || 0) > asOf) continue;   // younger than the snapshot
     await notesDb.del(n.id);
   }
 }
@@ -409,9 +445,22 @@ export function startSync({ onChange, onStateChange } = {}) {
   onState = onStateChange || onState;
   connect();
   flush();
-  addEventListener("online", () => { flush(); ensureLive(); });
+  // Waking up (tab refocused, network back, restored from the bfcache): push
+  // what's queued, revive the stream — and when the stream can't be trusted
+  // to have been listening, pull the snapshot directly rather than making the
+  // user wait for the reconnect. This is what makes a laptop note be there
+  // the moment the phone tab is looked at again, instead of after a refresh.
+  const wake = () => {
+    flush();
+    const stale = streamStale();
+    ensureLive();
+    if (stale) resyncNow();
+  };
+  addEventListener("online", wake);
+  addEventListener("focus", wake);
+  addEventListener("pageshow", e => { if (e.persisted) wake(); });
   addEventListener("visibilitychange", () => {
-    if (!document.hidden) { flush(); ensureLive(); }
+    if (!document.hidden) wake();
   });
   setInterval(flush, 60000);
 }

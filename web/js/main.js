@@ -11,7 +11,7 @@ const isLocal = ["127.0.0.1", "localhost"].includes(location.hostname);
 // phone runs whatever the service worker last cached, which is not necessarily
 // what was last deployed — so "have you actually got the fix yet" was a
 // guess. Now it's a number you can read off the screen.
-const BUILD = 31;
+const BUILD = 32;
 
 function grabToken() {
   // the pill opens us as /#t=<per-run token>; keep it for this tab only

@@ -507,6 +507,47 @@ body.horizon-collapsed .h-toggle svg { transform: rotate(180deg); }
 .note-row.starred { background: linear-gradient(90deg, var(--gold-dim), transparent 62%); }
 .note-row.starred:hover { background: linear-gradient(90deg, var(--gold-dim), var(--surface) 82%); }
 
+/* ---- the Pinned drawer: starred notes held above the flow ----
+   The head folds it like Keep's pinned section; the rows inside are the same
+   notes again, wearing a gold left edge so the copy reads as "the kept one". */
+.pin-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 16px 20px 9px;
+  cursor: pointer; user-select: none;
+  font-family: var(--mono);
+  font-size: 9.5px; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--gold);
+  transition: background .15s;
+}
+.pin-head:hover { background: var(--gold-dim); }
+.pin-head:focus-visible { outline: none; background: var(--gold-dim); box-shadow: inset 2px 0 0 var(--gold); }
+.pin-star { display: inline-grid; place-items: center; }
+.pin-star svg { width: 12px; height: 12px; fill: var(--gold); stroke: var(--gold); }
+.pin-count {
+  padding: 1px 7px;
+  border: 1px solid rgba(244, 199, 82, .32);
+  border-radius: 999px;
+  background: var(--gold-dim);
+  font-size: 9.5px; letter-spacing: .08em;
+}
+.pin-caret {
+  margin-left: auto;
+  width: 14px; height: 14px;
+  opacity: .7;
+  transform: rotate(-90deg);
+  transition: transform .2s var(--ease);
+}
+.pin-head.open .pin-caret { transform: rotate(0deg); }
+.note-row.pinned-row { box-shadow: inset 2px 0 0 var(--gold); }
+.note-row.pinned-row.active { box-shadow: inset 2px 0 0 var(--gold), inset 4px 0 0 var(--volt); }
+.pin-tail {
+  height: 8px;
+  border-bottom: 1px solid rgba(244, 199, 82, .22);
+  margin-bottom: 4px;
+}
+/* in select mode pins sit out — dim them so the wipe visibly passes them by */
+body.selecting .note-row.starred { opacity: .45; }
+
 /* a calendared note reads as scheduled: volt wash + a small event chip.
    The note itself keeps its normal chronological spot — this is display only. */
 .note-row.calendared { background: linear-gradient(90deg, var(--volt-dim), transparent 62%); }

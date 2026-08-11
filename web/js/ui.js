@@ -45,6 +45,9 @@ export class App {
     this._autoTitle = null;        // {id, title} — a title we derived, ours to keep updating
     this._listSig = null;          // what the list last drew — skip identical redraws
     this._renderedIds = null;      // …and which rows were already on screen
+    // The Pinned drawer at the top of the list — open unless it was last
+    // closed on this device (the star itself syncs; the drawer state is local).
+    this._pinnedOpen = localStorage.getItem("dictmic-pins-open") !== "0";
   }
 
   async start() {
@@ -115,6 +118,11 @@ export class App {
       ? this.notes.filter(n => searchText(n).toLowerCase().includes(q))
       : this.notes;
     this._shown = shown;
+    // Pinned is the same starred notes shown twice on purpose — once held at
+    // the top, once in their normal place in the flow. A search searches the
+    // one flow, and select mode is a flow-only affair, so the drawer steps
+    // aside for both.
+    const pinned = (q || this.selecting) ? [] : this.notes.filter(n => n.starred);
     const pending = this.adapter.pendingIds();
 
     // Typing or dictating commits every 700ms, and each commit came through
@@ -124,17 +132,44 @@ export class App {
     // and below, don't re-animate a row that was already there.
     const sig = JSON.stringify([
       q, this.activeId, this.selecting, [...this.selected].sort(),
-      this.notes.length, pending.size,
+      this.notes.length, pending.size, this._pinnedOpen,
       Math.floor(Date.now() / 60000),          // so "5m ago" still ticks over
       shown.map(n => [n.id, n.title, n.updatedAt, !!n.starred,
                       pending.has(n.id), n.calendar || null,
                       n.body.slice(0, 220)]),
+      pinned.map(n => n.id),
     ]);
     if (sig === this._listSig) { this._syncSelectUI(); return; }
     this._listSig = sig;
     const already = this._renderedIds;
 
     list.textContent = "";
+
+    // the Pinned drawer: a tap on the head folds it, the rows inside are the
+    // real notes (open, star, delete all work here — delete ONLY works here)
+    if (pinned.length) {
+      const head = document.createElement("li");
+      head.className = "pin-head" + (this._pinnedOpen ? " open" : "");
+      head.tabIndex = 0;
+      head.setAttribute("role", "button");
+      head.setAttribute("aria-expanded", String(this._pinnedOpen));
+      head.innerHTML = `<span class="pin-star" aria-hidden="true">${STAR_SVG}</span>`
+        + `<span class="pin-label">Pinned</span>`
+        + `<span class="pin-count mono">${pinned.length}</span>`
+        + `<svg class="pin-caret" viewBox="0 0 24 24" aria-hidden="true">`
+        + `<path d="M6 9.5 12 15.5 18 9.5" fill="none" stroke="currentColor"`
+        + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+      list.append(head);
+      if (this._pinnedOpen) {
+        pinned.forEach((n, i) =>
+          list.append(this._buildRow(n, i, { already, pending, pinned: true })));
+        const tail = document.createElement("li");
+        tail.className = "pin-tail";
+        tail.setAttribute("aria-hidden", "true");
+        list.append(tail);
+      }
+    }
+
     let lastDay = null;                 // notes are newest-first, so each
     shown.forEach((n, i) => {           // day's notes sit together already
       const day = n.updatedAt ? dayKey(n.updatedAt) : lastDay;
@@ -145,83 +180,9 @@ export class App {
         head.textContent = dayHeading(n.updatedAt);
         list.append(head);
       }
-      const li = document.createElement("li");
-      li.className = "note-row" + (n.id === this.activeId ? " active" : "")
-        + (n.starred ? " starred" : "")
-        + (this.selecting && this.selected.has(n.id) ? " checked" : "")
-        + (!n.calendar ? ""
-           : n.calendar.status === "ok" ? " calendared" : " cal-failed");
-      li.dataset.id = n.id;
-      li.tabIndex = 0;
-      // image/file rows can be dragged straight out of the list as real files
-      if (isImageBody(n.body) || isFileBody(n.body)) li.draggable = true;
-      // A row that was already on screen updates in place — only genuinely new
-      // rows get the entry animation, so a save never restages the whole list.
-      if (already?.has(n.id)) li.style.animation = "none";
-      else li.style.animationDelay = `${Math.min(i, 14) * 12}ms`;
-
-      const top = document.createElement("div");
-      top.className = "note-row-top";
-      if (this.selecting) {
-        const check = document.createElement("span");
-        check.className = "row-check";
-        check.innerHTML = TICK_SVG;
-        top.append(check);
-      }
-      const title = document.createElement("span");
-      title.className = "note-row-title";
-      title.textContent = n.title;
-      const star = document.createElement("button");
-      star.className = "row-star" + (n.starred ? " on" : "");
-      star.innerHTML = STAR_SVG;
-      star.setAttribute("aria-pressed", n.starred ? "true" : "false");
-      star.setAttribute("aria-label", n.starred ? `Unstar ${n.title}` : `Star ${n.title}`);
-      const time = document.createElement("span");
-      time.className = "note-row-time";
-      time.textContent = relTime(n.updatedAt);
-      const del = document.createElement("button");
-      del.className = "row-del";
-      del.textContent = "×";
-      del.setAttribute("aria-label", `Delete ${n.title}`);
-      top.append(title, star, time, del);
-
-      const snippet = document.createElement("div");
-      snippet.className = "note-row-snippet" + (isImageBody(n.body) ? " has-thumb" : "");
-      if (isImageBody(n.body)) {
-        const img = document.createElement("img");
-        img.className = "note-thumb";
-        img.src = n.body;
-        img.alt = "";
-        img.loading = "lazy";
-        img.decoding = "async";
-        snippet.append(img);
-      } else if (isFileBody(n.body)) {
-        const f = fileMeta(n.body);
-        const chip = document.createElement("span");
-        chip.className = "file-chip";
-        const badge = document.createElement("span");
-        badge.className = "file-badge small";
-        badge.textContent = f.ext || "FILE";
-        const label = document.createElement("span");
-        label.className = "file-chip-name";
-        label.textContent = `${f.name} · ${fmtBytes(f.bytes)}`;
-        chip.append(badge, label);
-        snippet.append(chip);
-      } else {
-        snippet.textContent = n.body.slice(0, 220);
-      }
-
-      li.append(top);
-      if (n.calendar) li.append(this._calChip(n.calendar));
-      li.append(snippet);
-      if (pending.has(n.id)) {
-        const dot = document.createElement("span");
-        dot.className = "sync-dot";
-        li.append(dot);
-      }
-      list.append(li);
+      list.append(this._buildRow(n, i, { already, pending }));
     });
-    this._renderedIds = new Set(shown.map(n => n.id));
+    this._renderedIds = new Set([...pinned, ...shown].map(n => n.id));
 
     $("emptyState").hidden = shown.length > 0;
     if (!shown.length) {
@@ -235,13 +196,102 @@ export class App {
     this._syncSelectUI();
   }
 
+  // One note row. The same builder serves the flow and the Pinned drawer —
+  // a pinned note renders twice, and both copies act on the same id.
+  _buildRow(n, i, { already, pending, pinned = false }) {
+    const li = document.createElement("li");
+    li.className = "note-row" + (n.id === this.activeId ? " active" : "")
+      + (n.starred ? " starred" : "")
+      + (pinned ? " pinned-row" : "")
+      + (this.selecting && this.selected.has(n.id) ? " checked" : "")
+      + (!n.calendar ? ""
+         : n.calendar.status === "ok" ? " calendared" : " cal-failed");
+    li.dataset.id = n.id;
+    li.tabIndex = 0;
+    // image/file rows can be dragged straight out of the list as real files
+    if (isImageBody(n.body) || isFileBody(n.body)) li.draggable = true;
+    // A row that was already on screen updates in place — only genuinely new
+    // rows get the entry animation, so a save never restages the whole list.
+    if (already?.has(n.id)) li.style.animation = "none";
+    else li.style.animationDelay = `${Math.min(i, 14) * 12}ms`;
+
+    const top = document.createElement("div");
+    top.className = "note-row-top";
+    if (this.selecting) {
+      const check = document.createElement("span");
+      check.className = "row-check";
+      check.innerHTML = TICK_SVG;
+      top.append(check);
+    }
+    const title = document.createElement("span");
+    title.className = "note-row-title";
+    title.textContent = n.title;
+    const star = document.createElement("button");
+    star.className = "row-star" + (n.starred ? " on" : "");
+    star.innerHTML = STAR_SVG;
+    star.setAttribute("aria-pressed", n.starred ? "true" : "false");
+    star.setAttribute("aria-label", n.starred ? `Unpin ${n.title}` : `Pin ${n.title}`);
+    const time = document.createElement("span");
+    time.className = "note-row-time";
+    time.textContent = relTime(n.updatedAt);
+    const del = document.createElement("button");
+    del.className = "row-del";
+    del.textContent = "×";
+    del.setAttribute("aria-label", `Delete ${n.title}`);
+    top.append(title, star, time, del);
+
+    const snippet = document.createElement("div");
+    snippet.className = "note-row-snippet" + (isImageBody(n.body) ? " has-thumb" : "");
+    if (isImageBody(n.body)) {
+      const img = document.createElement("img");
+      img.className = "note-thumb";
+      img.src = n.body;
+      img.alt = "";
+      img.loading = "lazy";
+      img.decoding = "async";
+      snippet.append(img);
+    } else if (isFileBody(n.body)) {
+      const f = fileMeta(n.body);
+      const chip = document.createElement("span");
+      chip.className = "file-chip";
+      const badge = document.createElement("span");
+      badge.className = "file-badge small";
+      badge.textContent = f.ext || "FILE";
+      const label = document.createElement("span");
+      label.className = "file-chip-name";
+      label.textContent = `${f.name} · ${fmtBytes(f.bytes)}`;
+      chip.append(badge, label);
+      snippet.append(chip);
+    } else {
+      snippet.textContent = n.body.slice(0, 220);
+    }
+
+    li.append(top);
+    if (n.calendar) li.append(this._calChip(n.calendar));
+    li.append(snippet);
+    if (pending.has(n.id)) {
+      const dot = document.createElement("span");
+      dot.className = "sync-dot";
+      li.append(dot);
+    }
+    return li;
+  }
+
+  _togglePinned() {
+    this._pinnedOpen = !this._pinnedOpen;
+    localStorage.setItem("dictmic-pins-open", this._pinnedOpen ? "1" : "0");
+    this.renderList();
+  }
+
   // ---------------- select mode (bulk delete) ----------------
 
+  // Pinned notes sit out bulk delete entirely — "delete everything" must
+  // never take the ones deliberately kept. They go via the Pinned drawer.
   _enterSelect(all = false) {
     if (this.selecting) return;
     this.selecting = true;
     this.selected.clear();
-    if (all) for (const n of this._shown) this.selected.add(n.id);
+    if (all) for (const n of this._shown) if (!n.starred) this.selected.add(n.id);
     document.body.classList.add("selecting");
     this.renderList();
   }
@@ -257,6 +307,10 @@ export class App {
 
   _toggleSelect(id) {
     if (this._bulkBusy) return;
+    if (this.notes.find(x => x.id === id)?.starred) {
+      this.toast("Pinned — delete it from the Pinned section");
+      return;
+    }
     if (this.selected.has(id)) this.selected.delete(id);
     else this.selected.add(id);
     const li = [...$("noteList").children].find(el => el.dataset?.id === id);
@@ -269,8 +323,9 @@ export class App {
     if (!this.selecting) return;
     const n = this.selected.size;
     $("selCount").textContent = `${n} selected`;
-    const all = this._shown.length
-      && this._shown.every(x => this.selected.has(x.id));
+    const targets = this._shown.filter(x => !x.starred);
+    const all = targets.length
+      && targets.every(x => this.selected.has(x.id));
     $("selectAllBtn").textContent = all ? "None" : "All";
     const btn = $("deleteSelBtn");
     if (!this._bulkBusy && !btn.classList.contains("armed")) {
@@ -369,15 +424,18 @@ export class App {
     }
   }
 
-  // Toggle the gold star. We flip it in place first (no reorder, instant feel),
-  // then persist; the adapter owns getting it to the other devices.
+  // Toggle the gold star — which is also the pin. The note keeps its place in
+  // the flow (a star never bumps updatedAt), and a full re-render slides its
+  // copy into or out of the Pinned drawer; the adapter owns getting the star
+  // to the other devices.
   async _toggleStar(id) {
     const n = this.notes.find(x => x.id === id);
     if (!n || typeof this.adapter.setStar !== "function") return;
     const want = !n.starred;
     n.starred = want;
     n.starredAt = Date.now();
-    this._markStarRow(id, want);
+    this.renderList();
+    if (want && !this.selecting) this.toast("Pinned to the top");
     try {
       const updated = await this.adapter.setStar(id, want);
       if (updated) {
@@ -386,21 +444,8 @@ export class App {
       }
     } catch (e) {
       n.starred = !want;                       // put it back
-      this._markStarRow(id, !want);
-      this.toast(e.message || "Couldn't update the star");
-    }
-  }
-
-  _markStarRow(id, on) {
-    const li = [...$("noteList").children].find(el => el.dataset?.id === id);
-    if (!li) return;
-    li.classList.toggle("starred", on);
-    const btn = li.querySelector(".row-star");
-    if (btn) {
-      btn.classList.toggle("on", on);
-      btn.setAttribute("aria-pressed", on ? "true" : "false");
-      const title = this.notes.find(x => x.id === id)?.title || "";
-      btn.setAttribute("aria-label", (on ? "Unstar " : "Star ") + title);
+      this.renderList();
+      this.toast(e.message || "Couldn't update the pin");
     }
   }
 
@@ -767,6 +812,7 @@ export class App {
   _bind() {
     // list interactions (the row × arms first — a stray tap can't delete)
     $("noteList").addEventListener("click", e => {
+      if (e.target.closest(".pin-head")) { this._togglePinned(); return; }
       if (this.selecting) {        // in select mode a tap ticks, never opens
         const row = e.target.closest(".note-row");
         if (row) this._toggleSelect(row.dataset.id);
@@ -782,7 +828,15 @@ export class App {
       const del = e.target.closest(".row-del");
       if (del) {
         e.stopPropagation();
-        const id = del.closest(".note-row")?.dataset.id;
+        const row = del.closest(".note-row");
+        const id = row?.dataset.id;
+        // a pinned note only deletes from inside the Pinned drawer — the ×
+        // in the flow points there instead of arming
+        if (!row?.classList.contains("pinned-row")
+            && this.notes.find(x => x.id === id)?.starred) {
+          this.toast("Pinned — delete it from the Pinned section");
+          return;
+        }
         if (!del.classList.contains("armed")) {
           for (const b of $("noteList").querySelectorAll(".row-del.armed")) {
             b.classList.remove("armed");
@@ -803,6 +857,13 @@ export class App {
       if (li) location.hash = `#/note/${li.dataset.id}`;
     });
     $("noteList").addEventListener("keydown", e => {
+      if (e.target.closest(".pin-head")) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          this._togglePinned();
+        }
+        return;
+      }
       // Enter/Space on the × or the star acts on that button, not the row
       if (e.target.closest(".row-del") || e.target.closest(".row-star")) return;
       const li = e.target.closest(".note-row");
@@ -819,9 +880,10 @@ export class App {
     $("selectCancelBtn").addEventListener("click", () => this._exitSelect());
     $("selectAllBtn").addEventListener("click", () => {
       if (this._bulkBusy) return;
-      const all = this._shown.length
-        && this._shown.every(n => this.selected.has(n.id));
-      for (const n of this._shown) {
+      const targets = this._shown.filter(n => !n.starred);   // pins sit out
+      const all = targets.length
+        && targets.every(n => this.selected.has(n.id));
+      for (const n of targets) {
         if (all) this.selected.delete(n.id);
         else this.selected.add(n.id);
       }
@@ -970,6 +1032,12 @@ export class App {
     });
 
     $("deleteBtn").addEventListener("click", () => {
+      // a pinned note is deliberately kept — it only deletes from the Pinned
+      // drawer's own ×, so a pin is never lost to a quick editor delete
+      if (this.notes.find(x => x.id === this.activeId)?.starred) {
+        this.toast("Pinned — unpin it, or delete it from the Pinned section");
+        return;
+      }
       const btn = $("deleteBtn");
       if (!btn.classList.contains("armed")) {
         btn.classList.add("armed");
