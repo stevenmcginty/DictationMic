@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Two words, same as the phone: spoken app names are matched against a
+         transcript, and "DictationMic" as one word never matched. -->
+    <string name="app_name">Dictation Mic</string>
+
+    <!-- Shown in Settings > Tiles, where the choice is being made between a
+         dozen tiles at a glance, so the label is the verb and not the app. -->
+    <string name="tile_label">Dictate</string>
+    <string name="tile_description">Start dictating a note</string>
+</resources>

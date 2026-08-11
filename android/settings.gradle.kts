@@ -13,4 +13,6 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "DictationMic"
+include(":core")
 include(":app")
+include(":wear")

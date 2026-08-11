@@ -21,6 +21,7 @@ dist/
 _internal/
 DictationMic.exe
 DictationMic-Android.apk
+DictationMic-Wear.apk
 models/
 selftest_out.txt
 .gradle/

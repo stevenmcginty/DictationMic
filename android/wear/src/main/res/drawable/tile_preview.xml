@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the watch shows in Settings > Tiles when you are choosing which tiles
+     to keep. It is a still picture of the tile, not the tile itself, so it is
+     drawn here by hand rather than rendered. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="192dp" android:height="192dp"
+    android:viewportWidth="192" android:viewportHeight="192">
+    <path
+        android:fillColor="#0B0C0A"
+        android:pathData="M96,96m-96,0a96,96 0 1,0 192,0a96,96 0 1,0 -192,0" />
+    <group android:translateX="60" android:translateY="52" android:scaleX="1.5" android:scaleY="1.5">
+        <path
+            android:fillColor="#B6EE3F"
+            android:pathData="M19,10 a5,5 0 0 1 10,0 v12 a5,5 0 0 1 -10,0 z" />
+        <path
+            android:strokeColor="#B6EE3F"
+            android:strokeWidth="3.5"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000"
+            android:pathData="M14,22 v3 a10,10 0 0 0 20,0 v-3" />
+        <path
+            android:strokeColor="#B6EE3F"
+            android:strokeWidth="3.5"
+            android:strokeLineCap="round"
+            android:fillColor="#00000000"
+            android:pathData="M24,35 v6" />
+    </group>
+</vector>

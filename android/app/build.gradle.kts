@@ -55,8 +55,10 @@ android {
 }
 
 // No Compose any more: the entire interface is the hosted web app, so the only
-// view this APK builds is the WebView that holds it.
+// view this APK builds is the WebView that holds it. The dictation engine,
+// note store and cloud sync live in :core, shared with the watch app.
 dependencies {
+    implementation(project(":core"))
     implementation("androidx.activity:activity:1.9.3")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.core:core-ktx:1.15.0")

@@ -1,6 +1,7 @@
 package org.dictationmic.android
 
 import android.content.Context
+import android.util.Log
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -53,7 +54,18 @@ object CloudSync {
         state.value = "off"
     }
 
-    suspend fun signIn(ctx: Context, mail: String, password: String): String? =
+    // allowCreate is what the phone does: an unknown email means a new account,
+    // because that is also how you sign up. The watch passes false, and it has
+    // to. There, the address is thumbed in on an inch of glass with no second
+    // field to check it against, and a single wrong character used to open a
+    // brand-new empty account and sync to it perfectly happily — every note
+    // saved, nothing ever arriving, and no way to tell from the wrist.
+    suspend fun signIn(
+        ctx: Context,
+        mail: String,
+        password: String,
+        allowCreate: Boolean = true,
+    ): String? =
         withContext(Dispatchers.IO) {
             val body = JSONObject()
                 .put("email", mail).put("password", password)
@@ -63,6 +75,13 @@ object CloudSync {
                 val err = errOf(resp)
                 if (err.startsWith("EMAIL_NOT_FOUND") ||
                     err.startsWith("INVALID_LOGIN_CREDENTIALS")) {
+                    // Firebase folds "no such account" and "wrong password"
+                    // into one error, so without signing up we can't tell them
+                    // apart — say both, since on a watch either one is nearly
+                    // always a mistyped character rather than a new account.
+                    if (!allowCreate) {
+                        return@withContext "No account with that email, or wrong password"
+                    }
                     val r2 = post(SIGNUP, body)
                     code = r2.first; resp = r2.second
                     if (code != 200) {
@@ -73,6 +92,12 @@ object CloudSync {
                 } else return@withContext friendly(err)
             }
             val j = JSONObject(resp)
+            // Deliberately not re-queueing the local notes on an account
+            // switch. Most of what a device holds was pulled down rather than
+            // dictated on it, so re-pushing the lot would stamp every one of
+            // them with a fresh cloud timestamp and reshuffle the note list on
+            // every other device. Signing into the wrong account is prevented
+            // up front instead.
             prefs(ctx).edit()
                 .putString("email", mail)
                 .putString("refreshToken", j.getString("refreshToken"))
@@ -154,6 +179,11 @@ object CloudSync {
                 pullAll(ctx, tok)
                 state.value = "ok"
             } catch (ex: Exception) {
+                // Swallowed for the user's sake — a failed sync retries and
+                // nothing is lost — but silent in the log meant a watch that
+                // never delivered looked exactly like a watch with nothing to
+                // deliver.
+                Log.i(DictationService.LOG, "sync failed: $ex")
                 state.value = "offline"
             }
         }
@@ -169,11 +199,16 @@ object CloudSync {
             if (!n.dirty) return@withLock true          // already up there
             try {
                 val tok = token(ctx)
-                if (tok == null) { state.value = "needs-signin"; return@withLock false }
+                if (tok == null) {
+                    Log.i(DictationService.LOG, "push: no token — signed out or refresh refused")
+                    state.value = "needs-signin"
+                    return@withLock false
+                }
                 pushOne(ctx, tok, n)
                 state.value = "ok"
                 true
             } catch (ex: Exception) {
+                Log.i(DictationService.LOG, "push of ${n.id} failed: $ex")
                 state.value = "offline"
                 false
             }

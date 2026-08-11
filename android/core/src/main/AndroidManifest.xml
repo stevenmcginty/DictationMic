@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Deliberately empty. Each app declares DictationService and the permissions
+     it needs itself, because the two of them ask for different things around
+     it: the phone also has a tile, a share target and an updater. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The same mic as the one drawn in DictationScreen, as a real drawable: a
+     tile is rendered by the system launcher, not by this app's Compose tree,
+     so the glyph has to exist as a resource it can inflate. Volt is baked in
+     rather than tinted at runtime — one colour, one place it can go wrong. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp" android:height="48dp"
+    android:viewportWidth="48" android:viewportHeight="48">
+    <path
+        android:fillColor="#B6EE3F"
+        android:pathData="M19,10 a5,5 0 0 1 10,0 v12 a5,5 0 0 1 -10,0 z" />
+    <path
+        android:strokeColor="#B6EE3F"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M14,22 v3 a10,10 0 0 0 20,0 v-3" />
+    <path
+        android:strokeColor="#B6EE3F"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M24,35 v6" />
+</vector>

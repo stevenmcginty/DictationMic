@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- The watch holds its own microphone now, the same way the phone does.
+         It used to hand off to the system's one-shot voice input screen,
+         because SpeechRecognizer was unusable here — the watch had no
+         RecognitionService at all. That is no longer true (measured: see the
+         comment in DictationScreen), and the one-shot screen's habit of ending
+         the note on a pause is exactly what makes it unusable for dictating on
+         a walk. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- The screen goes out long before a ten-minute dictation does. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.DeviceDefault"
+        android:allowBackup="true"
+        android:supportsRtl="true">
+
+        <!-- Required by the Wear platform even when the app never calls into
+             it; `required=false` keeps the APK installable on a plain phone. -->
+        <uses-library
+            android:name="com.google.android.wearable"
+            android:required="false" />
+
+        <!-- The whole point of this build: the watch dictates on its own,
+             straight to the cloud, with no phone in the loop. -->
+        <meta-data
+            android:name="com.google.android.wearable.standalone"
+            android:value="true" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.DeviceDefault"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Shared verbatim with the phone from :core. The microphone type is
+             what lets it keep recording with the screen off, which is most of a
+             ten-minute dictation on a wrist. -->
+        <service
+            android:name="org.dictationmic.android.DictationService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <!-- The tile: one swipe from the watch face and one tap to the voice
+             screen. The permission and the action name are the contract with
+             the system launcher, which is the process that actually binds to
+             this and draws it — both are fixed strings, not choices. -->
+        <service
+            android:name=".DictationTileService"
+            android:label="@string/tile_label"
+            android:description="@string/tile_description"
+            android:exported="true"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview" />
+        </service>
+    </application>
+</manifest>

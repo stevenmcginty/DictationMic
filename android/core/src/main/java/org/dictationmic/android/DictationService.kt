@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -39,6 +40,13 @@ object DictationState {
     val partial = MutableStateFlow("")    // phrase being spoken right now
     val level = MutableStateFlow(0f)      // mic level 0..1 for the meter
     val savedNoteAt = MutableStateFlow(0L)
+    // What the note turned out to be, for a screen that wants to say more than
+    // "saved". Both are stamped for the session savedNoteAt refers to:
+    // savedWords the moment it lands on disk, savedLanded once the upload has
+    // been answered — it starts each session false and flips when the cloud
+    // has actually taken it.
+    val savedWords = MutableStateFlow(0)
+    val savedLanded = MutableStateFlow(false)
 
     val fullText: String
         get() {
@@ -65,7 +73,22 @@ class DictationService : Service() {
         const val ACTION_START = "org.dictationmic.android.START"
         const val ACTION_STOP = "org.dictationmic.android.STOP"
         const val EXTRA_HANDS_FREE = "handsFree"
+        // Whether to insist on transcribing without a network.
+        //
+        // The phone does: it has the offline model, and the whole point there
+        // is dictating in a pocket with no signal. A Pixel Watch frequently
+        // has no offline model at all, and asking for one anyway is not a
+        // graceful degradation — the recogniser simply returns nothing, over
+        // and over, which on the wrist is indistinguishable from a dead
+        // microphone. The watch passes false and takes whatever the system
+        // gives it, which is the same thing Gemini and the voice keyboard use.
+        const val EXTRA_OFFLINE_ONLY = "offlineOnly"
         private const val CHANNEL = "dictation"
+        // One tag for the whole pipeline, so `adb logcat -s DictationMic`
+        // tells the story of a session end to end. Worth keeping in the
+        // shipped build: the watch has no screen to put a diagnosis on, and
+        // this is the only way to tell "heard nothing" from "sent nothing".
+        const val LOG = "DictationMic"
         private const val NOTIF_ID = 1
         // Live upload cadence: at most one PATCH per gap, always carrying the
         // newest text. Quick enough that the laptop feels live, slow enough
@@ -121,10 +144,11 @@ class DictationService : Service() {
             return out
         }
 
-        fun start(ctx: Context, handsFree: Boolean = false) {
+        fun start(ctx: Context, handsFree: Boolean = false, offlineOnly: Boolean = true) {
             val i = Intent(ctx, DictationService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_HANDS_FREE, handsFree)
+                .putExtra(EXTRA_OFFLINE_ONLY, offlineOnly)
             ctx.startForegroundService(i)
         }
 
@@ -140,6 +164,7 @@ class DictationService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var recording = false
     @Volatile private var handsFree = false  // opened by voice: speak the state
+    @Volatile private var offlineOnly = true // see EXTRA_OFFLINE_ONLY
     private var listening = false            // a startListening is in flight
     // A stop phrase was heard in a partial; the session ends on whatever comes
     // back next, result or error. Without it the request lived only in the
@@ -157,7 +182,10 @@ class DictationService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START ->
-                if (!recording) startSession(intent.getBooleanExtra(EXTRA_HANDS_FREE, false))
+                if (!recording) {
+                    offlineOnly = intent.getBooleanExtra(EXTRA_OFFLINE_ONLY, true)
+                    startSession(intent.getBooleanExtra(EXTRA_HANDS_FREE, false))
+                }
             ACTION_STOP -> stopSession()
         }
         return START_NOT_STICKY
@@ -234,10 +262,15 @@ class DictationService : Service() {
     // Prefer the guaranteed on-device recognizer where the platform exposes it
     // (API 33+); otherwise the default Google recognizer with EXTRA_PREFER_OFFLINE.
     private fun makeRecognizer(): SpeechRecognizer =
-        if (Build.VERSION.SDK_INT >= 33 &&
+        if (offlineOnly && Build.VERSION.SDK_INT >= 33 &&
             SpeechRecognizer.isOnDeviceRecognitionAvailable(this)) {
+            Log.i(LOG, "recogniser: on-device")
             SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
         } else {
+            // The system's default. On the watch this is the same engine
+            // behind the voice keyboard and the assistant — the one that
+            // demonstrably hears him.
+            Log.i(LOG, "recogniser: system default (offlineOnly=$offlineOnly)")
             SpeechRecognizer.createSpeechRecognizer(this)
         }
 
@@ -246,7 +279,9 @@ class DictationService : Service() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            // Asking for offline where no offline model exists doesn't fall
+            // back — it just returns nothing, forever.
+            if (offlineOnly) putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         }
@@ -357,6 +392,11 @@ class DictationService : Service() {
         }
 
         override fun onError(error: Int) {
+            // The one thing that can't be worked out from the outside. A watch
+            // that hears nothing looks identical whether the recogniser has no
+            // language model, is busy behind another app, or was simply given
+            // silence — and on a screen this size there is nowhere to say so.
+            Log.i(LOG, "recogniser error $error (${errorName(error)})")
             main.removeCallbacks(stopGrace)
             val stopping = pendingStop
             DictationState.partial.value = ""
@@ -401,6 +441,25 @@ class DictationService : Service() {
         listening = false
         if (handsFree) Speaker.speak("Got it. Saving.")
         stopSession()
+    }
+
+    // The numbers alone are unreadable at three in the morning.
+    private fun errorName(code: Int): String = when (code) {
+        SpeechRecognizer.ERROR_NETWORK -> "network"
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network timeout"
+        SpeechRecognizer.ERROR_AUDIO -> "audio"
+        SpeechRecognizer.ERROR_SERVER -> "server"
+        SpeechRecognizer.ERROR_CLIENT -> "client"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "no speech"
+        SpeechRecognizer.ERROR_NO_MATCH -> "no match"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "busy"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "no microphone permission"
+        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "language not supported"
+        SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "language unavailable (no model)"
+        SpeechRecognizer.ERROR_SERVER_DISCONNECTED -> "server disconnected"
+        SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "too many requests"
+        SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT -> "cannot check support"
+        else -> "unknown"
     }
 
     private fun firstResult(b: Bundle?): String? =
@@ -459,26 +518,36 @@ class DictationService : Service() {
                 val id = liveNoteId?.also {
                     NoteStore.updateText(applicationContext, it, text)
                 } ?: NoteStore.saveNew(applicationContext, text).id
+                val words = Regex("""\S+""").findAll(text).count()
+                // Stamped before the flags a screen reads off them, so a
+                // confirmation can never be drawn from the last session's
+                // numbers while this one is still uploading.
+                DictationState.savedWords.value = words
+                DictationState.savedLanded.value = false
                 DictationState.savedNoteAt.value = System.currentTimeMillis()
                 // the finished wording goes up on its own first; the backlog
                 // and the download follow behind it, off the critical path
                 val landed = runCatching {
                     CloudSync.pushNote(applicationContext, id)
                 }.getOrDefault(false)
+                Log.i(LOG, "saved $words words as $id — " +
+                    "sync=${CloudSync.state.value}, landed=$landed")
+                DictationState.savedLanded.value = landed
                 runCatching { CloudSync.syncNow(applicationContext, firstId = id) }
                 // Said after the upload, not before it, so "on your computer"
                 // is a fact rather than a hope. With no screen this is the only
                 // way to know a dictation in a dead spot didn't reach the laptop.
                 if (spoken) {
-                    val words = Regex("""\S+""").findAll(text).count()
                     Speaker.speak(
                         if (landed) "Saved. $words words, on your computer."
                         else "Saved on the phone, $words words. It'll reach your " +
                             "computer when there's signal.",
                         flush = false)
                 }
-            } else if (spoken) {
-                Speaker.speak("I didn't catch anything, so there's nothing to save.",
+            } else {
+                Log.i(LOG, "session ended with no text — nothing to save")
+                if (spoken) Speaker.speak(
+                    "I didn't catch anything, so there's nothing to save.",
                     flush = false)
             }
             liveJob?.cancel()
@@ -512,9 +581,12 @@ class DictationService : Service() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val openApp = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE)
+        // The service is shared code now, so it can't name an activity: the
+        // phone's is a WebView and the watch's is Compose. The launcher intent
+        // is the one thing both of them are guaranteed to have.
+        val openApp = packageManager.getLaunchIntentForPackage(packageName)?.let {
+            PendingIntent.getActivity(this, 0, it, PendingIntent.FLAG_IMMUTABLE)
+        }
         val stop = PendingIntent.getService(
             this, 1,
             Intent(this, DictationService::class.java).setAction(ACTION_STOP),
