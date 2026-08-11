@@ -8,4 +8,7 @@
          dozen tiles at a glance, so the label is the verb and not the app. -->
     <string name="tile_label">Dictate</string>
     <string name="tile_description">Start dictating a note</string>
+
+    <!-- Shown in the watch face editor's complication picker. -->
+    <string name="complication_label">Dictate</string>
 </resources>

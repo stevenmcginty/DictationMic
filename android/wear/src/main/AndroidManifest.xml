@@ -5,6 +5,10 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- requestNetwork(TRANSPORT_CELLULAR): how the watch is told to bring
+         LTE up NOW instead of a minute after the phone drops away. A normal
+         permission — granted at install, no prompt. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
 
     <!-- The watch holds its own microphone now, the same way the phone does.
          It used to hand off to the system's one-shot voice input screen,
@@ -21,6 +25,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
+        android:name=".WatchApplication"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.DeviceDefault"
@@ -77,6 +82,27 @@
             <meta-data
                 android:name="androidx.wear.tiles.PREVIEW"
                 android:resource="@drawable/tile_preview" />
+        </service>
+
+        <!-- The complication: the mic on the watch face itself, zero swipes
+             away. Chosen into a face slot from the face's own editor; the tap
+             goes straight to dictating, same contract as the tile. -->
+        <service
+            android:name=".DictationComplicationService"
+            android:label="@string/complication_label"
+            android:icon="@drawable/ic_tile_mic"
+            android:exported="true"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="MONOCHROMATIC_IMAGE,SHORT_TEXT" />
+            <!-- A button, not a readout — never re-asked for. -->
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="0" />
         </service>
     </application>
 </manifest>

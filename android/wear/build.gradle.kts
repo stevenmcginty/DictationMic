@@ -26,8 +26,8 @@ android {
         // dictating into.
         minSdk = 33
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     signingConfigs {
@@ -81,4 +81,6 @@ dependencies {
     // implementation of one — the alternative is pulling all of Guava onto a
     // watch to call a single immediateFuture.
     implementation("androidx.concurrent:concurrent-futures:1.2.0")
+    // Complications: the mic slot on the watch face itself.
+    implementation("androidx.wear.watchface:watchface-complications-data-source-ktx:1.2.1")
 }

@@ -8,6 +8,7 @@ import androidx.wear.protolayout.LayoutElementBuilders
 import androidx.wear.protolayout.ModifiersBuilders
 import androidx.wear.protolayout.ResourceBuilders
 import androidx.wear.protolayout.TimelineBuilders
+import androidx.wear.tiles.EventBuilders
 import androidx.wear.tiles.RequestBuilders
 import androidx.wear.tiles.TileBuilders
 import androidx.wear.tiles.TileService
@@ -26,6 +27,19 @@ import com.google.common.util.concurrent.ListenableFuture
 // A tile that opens a screen with a button on it has spent the user's tap and
 // given them another one to make.
 class DictationTileService : TileService() {
+
+    // Swiping to the tile is the moment of intent — the tap is coming. Start
+    // the LTE attach now and the recogniser isn't opening onto a watch that
+    // still thinks a long-gone phone is its network (see NetworkBoost).
+    override fun onTileEnterEvent(requestParams: EventBuilders.TileEnterEvent) {
+        NetworkBoost.hold(this, "tile")
+    }
+
+    override fun onTileLeaveEvent(requestParams: EventBuilders.TileLeaveEvent) {
+        // If the tap happened, the activity and the session carry their own
+        // holds by now; this one has done its job either way.
+        NetworkBoost.release("tile")
+    }
 
     override fun onTileRequest(
         requestParams: RequestBuilders.TileRequest,

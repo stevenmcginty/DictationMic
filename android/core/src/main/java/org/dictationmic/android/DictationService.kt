@@ -144,6 +144,13 @@ class DictationService : Service() {
             return out
         }
 
+        // Set by the watch app (see its WatchApplication): called with true
+        // when a session starts and false once its last upload has been
+        // given to the network, so the watch can hold its cellular radio up
+        // for exactly the stretch that needs it. The phone leaves this null —
+        // it dictates offline and has no radio to hurry.
+        @Volatile var networkHold: ((Boolean) -> Unit)? = null
+
         fun start(ctx: Context, handsFree: Boolean = false, offlineOnly: Boolean = true) {
             val i = Intent(ctx, DictationService::class.java)
                 .setAction(ACTION_START)
@@ -230,6 +237,7 @@ class DictationService : Service() {
         if (handsFree && autoStopMs == 0L) autoStopMs = HANDS_FREE_STOP_MS
 
         liveNoteId = null
+        runCatching { networkHold?.invoke(true) }
         // Mint the auth token now, while you're still drawing breath, so the
         // first upload isn't waiting on a round trip to Google.
         scope.launch { runCatching { CloudSync.warmToken(applicationContext) } }
@@ -552,6 +560,7 @@ class DictationService : Service() {
             }
             liveJob?.cancel()
             liveNoteId = null
+            runCatching { networkHold?.invoke(false) }
             wakeLock?.let { if (it.isHeld) it.release() }
             wakeLock = null
             ServiceCompat.stopForeground(this@DictationService,
@@ -562,6 +571,7 @@ class DictationService : Service() {
 
     override fun onDestroy() {
         recording = false
+        runCatching { networkHold?.invoke(false) }
         main.removeCallbacks(nudge)
         main.post { runCatching { recognizer?.destroy() }; recognizer = null }
         wakeLock?.let { if (it.isHeld) it.release() }

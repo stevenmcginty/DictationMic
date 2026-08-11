@@ -38,6 +38,11 @@ class MainActivity : ComponentActivity() {
         // this build exists to do without.
         CloudSync.loadAccount(applicationContext)
 
+        // The app being open is the best warning the network gets: whatever
+        // happens next — dictating, signing in, syncing — wants LTE up NOW,
+        // not on the watch's own leisurely discovery that the phone is gone.
+        NetworkBoost.hold(this, "app")
+
         dictateRequest = intent?.getBooleanExtra(EXTRA_DICTATE, false) == true
 
         // No keep-screen-on any more: the talking now happens on the system's
@@ -58,6 +63,13 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         if (intent.getBooleanExtra(EXTRA_DICTATE, false)) dictateRequest = true
+    }
+
+    override fun onDestroy() {
+        // A running session keeps its own hold (see WatchApplication), so the
+        // radio survives the screen going off mid-dictation.
+        NetworkBoost.release("app")
+        super.onDestroy()
     }
 
     companion object {
