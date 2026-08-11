@@ -16,5 +16,9 @@ class WatchApplication : Application() {
             if (on) NetworkBoost.hold(this, "dictation")
             else NetworkBoost.release("dictation")
         }
+        // Catch the walk-away the moment a link drops, not when the routing
+        // layer finally notices. The process is alive whenever the watch face
+        // is ours, which is always.
+        WalkAwayGuard.start(this)
     }
 }

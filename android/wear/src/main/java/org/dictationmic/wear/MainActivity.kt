@@ -1,8 +1,11 @@
 package org.dictationmic.wear
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -48,6 +51,16 @@ class MainActivity : ComponentActivity() {
         // happens next — dictating, signing in, syncing — wants LTE up NOW,
         // not on the watch's own leisurely discovery that the phone is gone.
         NetworkBoost.hold(this, "app")
+
+        // One-time ask so WalkAwayGuard can hear the Bluetooth link drop the
+        // instant it happens. Denied is fine — the slower network-loss signal
+        // still catches the walk-away.
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+            != PackageManager.PERMISSION_GRANTED) {
+            registerForActivityResult(
+                ActivityResultContracts.RequestPermission()) { }
+                .launch(Manifest.permission.BLUETOOTH_CONNECT)
+        }
 
         dictateRequest = intent?.getBooleanExtra(EXTRA_DICTATE, false) == true
         exitWhenDone = dictateRequest

@@ -9,6 +9,10 @@
          LTE up NOW instead of a minute after the phone drops away. A normal
          permission — granted at install, no prompt. -->
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <!-- Hearing the Bluetooth link to the phone drop the moment it happens —
+         the earliest walk-away signal there is (see WalkAwayGuard). Runtime
+         permission, asked once on first open; everything else works without. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!-- The watch holds its own microphone now, the same way the phone does.
          It used to hand off to the system's one-shot voice input screen,

@@ -55,6 +55,11 @@ keeps data and sign-in. Bump `versionCode`/`versionName` in
 - **NetworkBoost** — holds LTE up while the app/tile/dictation needs it,
   because the watch otherwise takes ~1 min to fail over from a dead
   Bluetooth proxy after walking away from the phone.
+- **WalkAwayGuard** — catches the walk-away at its earliest signals (a
+  Bluetooth ACL disconnect, any non-cellular network lost) and holds LTE
+  for two minutes, so the modem attaches while the routing layer is still
+  waiting out its timeouts. Needs BLUETOOTH_CONNECT for the fast path
+  (granted on Steve's watch via `pm grant`).
 
 ## Debugging
 
