@@ -266,6 +266,11 @@ class CloudSync:
                     if not self.settings.get("sync_refresh_token"):
                         return
                     raise ConnectionError("no id token")
+                # The root snapshot this stream is about to deliver reflects
+                # the database no later than this moment. Carried with every
+                # queued event so _reconcile can tell "synced after the
+                # snapshot was taken" from "purged on another device".
+                opened = _now_ms()
                 with requests.get(self._notes_url(token=token), stream=True,
                                   headers={"Accept": "text/event-stream"},
                                   timeout=(10, 60)) as r:
@@ -319,7 +324,8 @@ class CloudSync:
                                 if event in ("put", "patch"):
                                     try:
                                         self._q.put(
-                                            ("remote", (event, json.loads(data))))
+                                            ("remote",
+                                             (event, json.loads(data), opened)))
                                     except ValueError:
                                         pass
                                 elif event == "auth_revoked":
@@ -489,7 +495,7 @@ class CloudSync:
     # applying remote events
     # ------------------------------------------------------------------
 
-    def _handle_remote(self, kind, msg):
+    def _handle_remote(self, kind, msg, opened=0):
         path = (msg or {}).get("path", "/")
         data = (msg or {}).get("data")
         if path == "/":
@@ -498,7 +504,7 @@ class CloudSync:
                 for nid, part in (data or {}).items():
                     self._apply_patch(nid, part)
             else:
-                self._reconcile(data or {})
+                self._reconcile(data or {}, opened)
         else:
             nid = path.strip("/").split("/")[0]
             if "/" in path.strip("/"):
@@ -604,19 +610,24 @@ class CloudSync:
         }
         self._apply_one(nid, merged)
 
-    def _reconcile(self, snapshot):
+    def _reconcile(self, snapshot, as_of=0):
         seen = set()
         for nid, record in (snapshot or {}).items():
             if not isinstance(record, dict):
                 continue
             seen.add(nid)
             self._apply_one(nid, record)
-        # local notes that were synced before but are gone from the cloud
-        # were deleted (and purged) while we were away
+        # Local notes that were synced before but are gone from the cloud were
+        # deleted (and purged) while we were away — but only trust a snapshot
+        # old enough to have known about the note. A note whose push (or
+        # adoption) postdates the stream's opening can't be one the snapshot
+        # deliberately omitted; sweeping those deleted a just-dictated note's
+        # file off disk whenever the stream reconnected at the wrong moment.
         for nid in list(self.store.notes.keys()):
             e = self.store.entry(nid)
             if (e and nid not in seen and int(e.get("syncedRev") or 0) > 0
-                    and not e.get("dirty")):
+                    and not e.get("dirty")
+                    and int(e.get("syncedAt") or 0) <= as_of):
                 self.store.apply_remote(nid, {"deleted": True,
                                               "updatedAt": _now_ms()})
         if not self._purged:

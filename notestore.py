@@ -509,13 +509,17 @@ class NoteStore:
             self._save_index()
 
     def mark_synced(self, note_id, rev):
-        """Record the server updatedAt after a successful push."""
+        """Record the server updatedAt after a successful push. syncedAt is
+        our own wall clock, kept so the reconcile sweep can tell a note that
+        reached the cloud after a snapshot was taken from one that was purged
+        on another device."""
         with self.lock:
             e = self.notes.get(note_id)
             if not e:
                 return
             e["syncedRev"] = rev
             e["dirty"] = False
+            e["syncedAt"] = _now_ms()
             self._save_index()
 
     # ---------------- remote application (cloud sync) ----------------
@@ -557,6 +561,7 @@ class NoteStore:
                         "mtime": st.st_mtime,
                         "createdAt": int(record.get("createdAt") or _now_ms()),
                         "syncedRev": rev, "dirty": False,
+                        "syncedAt": _now_ms(),
                         "starred": bool(record.get("starred")),
                         "starredAt": int(record.get("starredAt") or 0),
                     }
@@ -579,7 +584,7 @@ class NoteStore:
                         changed = True
                     st = os.stat(self._path(e["filename"]))
                     e.update(hash=_hash(body), size=st.st_size, mtime=st.st_mtime,
-                             syncedRev=rev, dirty=False)
+                             syncedRev=rev, dirty=False, syncedAt=_now_ms())
                     kind = "remote_update" if changed else ""
                 self._save_index()
         if kind:

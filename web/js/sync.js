@@ -152,16 +152,20 @@ async function connect() {
   let token;
   try { token = await idToken(); }
   catch { setState("needs-signin"); return; }
+  // Stamped BEFORE the socket is even opened: the root snapshot reflects the
+  // database no later than this moment, so any note that synced after it must
+  // survive the reconcile sweep. Stamping it in onopen left a gap where a note
+  // arriving between open and snapshot could look older than the snapshot.
+  streamOpenedAt = Date.now();
   es = new EventSource(notesUrl(null, token));
   const beat = () => { lastBeat = Date.now(); };
-  es.addEventListener("put", ev => { beat(); handle("put", ev); });
-  es.addEventListener("patch", ev => { beat(); handle("patch", ev); });
+  es.addEventListener("put", ev => { beat(); enqueue("put", ev); });
+  es.addEventListener("patch", ev => { beat(); enqueue("patch", ev); });
   es.addEventListener("keep-alive", beat);         // RTDB pings ~every 30s
   es.addEventListener("auth_revoked", () => hardReconnect());
   es.addEventListener("cancel", () => hardReconnect());
   es.onopen = () => {
     esBackoff = 1000; lastBeat = Date.now(); streamLive = true;
-    streamOpenedAt = Date.now();
     setState("ok");
   };
   es.onerror = () => {
@@ -245,6 +249,15 @@ export async function resyncNow() {
     onRemote();
   } catch { /* the stream reconnect heals it on its own clock */ }
   finally { resyncing = false; }
+}
+
+// Stream events must apply in order, one at a time. handle() is async, and an
+// unawaited child "put" used to interleave with a root-put reconcile mid-flight:
+// the reconcile's sweep re-reads the whole store, so it could see (and delete)
+// a note the child put had just written but the older snapshot didn't contain.
+let eventChain = Promise.resolve();
+function enqueue(kind, ev) {
+  eventChain = eventChain.then(() => handle(kind, ev)).catch(() => {});
 }
 
 async function handle(kind, ev) {
@@ -361,6 +374,11 @@ async function applyOne(id, record) {
   const star = mergeStar(local, record);
   const calendar = record.calendar !== undefined ? record.calendar
     : local?.calendar;
+  // syncedAt guards the reconcile sweep exactly as it does for notes this
+  // device pushed: a note adopted from the cloud just now can't be one an
+  // older snapshot deliberately omitted. Without it, a laptop note delivered
+  // live was deleted by the next stale snapshot's sweep and only came back on
+  // the reconnect after that — the appear/disappear/reappear flicker.
   await notesDb.put({
     id,
     title: record.title || "Note",
@@ -368,6 +386,7 @@ async function applyOne(id, record) {
     createdAt: Number(record.createdAt) || rev,
     updatedAt: rev,
     syncedRev: rev,
+    syncedAt: Date.now(),
     ...star,
     ...(calendar !== undefined ? { calendar } : {}),
   });
@@ -400,6 +419,7 @@ async function applyPatch(id, part) {
     ...star,
     updatedAt: rev,
     syncedRev: rev,
+    syncedAt: Date.now(),      // same sweep protection as applyOne
   });
 }
 
