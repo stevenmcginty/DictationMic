@@ -195,20 +195,25 @@ function scheduleReconnect() {
     reconnectTimer = null;
     if (!es) connect();
   }, esBackoff);
-  esBackoff = Math.min(esBackoff * 2, 60000);
+  // Capped low on purpose: this stream is the only live channel the phone
+  // has, and a 60s cap meant a couple of network flaps put the next laptop
+  // note a full minute away. A retry is one cheap GET — err on eager.
+  esBackoff = Math.min(esBackoff * 2, 15000);
 }
 
-// A healthy stream emits a keep-alive (or data) at least every ~30s. Three
-// missed beats means the socket died and the browser is quietly retrying it
-// with a stale token — which never recovers on its own. Force a fresh reconnect.
+// A healthy stream emits a keep-alive (or data) at least every ~30s. One
+// missed beat plus grace means the socket died and the browser is quietly
+// retrying it with a stale token — which never recovers on its own. Force a
+// fresh reconnect. (This used to wait for three missed beats on a 30s check —
+// a dead socket could sit unnoticed for two minutes.)
 function startWatchdog() {
   if (watchdog) return;
   watchdog = setInterval(() => {
-    if (es && lastBeat && Date.now() - lastBeat > 95000) {
+    if (es && lastBeat && Date.now() - lastBeat > 50000) {
       hardReconnect();
       resyncNow();      // don't sit on stale notes while the stream rebuilds
     }
-  }, 30000);
+  }, 10000);
 }
 
 // Bring the live pull back the moment it's needed (network returned, tab
@@ -482,5 +487,11 @@ export function startSync({ onChange, onStateChange } = {}) {
   addEventListener("visibilitychange", () => {
     if (!document.hidden) wake();
   });
+  // Inside the Android shell the page can't rely on focus/visibility events:
+  // the activity can resume without the WebView firing either. The shell calls
+  // this from onResume, so coming back to the app always revives the stream
+  // and pulls anything that landed while Android had starved the socket.
+  const shell = (window.DictationMicShell = window.DictationMicShell || {});
+  shell.resync = wake;
   setInterval(flush, 60000);
 }
