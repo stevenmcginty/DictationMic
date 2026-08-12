@@ -418,6 +418,14 @@ class MainActivity : ComponentActivity() {
                 offerUpdate(rel)
             }
         }
+        // Coming back to the app must mean fresh notes. The page's own
+        // focus/visibility listeners don't reliably fire when this activity
+        // resumes, so nudge its sync loop directly: it revives the live
+        // stream and pulls anything that landed while Android had the
+        // WebView's socket starved.
+        web.evaluateJavascript(
+            "window.DictationMicShell&&window.DictationMicShell.resync&&window.DictationMicShell.resync()",
+            null)
         // The recorder runs in a service and keeps going with this activity
         // gone, so the page is only ever a mirror of it. Poll while we're on
         // screen: a flow collector would need the page to be alive to receive
