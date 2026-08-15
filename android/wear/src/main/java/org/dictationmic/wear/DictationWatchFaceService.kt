@@ -63,7 +63,16 @@ class DictationWatchFaceService : WatchFaceService() {
         private const val MUTED = 0xFF9AA096.toInt()
         private const val TRACK = 0x33FFFFFF          // dim ring under arcs
         private const val AMBER = 0xFFFFB74D.toInt()  // battery running out
+        private const val TEAL = 0xFF12D6DF.toInt()   // Knee Rebuild's accent
+
+        // The knee-rehab app, if it's installed. Its launcher sits at the
+        // bottom of the dial, under the mic.
+        private const val KNEE_PACKAGE = "com.kneerebuild"
+        private const val KNEE_ACTIVITY = "com.kneerebuild.wear.MainActivity"
     }
+
+    private fun kneeInstalled(): Boolean =
+        packageManager.getLaunchIntentForPackage(KNEE_PACKAGE) != null
 
     private fun styled(drawable: ComplicationDrawable): ComplicationDrawable =
         drawable.apply {
@@ -161,6 +170,27 @@ class DictationWatchFaceService : WatchFaceService() {
                                 MainActivity::class.java)
                                 .putExtra(MainActivity.EXTRA_DICTATE, true)
                                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        return
+                    }
+                    // the knee launcher, bottom of the dial
+                    if (kneeInstalled()) {
+                        val kx = b.exactCenterX()
+                        val ky = b.height() * 0.895f
+                        val kr = b.width() * 0.085f
+                        val kd = hypot(
+                            (tapEvent.xPos - kx).toDouble(),
+                            (tapEvent.yPos - ky).toDouble())
+                        if (kd <= kr) {
+                            try {
+                                startActivity(
+                                    Intent(Intent.ACTION_VIEW)
+                                        .setClassName(KNEE_PACKAGE, KNEE_ACTIVITY)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            } catch (_: Exception) {
+                                // app vanished between the draw and the tap;
+                                // next render drops the icon
+                            }
+                        }
                     }
                 }
             })
@@ -278,6 +308,23 @@ class DictationWatchFaceService : WatchFaceService() {
                 drawMic(canvas, cx, cy, r * 0.98f, MUTED)
             }
 
+            // ---- the knee app, bottom of the dial -----------------------
+            // Only drawn while Knee Rebuild is installed; tap opens today's
+            // session. Teal on purpose — it's that app's accent, so the icon
+            // reads as a doorway to it rather than a fourth face element.
+            if (kneeInstalled()) {
+                val kx = w / 2f
+                val ky = h * 0.895f
+                val kr = w * 0.068f
+                if (!ambient) {
+                    fillPaint.color = 0xFF14201F.toInt()  // quiet dark pad
+                    canvas.drawCircle(kx, ky, kr, fillPaint)
+                    drawKnee(canvas, kx, ky, kr * 0.95f, TEAL)
+                } else {
+                    drawKnee(canvas, kx, ky, kr * 0.95f, MUTED)
+                }
+            }
+
             // ---- steps & heart rate -------------------------------------
             for ((_, slot) in slots.complicationSlots) {
                 if (!slot.enabled) continue
@@ -307,6 +354,23 @@ class DictationWatchFaceService : WatchFaceService() {
                     slot.renderHighlightLayer(canvas, zonedDateTime, renderParameters)
                 }
             }
+        }
+
+        // A bent leg seen side-on — thigh, shin, foot, and the joint dot the
+        // knee app marks on every drawing. Same visual language as its own
+        // glyph, shrunk to a dial ornament.
+        private fun drawKnee(canvas: Canvas, cx: Float, cy: Float, r: Float, colour: Int) {
+            arcPaint.color = colour
+            arcPaint.strokeWidth = r * 0.24f
+            // thigh: upper-left down to the joint
+            canvas.drawLine(cx - r * 0.75f, cy - r * 0.55f, cx + r * 0.15f, cy, arcPaint)
+            // shin: joint down to the ankle
+            canvas.drawLine(cx + r * 0.15f, cy, cx - r * 0.05f, cy + r * 0.75f, arcPaint)
+            // foot
+            canvas.drawLine(cx - r * 0.05f, cy + r * 0.75f, cx + r * 0.55f, cy + r * 0.75f, arcPaint)
+            // the joint dot
+            fillPaint.color = colour
+            canvas.drawCircle(cx + r * 0.15f, cy, r * 0.2f, fillPaint)
         }
 
         // The same three shapes the app and the tile draw — capsule, cradle,
