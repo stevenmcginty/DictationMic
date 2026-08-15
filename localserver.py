@@ -163,6 +163,15 @@ class LocalServer:
                 kind, arg = r
                 if kind == "static":
                     return self._serve_static(arg)
+                if arg == ["rev"]:
+                    # "Has anything changed?" in a few bytes. The notes window
+                    # polls this instead of re-fetching every note and diffing
+                    # the JSON — that read the whole folder off disk and sent
+                    # megabytes every few seconds to answer "no". The scan runs
+                    # here too, so files changed in Explorer are still noticed
+                    # without anyone asking for the notes themselves.
+                    server_self._scan_maybe()
+                    return self._send(200, {"rev": store.rev})
                 if arg == ["notes"]:
                     server_self._scan_maybe()
                     return self._send(200, store.all_notes())

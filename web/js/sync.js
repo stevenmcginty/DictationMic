@@ -221,13 +221,23 @@ function startWatchdog() {
 // tab resets the reconnect backoff outright: a backoff that climbed to 60s
 // while the phone sat in a pocket must not make the user wait a minute for
 // notes they're now looking for.
+// Returns true when it opened a fresh stream — whose first message is the whole
+// snapshot, so the caller has no reason to fetch that same snapshot itself.
+//
+// The reconnect happens here rather than through scheduleReconnect: that path
+// always goes via a setTimeout, and with the backoff just reset to its floor
+// that is a full second of dead air before the socket is even opened — spent
+// on the one path where the user is watching and waiting.
 function ensureLive() {
   const fresh = es && streamLive
     && lastBeat && Date.now() - lastBeat <= 45000;
-  if (fresh) return;
+  if (fresh) return false;
   esBackoff = 1000;
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if (es) hardReconnect(); else connect();
+  if (es) { try { es.close(); } catch { /* already gone */ } es = null; }
+  streamLive = false;
+  connect();
+  return true;
 }
 
 // Whether the stream can be trusted to have delivered everything up to now.
@@ -249,7 +259,9 @@ export async function resyncNow() {
     const asOf = Date.now();               // sweep guard: snapshot is "now"
     const res = await fetch(notesUrl(null, token));
     if (!res.ok) return;
-    await reconcile((await res.json()) || {}, asOf);
+    const batch = await openBatch();
+    try { await reconcile((await res.json()) || {}, batch, asOf); }
+    finally { await closeBatch(batch); }
     lastSync = Date.now();
     onRemote();
   } catch { /* the stream reconnect heals it on its own clock */ }
@@ -269,34 +281,41 @@ async function handle(kind, ev) {
   let msg;
   try { msg = JSON.parse(ev.data); } catch { return; }
   const path = (msg?.path || "/").replace(/^\/+|\/+$/g, "");
-  if (path === "") {
-    // "put" at the root is the whole snapshot; "patch" names only the notes
-    // that changed, and each carries only its changed fields — so merge those.
-    if (kind === "patch") {
-      for (const [id, part] of Object.entries(msg.data || {})) await applyPatch(id, part);
+  const batch = await openBatch();
+  try {
+    if (path === "") {
+      // "put" at the root is the whole snapshot; "patch" names only the notes
+      // that changed, and each carries only its changed fields — so merge those.
+      if (kind === "patch") {
+        for (const [id, part] of Object.entries(msg.data || {})) {
+          await applyPatch(id, part, batch);
+        }
+      } else {
+        await reconcile(msg.data || {}, batch);
+      }
     } else {
-      await reconcile(msg.data || {});
+      const id = path.split("/")[0];
+      if (path.includes("/")) {
+        await refetch(id, batch);         // a single field moved: re-pull the whole note
+      } else if (kind === "patch") {
+        await applyPatch(id, msg.data, batch); // changed fields only — never the full note
+      } else {
+        await applyOne(id, msg.data, batch);   // "put": the complete record (or a delete)
+      }
     }
-  } else {
-    const id = path.split("/")[0];
-    if (path.includes("/")) {
-      await refetch(id);                  // a single field moved: re-pull the whole note
-    } else if (kind === "patch") {
-      await applyPatch(id, msg.data);      // changed fields only — never the full note
-    } else {
-      await applyOne(id, msg.data);        // "put": the complete record (or a delete)
-    }
+  } finally {
+    await closeBatch(batch);
   }
   lastSync = Date.now();
   setState("ok");
   onRemote();
 }
 
-async function refetch(id) {
+async function refetch(id, batch) {
   try {
     const token = await idToken();
     const res = await fetch(notesUrl(id, token));
-    if (res.ok) await applyOne(id, await res.json());
+    if (res.ok) await applyOne(id, await res.json(), batch);
   } catch { /* next snapshot heals it */ }
 }
 
@@ -357,20 +376,50 @@ async function mergeCalendarInto(id, local, src) {
   return updated;
 }
 
-async function applyOne(id, record) {
-  const bodyPending = await bodyPendingIds();
+// Everything an apply needs that is the same for every note in one stream
+// event: the outbox's queued-body ids, and the tombstone map. Both used to be
+// re-read inside applyOne, so a root "put" — the whole tree, one record per
+// deleted note as well as per live one — did three IndexedDB round-trips per
+// node. At a few thousand nodes that is seconds of blocked main thread on a
+// phone, and it ran on every reconnect. Now they are read once per event.
+//
+// The pending set can go stale mid-batch if a flush drains the outbox behind
+// us. That errs toward "still queued", which keeps the local intent and lets
+// the next snapshot adopt the remote — the safe direction.
+async function openBatch() {
+  return {
+    bodyPending: await bodyPendingIds(),
+    tombs: (await metaDb.get("tombstones")) || {},
+    tombsDirty: false,
+  };
+}
+
+// flush() writes tombstones too (on a delete it has just pushed), so the map
+// is re-read and merged rather than overwritten with our snapshot of it —
+// otherwise a delete confirmed mid-batch would lose its tombstone and the next
+// stale snapshot could resurrect the note.
+async function closeBatch(batch) {
+  if (!batch?.tombsDirty) return;
+  const cur = (await metaDb.get("tombstones")) || {};
+  for (const [id, rev] of Object.entries(batch.tombs)) {
+    if (!(cur[id] > rev)) cur[id] = rev;
+  }
+  await metaDb.set("tombstones", cur);
+}
+
+async function applyOne(id, record, batch) {
   let local = await notesDb.get(id);
   if (record && typeof record === "object") {
     local = await mergeStarInto(id, local, record);   // star merges regardless
     local = await mergeCalendarInto(id, local, record);
   }
-  if (bodyPending.has(id)) return;          // queued body intent wins until flushed
-  const tombs = (await metaDb.get("tombstones")) || {};
+  if (batch.bodyPending.has(id)) return;    // queued body intent wins until flushed
+  const tombs = batch.tombs;
   if (record === null || record.deleted) {
     const rev = Number(record?.updatedAt) || Date.now();
     if (tombs[id] && rev <= tombs[id]) return;
     tombs[id] = rev;
-    await metaDb.set("tombstones", tombs);
+    batch.tombsDirty = true;
     await notesDb.del(id);
     return;
   }
@@ -401,17 +450,16 @@ async function applyOne(id, record) {
 // onto the note we already hold, so renaming a note never drops its body and
 // editing a body never drops its title. A patch for a note we've never seen —
 // or a delete — can't be merged, so fetch/handle the whole record instead.
-async function applyPatch(id, part) {
+async function applyPatch(id, part, batch) {
   if (part == null) return;
-  const bodyPending = await bodyPendingIds();
   let local = await notesDb.get(id);
   if (!part.deleted) {
     local = await mergeStarInto(id, local, part);     // star first
     local = await mergeCalendarInto(id, local, part); // calendar rides the same way
   }
-  if (bodyPending.has(id)) return;          // queued body intent wins until flushed
-  if (part.deleted) { await applyOne(id, part); return; }
-  if (!local) { await refetch(id); return; }
+  if (batch.bodyPending.has(id)) return;    // queued body intent wins until flushed
+  if (part.deleted) { await applyOne(id, part, batch); return; }
+  if (!local) { await refetch(id, batch); return; }
   const rev = Number(part.updatedAt) || 0;
   if (rev <= (local.syncedRev || 0)) return;   // body echo (star handled above)
   const star = mergeStar(local, part);
@@ -428,18 +476,18 @@ async function applyPatch(id, part) {
   });
 }
 
-async function reconcile(snapshot, asOf = streamOpenedAt) {
+async function reconcile(snapshot, batch, asOf = streamOpenedAt) {
   // Only a queued *body* op protects a note from the "gone from the cloud"
   // sweep — a pending star must not (it can't meaningfully resurrect a deleted
   // note, and keeping it would diverge from cloudsync.py, which guards on the
   // body-`dirty` flag alone). Its stale star op is dropped by flush's guard
   // once the note is deleted here.
-  const pending = await bodyPendingIds();
+  const pending = batch.bodyPending;
   const seen = new Set();
   for (const [id, record] of Object.entries(snapshot)) {
     if (record && typeof record === "object") {
       seen.add(id);
-      await applyOne(id, record);
+      await applyOne(id, record, batch);
     }
   }
   // Synced notes missing from the snapshot were deleted and purged elsewhere —
@@ -475,11 +523,16 @@ export function startSync({ onChange, onStateChange } = {}) {
   // to have been listening, pull the snapshot directly rather than making the
   // user wait for the reconnect. This is what makes a laptop note be there
   // the moment the phone tab is looked at again, instead of after a refresh.
+  //
+  // Only when ensureLive did NOT open a stream, though. A fresh stream's first
+  // message is that same snapshot, so doing both downloaded the entire tree
+  // twice on every single resume — the single most expensive thing the app did
+  // on mobile data.
   const wake = () => {
     flush();
     const stale = streamStale();
-    ensureLive();
-    if (stale) resyncNow();
+    const reconnecting = ensureLive();
+    if (stale && !reconnecting) resyncNow();
   };
   addEventListener("online", wake);
   addEventListener("focus", wake);

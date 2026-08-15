@@ -7,12 +7,17 @@ export class LocalAdapter {
   constructor(token) {
     this.token = token;
     this._listeners = [];
-    this._lastJson = "";
+    this._rev = null;
   }
 
   async init() {
     await this.list();                       // fail fast if token/server bad
-    this._poll = setInterval(() => this._check(), 4000);
+    // A second, not four: /api/rev is a few bytes, so the poll can be quick
+    // without costing anything. It used to re-fetch every note on every tick
+    // and diff the serialised result, which put a note dictated on the phone
+    // up to four seconds behind the window that was meant to be watching for
+    // it — and churned the whole notes folder through JSON to do it.
+    this._poll = setInterval(() => this._check(), 1000);
     return { needsAuth: false };
   }
 
@@ -28,9 +33,18 @@ export class LocalAdapter {
   }
 
   async list() {
+    // Read the revision first. Taking it after the notes could miss a change
+    // that landed between the two calls; taking it before means at worst one
+    // redundant re-fetch on the next tick, which is the harmless direction.
+    const rev = await this._rev_now();
     const notes = await this._fetch("/api/notes");
-    this._lastJson = JSON.stringify(notes);
+    if (rev !== null) this._rev = rev;
     return notes;
+  }
+
+  async _rev_now() {
+    try { return (await this._fetch("/api/rev")).rev; }
+    catch { return null; }
   }
 
   get(id) { return this._fetch(`/api/notes/${id}`); }
@@ -68,14 +82,23 @@ export class LocalAdapter {
   onChange(cb) { this._listeners.push(cb); }
 
   async _check() {
-    // cheap change detection: notify the UI when the folder content moved
+    // Cheap change detection: ask for a counter, and only pay for the notes
+    // when it has moved. An older DictationMic.exe has no /api/rev, so a null
+    // means "can't tell" and we fall back to fetching and diffing as before —
+    // the window keeps working while the app catches up.
     try {
-      const notes = await this._fetch("/api/notes");
-      const json = JSON.stringify(notes);
-      if (json !== this._lastJson) {
-        this._lastJson = json;
-        this._listeners.forEach(cb => cb(notes));
+      const rev = await this._rev_now();
+      if (rev !== null) {
+        if (rev === this._rev) return;
+        this._rev = rev;
       }
+      const notes = await this._fetch("/api/notes");
+      if (rev === null) {                 // no counter: diff as we always did
+        const json = JSON.stringify(notes);
+        if (json === this._lastJson) return;
+        this._lastJson = json;
+      }
+      this._listeners.forEach(cb => cb(notes));
     } catch { /* server briefly away — next tick */ }
   }
 }

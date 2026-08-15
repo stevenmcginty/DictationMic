@@ -164,10 +164,25 @@ object CloudSync {
 
     val enabled: Boolean get() = state.value != "off"
 
-    // Push everything dirty, then pull the snapshot and reconcile (LWW,
-    // echo-guarded by syncedRev — mirrors cloudsync.py's rules).
-    // firstId jumps one note to the head of the push queue — the one just
-    // dictated, so it never waits behind an older backlog.
+    // Push everything dirty. firstId jumps one note to the head of the push
+    // queue — the one just dictated, so it never waits behind an older backlog.
+    //
+    // This deliberately does NOT pull. It used to end with pullAll(), which
+    // GETs /users/$uid/notes.json — the entire tree, every body, no filter —
+    // after every single dictation, on the watch and the phone both. That is
+    // megabytes over LTE while a wake lock is held, and the watch then parsed
+    // the lot into one JSONObject on a 300 MB heap.
+    //
+    // It bought nothing. Neither app reads notes back out of NoteStore: the
+    // phone's list is the web app's IndexedDB inside the WebView, and the
+    // watch has no list screen at all. applyRemote's only caller was the pull
+    // itself. The device that needs the notes — the laptop — has its own
+    // stream, and the phone's page has its own.
+    //
+    // If a mobile pull is ever wanted back, make it a delta: add
+    // ".indexOn": ["updatedAt"] to database.rules.json and query
+    // ?orderBy="updatedAt"&startAt=<newest syncedRev + 1>. Without that index
+    // RTDB filters client-side, which downloads the whole tree regardless.
     suspend fun syncNow(ctx: Context, firstId: String? = null) = withContext(Dispatchers.IO) {
         if (!enabled) return@withContext
         mutex.withLock {
@@ -176,7 +191,6 @@ object CloudSync {
                 val tok = token(ctx)
                 if (tok == null) { state.value = "needs-signin"; return@withLock }
                 pushDirty(ctx, tok, firstId)
-                pullAll(ctx, tok)
                 state.value = "ok"
             } catch (ex: Exception) {
                 // Swallowed for the user's sake — a failed sync retries and
@@ -253,6 +267,11 @@ object CloudSync {
         NoteStore.markSynced(ctx, n.id, rev, startedAt)
     }
 
+    // Kept, uncalled, for the day a mobile pull is wanted back — the merge
+    // rules below (echo guard, local-edit-wins, tombstones) are the fiddly
+    // part and are worth more than the fetch. See syncNow for why it is off
+    // and what has to change before it goes back on.
+    @Suppress("unused")
     private fun pullAll(ctx: Context, tok: String) {
         val (code, resp) = get(notesUrl(ctx, tok))
         if (code != 200) throw RuntimeException("pull: HTTP $code")

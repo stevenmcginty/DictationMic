@@ -62,6 +62,12 @@ class NoteStore:
         # sync engine pushes them; while False they are dropped immediately
         self.keep_deletes = False
         self._listeners = []
+        # Monotonic change counter, bumped by _notify. Cheap "has anything
+        # moved?" for pollers — see /api/rev in localserver.py. Per-process and
+        # deliberately not persisted: a restart resets it to 0, which reads as
+        # "changed" to any client holding an older number, and a client that
+        # re-fetches once after the app restarts is exactly right.
+        self.rev = 0
         # index: id -> {filename, title, hash, size, mtime, createdAt,
         #               syncedRev, dirty, deletedLocally}
         self.notes = {}
@@ -79,6 +85,12 @@ class NoteStore:
         self._listeners.append(cb)
 
     def _notify(self, kind, note_id):
+        # Bumped before the callbacks so a listener that reads it sees its own
+        # change already counted. This is what /api/rev serves: the "My notes"
+        # window used to detect change by re-fetching every note and diffing
+        # the JSON, which meant serialising the whole folder every few seconds
+        # just to learn that nothing had happened.
+        self.rev += 1
         for cb in list(self._listeners):
             try:
                 cb(kind, note_id)

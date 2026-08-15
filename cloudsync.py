@@ -82,6 +82,12 @@ def send_password_reset(email):
 
 
 class CloudSync:
+    # How many stale tombstones one purge run is allowed to delete, and how
+    # long before another run may start. Small and spaced on purpose — see
+    # _purge_tombstones.
+    PURGE_PER_RUN = 25
+    PURGE_EVERY_S = 600.0
+
     def __init__(self, store, settings, save_settings, events, dbg=lambda m: None,
                  voice_stt=None):
         self.store = store
@@ -105,7 +111,28 @@ class CloudSync:
         self._resp = None               # the live stream, for _kick_stream
         self._state = "off"             # off | ok | offline | needs-signin | error
         self._last_sync = 0
-        self._purged = False
+        self._last_purge = 0.0          # monotonic; see _purge_tombstones
+        self._http = None               # see _session()
+        self._http_lock = threading.Lock()
+
+    def _session(self):
+        """The pooled connection every short-lived call goes through.
+
+        Each call used to be a bare requests.get/patch, which opens a fresh TCP
+        connection and does a full TLS handshake every time: measured against
+        Firebase at 360 ms per call, versus 64 ms on a reused connection. Notes
+        are pushed one at a time, so that ~300 ms was paid per note and a
+        backlog of ten cost three and a half seconds of pure handshaking.
+
+        The SSE stream deliberately stays outside this. It holds one connection
+        open for its whole life, so it gains nothing from the pool and would
+        only occupy a slot in it.
+        """
+        import requests
+        with self._http_lock:
+            if self._http is None:
+                self._http = requests.Session()
+            return self._http
 
     # ------------------------------------------------------------------
     # auth
@@ -165,7 +192,7 @@ class CloudSync:
             return None
         import requests
         try:
-            r = requests.post(REFRESH_URL, data={
+            r = self._session().post(REFRESH_URL, data={
                 "grant_type": "refresh_token", "refresh_token": rt}, timeout=15)
         except Exception:
             raise ConnectionError("offline")
@@ -407,7 +434,7 @@ class CloudSync:
                            "deleted": False, "origin": "laptop",
                            "updatedAt": {".sv": "timestamp"}}
             try:
-                r = requests.patch(self._notes_url(nid, token),
+                r = self._session().patch(self._notes_url(nid, token),
                                    json=payload, timeout=20)
             except Exception:
                 self._set_state("offline")
@@ -445,7 +472,7 @@ class CloudSync:
             payload = {"starred": bool(e.get("starred")),
                        "starredAt": pushed_at, "origin": "laptop"}
             try:
-                r = requests.patch(self._notes_url(nid, token),
+                r = self._session().patch(self._notes_url(nid, token),
                                    json=payload, timeout=20)
             except Exception:
                 self._set_state("offline")
@@ -475,7 +502,7 @@ class CloudSync:
                 continue
             payload = {"calendar": cal, "origin": "laptop"}
             try:
-                r = requests.patch(self._notes_url(nid, token),
+                r = self._session().patch(self._notes_url(nid, token),
                                    json=payload, timeout=20)
             except Exception:
                 self._set_state("offline")
@@ -523,7 +550,7 @@ class CloudSync:
         import requests
         try:
             token = self._token()
-            r = requests.get(self._notes_url(nid, token), timeout=15)
+            r = self._session().get(self._notes_url(nid, token), timeout=15)
             return r.json() if r.status_code == 200 else None
         except Exception:
             return None
@@ -630,8 +657,12 @@ class CloudSync:
                     and int(e.get("syncedAt") or 0) <= as_of):
                 self.store.apply_remote(nid, {"deleted": True,
                                               "updatedAt": _now_ms()})
-        if not self._purged:
-            self._purged = True
+        # Every snapshot is a chance to clear a few more, rather than the one
+        # chance per launch this used to get: a batch is capped now, so a
+        # backlog that would once have been a single multi-minute stall at
+        # startup drains a little at a time instead.
+        if time.monotonic() - self._last_purge >= self.PURGE_EVERY_S:
+            self._last_purge = time.monotonic()
             self._purge_tombstones(snapshot or {})
 
     # ------------------------------------------------------------------
@@ -681,7 +712,7 @@ class CloudSync:
                        "updatedAt": {".sv": "timestamp"}}
             try:
                 token = self._token()
-                r = requests.patch(self._notes_url(nid, token),
+                r = self._session().patch(self._notes_url(nid, token),
                                    json=payload, timeout=30)
                 ok = r.status_code == 200
             except Exception as ex:
@@ -697,13 +728,32 @@ class CloudSync:
                      f"({len(text or '')} chars)")
 
     def _purge_tombstones(self, snapshot):
-        import requests
+        """Delete tombstones old enough that no offline device still needs them.
+
+        Runs on its own thread, and only a handful at a time. Both matter: this
+        used to run inline on the worker, one blocking DELETE per tombstone, on
+        the first snapshot after every launch — and the worker is the same
+        thread that pushes dictated notes to the cloud. With a few thousand
+        tombstones accumulated that is minutes during which nothing dictated
+        reaches the cloud, right at startup, which is exactly when there is a
+        backlog to send. The rest are picked up on the next launch; nothing is
+        lost by taking them slowly.
+        """
         cutoff = _now_ms() - TOMBSTONE_KEEP_MS
-        try:
-            token = self._token()
-            for nid, record in snapshot.items():
-                if (isinstance(record, dict) and record.get("deleted")
-                        and int(record.get("updatedAt") or 0) < cutoff):
-                    requests.delete(self._notes_url(nid, token), timeout=15)
-        except Exception as ex:
-            self.dbg(f"cloudsync purge: {ex}")
+        stale = [nid for nid, record in (snapshot or {}).items()
+                 if isinstance(record, dict) and record.get("deleted")
+                 and int(record.get("updatedAt") or 0) < cutoff]
+        if not stale:
+            return
+
+        def run():
+            try:
+                token = self._token()
+                for nid in stale[:self.PURGE_PER_RUN]:
+                    if self._stop.is_set():
+                        return
+                    self._session().delete(self._notes_url(nid, token), timeout=15)
+            except Exception as ex:
+                self.dbg(f"cloudsync purge: {ex}")
+
+        threading.Thread(target=run, name="cloudsync-purge", daemon=True).start()
