@@ -1,7 +1,7 @@
 // Service worker — hosted origin only (main.js never registers it on
 // localhost). App shell is precached; data traffic is always network-only.
 
-const CACHE = "dictmic-v34";
+const CACHE = "dictmic-v35";
 const SHARED = "dictmic-shared";   // Android share-sheet drops wait here for main.js
 const SHELL = [
   "./", "index.html", "styles.css", "config.js", "manifest.webmanifest",
@@ -28,6 +28,16 @@ self.addEventListener("activate", e => {
     .then(keys => Promise.all(
       keys.filter(k => k !== CACHE && k !== SHARED).map(k => caches.delete(k))))
     .then(() => self.clients.claim()));
+});
+
+// The page asks who is actually in charge. main.js puts a version on the
+// "update ready" bar so a reload is something you can see the result of, and
+// this file is the only place that knows the number. One question, one answer
+// back down the port it arrived on — neither side remembers anything. A worker
+// old enough to predate this simply never answers, which is why main.js caps
+// how long it waits rather than assuming a reply is coming.
+self.addEventListener("message", e => {
+  if (e.data === "version" && e.ports && e.ports[0]) e.ports[0].postMessage(CACHE);
 });
 
 // shell files answer from cache instantly, then refresh the cached copy in

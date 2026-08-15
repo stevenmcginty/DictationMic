@@ -66,6 +66,80 @@ async function drainSharedFiles(app) {
   } catch { /* never block boot on a share drop */ }
 }
 
+// How often the page is allowed to ask the network whether sw.js has changed.
+// registration.update() is a real request for the file, and the triggers below
+// fire every time the app comes back to the front — someone flicking between
+// their notes and a chat would otherwise fetch it dozens of times a minute.
+// Fifteen minutes is short enough that a deploy reaches a phone that gets
+// picked up a few times an hour, and long enough that the traffic is a rounding
+// error next to the sync stream that's already running.
+const UPDATE_CHECK_MS = 15 * 60 * 1000;
+
+let swReg = null;
+let lastUpdateCheck = 0;
+
+// The browser only looks for a new sw.js when register() is called or on a
+// navigation. An installed PWA or the Android shell gets *resumed* rather than
+// relaunched, so neither ever happens — the app can sit on a months-old version
+// having never once asked. This is the ask.
+function checkForUpdate() {
+  if (!swReg || Date.now() - lastUpdateCheck < UPDATE_CHECK_MS) return;
+  lastUpdateCheck = Date.now();
+  swReg.update().catch(() => {});      // offline, or the host is having a moment
+}
+
+// Ask the worker that just took over what it is; it answers with its cache name
+// ("dictmic-v34") and the bar shows the tail of it. The wait is capped because
+// the worker being replaced shipped before this handshake existed and will
+// never reply — a bar with no version on it is far better than no bar.
+function workerVersion() {
+  return new Promise(resolve => {
+    const sw = navigator.serviceWorker.controller;
+    if (!sw) { resolve(""); return; }
+    const chan = new MessageChannel();
+    chan.port1.onmessage = e =>
+      resolve(String(e.data || "").replace(/^dictmic-/, ""));
+    setTimeout(() => resolve(""), 1200);
+    try { sw.postMessage("version", [chan.port2]); } catch { resolve(""); }
+  });
+}
+
+// Shown only on the path where reloading by ourselves would be rude. "Later"
+// hides it and nothing more: the new worker is already in charge, so the note
+// they're protecting is the only thing keeping this page on the old code, and
+// the moment they close it the idle rule below reloads anyway.
+async function showUpdateBar(reload) {
+  const bar = $("updateBar");
+  if (!bar || !bar.hidden) return;
+  $("updateVer").textContent = await workerVersion();
+  bar.hidden = false;
+  document.body.classList.add("update-ready");
+  $("updateNowBtn").onclick = reload;
+  $("updateLaterBtn").onclick = () => {
+    bar.hidden = true;
+    document.body.classList.remove("update-ready");
+  };
+}
+
+// Inside the Android shell the page can be resumed without the WebView firing
+// focus or visibilitychange — the same blind spot sync.js has, and the shell
+// already solves it by calling DictationMicShell.resync() from onResume. That
+// hook belongs to sync.js and is installed later in boot than this is, so
+// rather than racing for the property we sit in front of it: whatever sync.js
+// assigns is kept and still called, and the resume reaches the update check on
+// its way past. Giving the shell a second hook of its own would mean a new APK,
+// and the whole point of the shell is that a hosting deploy updates it without
+// one.
+function watchShellResume() {
+  const shell = (window.DictationMicShell = window.DictationMicShell || {});
+  let inner = shell.resync;
+  Object.defineProperty(shell, "resync", {
+    configurable: true,
+    get: () => (...args) => { checkForUpdate(); if (inner) inner(...args); },
+    set: fn => { inner = fn; },
+  });
+}
+
 // The service worker claims this page the moment it activates (skipWaiting +
 // clients.claim), which fires "controllerchange". Reloading on that blindly
 // throws away whatever the user was doing — an open editor, a half-typed note —
@@ -79,28 +153,50 @@ async function drainSharedFiles(app) {
 //     storage, first launch after the SW was unregistered) changes nothing
 //     about the files this page is already running. Never reload for it.
 //   - a genuine update only reloads while the user is on the list with nothing
-//     open. Otherwise it waits — the new worker is already in charge, so the
-//     next launch runs the new code regardless.
+//     open. Otherwise it stands up the bar and lets them choose — the new
+//     worker is already in charge, so the next launch runs the new code
+//     regardless, but they shouldn't have to wait that long to find out.
+//
+// The first guard used to be a `return` that skipped the whole function, which
+// also skipped every check below it. It only ever needed to skip that one
+// claim, so it now does exactly that: a deploy that lands during a long
+// first session is a real update like any other.
 function wireServiceWorker() {
-  const hadController = !!navigator.serviceWorker.controller;
-  navigator.serviceWorker.register("sw.js").catch(() => {});
-  if (!hadController) return;
+  let firstClaim = !navigator.serviceWorker.controller;
+  navigator.serviceWorker.register("sw.js").then(reg => {
+    swReg = reg;
+    lastUpdateCheck = Date.now();       // register() has just asked for us
+  }).catch(() => {});
 
   let pending = false;
   const idle = () => {
     const h = location.hash;
     return h === "" || h === "#/";
   };
+  const reload = () => location.reload();
   const apply = () => {
     if (!pending || !idle()) return;
     pending = false;
-    location.reload();
+    reload();
   };
   navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (firstClaim) { firstClaim = false; return; }
     pending = true;
     apply();
+    if (pending) showUpdateBar(reload);  // still here: they're mid-something
   });
   addEventListener("hashchange", apply);
+
+  // Every way this app comes back to life. The interval alone can't be trusted
+  // — a backgrounded tab has its timers throttled to a crawl, and that is
+  // precisely the tab that has been stale the longest.
+  addEventListener("focus", checkForUpdate);
+  addEventListener("visibilitychange", () => {
+    if (!document.hidden) checkForUpdate();
+  });
+  addEventListener("pageshow", e => { if (e.persisted) checkForUpdate(); });
+  setInterval(checkForUpdate, UPDATE_CHECK_MS);
+  watchShellResume();
 }
 
 // The Android shell (MainActivity) loads this very page and injects a bridge.

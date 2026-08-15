@@ -195,6 +195,16 @@ if (location.protocol === "file:") {
   </div>
 </div>
 
+<!-- a newer version is cached and in charge; this page is still running the
+     old one. Only shown when reloading unasked would interrupt something —
+     see wireServiceWorker in js/main.js -->
+<div class="update-bar" id="updateBar" role="status" hidden>
+  <span class="update-dot" aria-hidden="true"></span>
+  <span class="update-text">Update ready<b class="update-ver mono" id="updateVer"></b></span>
+  <button class="capsule small solid" id="updateNowBtn">Reload</button>
+  <button class="capsule small ghost" id="updateLaterBtn">Later</button>
+</div>
+
 <div class="toast mono" id="toast" role="status"></div>
 
 <script type="module" src="js/main.js"></script>
