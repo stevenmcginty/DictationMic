@@ -171,7 +171,20 @@ class MainActivity : ComponentActivity() {
                 if (url.startsWith(TRUSTED_ORIGIN)) return false
                 // Anything else — a download link, a help page — belongs in the
                 // browser, not trapped in a shell with no address bar.
+                //
+                // The failure has to be said out loud. This used to swallow it,
+                // and that is precisely how Open on a PDF came to do nothing
+                // whatsoever: the page's blob: URL arrived here, no app on
+                // Earth handles blob:, and the exception went in the bin while
+                // we told the WebView we'd dealt with it. Files now go over the
+                // bridge instead (NativeBridge.openFile), but the next thing to
+                // land here unexpectedly should be visible, not silent.
                 runCatching { startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+                    .onFailure {
+                        Toast.makeText(this@MainActivity,
+                            "Nothing on this phone can open that link",
+                            Toast.LENGTH_LONG).show()
+                    }
                 return true
             }
 
@@ -251,6 +264,30 @@ class MainActivity : ComponentActivity() {
                 // the same button works the next time it's pressed.
                 if (handOff) callback.onReceiveValue(null)
                 return true
+            }
+        }
+
+        // A download the page starts on its own. There is no browser under this
+        // WebView to catch one, so without a listener it lands nowhere and
+        // looks like another dead button — which is half of how the file
+        // buttons went quiet in the first place.
+        //
+        // The page's own files don't come this way any more; they cross the
+        // bridge. What's left is an ordinary http(s) link, which the browser
+        // can have, and a blob: or data: URL, which exists only inside the page
+        // and cannot be handed to anything — for that, say so.
+        w.setDownloadListener { url, _, _, _, _ ->
+            if (url.startsWith("blob:") || url.startsWith("data:")) {
+                Toast.makeText(this,
+                    "That file lives inside the app — use Open or Share to send it out",
+                    Toast.LENGTH_LONG).show()
+                return@setDownloadListener
+            }
+            runCatching {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }.onFailure {
+                Toast.makeText(this, "Couldn't download that", Toast.LENGTH_LONG).show()
             }
         }
     }

@@ -29,6 +29,95 @@ const TICK_SVG = `<svg viewBox="0 0 24 24" width="12" height="12" aria-hidden="t
 // a name — _commitBody replaces it with the opening words as you write.
 const NEW_NOTE_TITLE = "New note";
 
+// ---------------- handing a file to the device ----------------
+//
+// Open, Download and Share all end in the same place: this page giving a real
+// file to something outside itself. What "outside" means is different on every
+// surface the same code runs on, and getting it wrong is silent every single
+// time — which is how Open on a PDF spent a release doing nothing whatsoever
+// inside the Android app.
+//
+// In the APK there is no browser around the page. A blob: URL exists only
+// inside the document that made it; window.open of one becomes a navigation,
+// the shell hands the navigation to Android, and nothing on Android has ever
+// known what blob: means — so the tap died there with no viewer, no error and
+// nothing said. The bytes have to cross the bridge and be opened by Android
+// itself, which is what DictationMicNative.openFile is for.
+//
+// Installed on a phone's home screen — the iOS PWA — there is no tab for a new
+// window to appear in and no downloads shelf to notice a file landing in, and
+// <a download> is unreliable there besides. But the system share sheet is right
+// there and it takes files, so that is the way out.
+//
+// In an ordinary tab a new tab and a download are exactly what's wanted, and
+// have always worked.
+//
+// Three tiers, then, each of them feature-detected. Never the user agent: the
+// shell calls itself Chrome on purpose (MainActivity's userAgentString says
+// why), and an APK installed before the page it loads has the bridge object
+// without the newer methods on it — so what gets checked is the method itself,
+// the same guard shellshare.js puts on the inbound direction.
+
+const N = () => window.DictationMicNative;
+
+const shellCanOpen = () =>
+  !!N() && typeof N().openFile === "function"
+        && typeof N().openFileChunk === "function";
+
+// The page is an app on a home screen rather than a tab. Asking the display
+// mode is a question about the window we're in, not about who is rendering it,
+// so it stays true when Safari changes its user agent again; navigator's own
+// flag is iOS's older answer to the same question and some versions only have
+// that one.
+const installedApp = () =>
+  ["standalone", "fullscreen", "minimal-ui"]
+    .some(m => matchMedia(`(display-mode: ${m})`).matches) ||
+  navigator.standalone === true;
+
+// Base64 characters per bridge call, on a multiple of four so every slice
+// decodes on its own and the shell can append as they arrive instead of
+// rebuilding one nine-megabyte string. 288 KB of bytes a call — the size the
+// inbound direction has been using all along (SharedInbox.CHUNK_BYTES), which
+// for the 7 MB a file note is capped at means around twenty-five calls.
+const OUT_CHUNK = 384 * 1024;
+
+const fileToBase64 = file => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => {
+    const url = String(r.result);
+    resolve(url.slice(url.indexOf(",") + 1));
+  };
+  r.onerror = () => reject(new Error("unreadable"));
+  r.readAsDataURL(file);
+});
+
+// False means the shell couldn't take the file at all and the page should say
+// so. Anything past that point — no app on the phone opens a .xlsx, a viewer
+// that refuses it — is the shell's to explain, because only it knows what
+// happened; those come back true and Android puts up the toast.
+async function sendToShell(file, share) {
+  try {
+    const b64 = await fileToBase64(file);
+    for (let i = 0, at = 0; at < b64.length; i++, at += OUT_CHUNK) {
+      N().openFileChunk(i, b64.slice(at, at + OUT_CHUNK));
+    }
+    return N().openFile(file.name || "file",
+                        file.type || "application/octet-stream", !!share) === true;
+  } catch {
+    return false;
+  }
+}
+
+// Kept synchronous, and called without an await in front of it, because iOS
+// only opens the share sheet while the tap that asked for it is still live —
+// reaching this through a resolved promise is how a share silently becomes a
+// no-op.
+const shareFile = (file, title) => {
+  if (!navigator.canShare?.({ files: [file] })) return false;
+  navigator.share({ files: [file], title }).catch(() => { /* sheet closed */ });
+  return true;
+};
+
 export class App {
   constructor(adapter, opts = {}) {
     this.adapter = adapter;
@@ -980,44 +1069,70 @@ export class App {
       setTimeout(() => URL.revokeObjectURL(url), 60000);
     };
 
-    $("shareBtn").addEventListener("click", async () => {
+    // The one road out of the page, walked by all three buttons — the tiers and
+    // the reason there are three of them are described above the class. `local`
+    // is what to do when the page is in a browser tab with a browser around it,
+    // which is whatever these buttons have always done there.
+    //
+    // `sheet` says the share sheet is the point of the press rather than a
+    // stand-in for a viewer: Share obviously, but Download too, because on a
+    // phone there is no Downloads folder the page can put something in and
+    // "send it to Files, or Drive, or Steve's other phone" is what the button
+    // is actually being asked for. `inTab` takes that as far as a desktop tab,
+    // and only Share wants it — a desktop Download raising the Windows share
+    // dialog instead of dropping the file in Downloads would be a horrible
+    // surprise.
+    const handOff = (file, title, local, { sheet = false, inTab = false } = {}) => {
+      if (shellCanOpen()) {
+        sendToShell(file, sheet).then(ok => {
+          if (!ok) this.toast(`Couldn't hand ${file.name} to the phone`);
+        });
+        return;
+      }
+      if ((inTab || installedApp()) && shareFile(file, title)) return;
+      local();
+    };
+
+    $("shareBtn").addEventListener("click", () => {
       const n = this.notes.find(x => x.id === this.activeId);
       if (!n) return;
       let file;
       if (isImageBody(n.body)) file = imageBodyToFile(n.body, n.title);
       else if (isFileBody(n.body)) file = fileBodyToFile(n.body);
       else return;
-      if (navigator.canShare?.({ files: [file] })) {
-        try { await navigator.share({ files: [file], title: n.title }); }
-        catch { /* user closed the share sheet */ }
-      } else {
-        triggerDownload(file);       // desktop: download instead
-      }
+      handOff(file, n.title, () => triggerDownload(file),
+              { sheet: true, inTab: true });
     });
 
     // every non-text asset — image, PDF, spreadsheet, zipped folder, any
     // other document — gets the same Open/Download pair. Open hands the
-    // asset to the device, never a viewer in here: images, PDFs and
-    // spreadsheets go to a new tab (browsers render those — CSV/TSV as
-    // plain text, since there's no built-in table viewer); everything
-    // else — Word docs and friends — downloads under its real name so the
-    // default app opens it.
+    // asset to the device, never a viewer in here: on a phone that means the
+    // app Steve already opens that kind of file with, and in a desktop tab
+    // images, PDFs and spreadsheets go to a new tab (browsers render those —
+    // CSV/TSV as plain text, since there's no built-in table viewer) while
+    // everything else — Word docs and friends — downloads under its real name
+    // so the default app opens it.
     $("fileOpenBtn").addEventListener("click", () => {
       const n = this.notes.find(x => x.id === this.activeId);
       if (!n) return;
-      if (isImageBody(n.body)) return openInTab(imageBodyToFile(n.body, n.title));
+      if (isImageBody(n.body)) {
+        const img = imageBodyToFile(n.body, n.title);
+        return handOff(img, n.title, () => openInTab(img));
+      }
       if (!isFileBody(n.body)) return;
       const f = fileMeta(n.body);
       const file = fileBodyToFile(n.body);
       const sheet = SHEET_EXT_RE.test(f.name) || f.mime === "text/csv";
-      if (f.mime === "application/pdf" || f.mime.startsWith("image/")) {
-        return openInTab(file);
-      }
-      if (sheet) {
-        return openInTab(new Blob([file], { type: "text/plain;charset=utf-8" }));
-      }
-      triggerDownload(file);
-      this.toast(`${file.name} is in your Downloads — it opens in your usual app`);
+      handOff(file, n.title, () => {
+        if (f.mime === "application/pdf" || f.mime.startsWith("image/")) {
+          return openInTab(file);
+        }
+        if (sheet) {
+          return openInTab(new Blob([file], { type: "text/plain;charset=utf-8" }));
+        }
+        triggerDownload(file);
+        this.toast(`${file.name} is in your Downloads — it opens in your usual app`);
+      });
     });
 
     $("fileDownloadBtn").addEventListener("click", () => {
@@ -1027,8 +1142,10 @@ export class App {
       if (isImageBody(n.body)) file = imageBodyToFile(n.body, n.title);
       else if (isFileBody(n.body)) file = fileBodyToFile(n.body);
       else return;
-      triggerDownload(file);
-      this.toast(`${file.name} is in your Downloads`);
+      handOff(file, n.title, () => {
+        triggerDownload(file);
+        this.toast(`${file.name} is in your Downloads`);
+      }, { sheet: true });
     });
 
     $("deleteBtn").addEventListener("click", () => {

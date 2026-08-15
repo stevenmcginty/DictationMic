@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- What the FileProvider may serve: only the updates folder in cache, where
-     Updater.download puts a fresh APK for the system installer to read. -->
+<!-- What the FileProvider may serve, and nothing else in the app's storage:
+     the updates folder, where Updater.download puts a fresh APK for the system
+     installer to read, and the open folder, where NativeBridge.openFile writes
+     the note Steve has just asked another app to open or share. A folder that
+     isn't listed here is a crash when the provider is asked for it, not a
+     refusal. -->
 <paths>
     <cache-path name="updates" path="updates/" />
+    <cache-path name="open" path="open/" />
 </paths>

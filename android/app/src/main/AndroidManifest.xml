@@ -11,11 +11,18 @@
     <!-- In-app updates: hand a downloaded APK to the system installer. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
-    <!-- Text-to-speech: the spoken status the hands-free flow depends on.
-         Android 11+ hides other packages unless they're declared. -->
+    <!-- Android 11+ hides other packages from us unless they're declared here,
+         and an app we can't see is an app we can't hand anything to.
+         Text-to-speech is the spoken status the hands-free flow depends on;
+         VIEW of any type is every PDF reader, photo viewer and spreadsheet app
+         on the phone, which is what Open on a file note goes looking for. -->
     <queries>
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="*/*" />
         </intent>
     </queries>
 
