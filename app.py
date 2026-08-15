@@ -42,6 +42,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import shots
 import voicecmd
 import brain
+import updater
 from remotecmd import RemoteCommands
 
 # OS drag-and-drop onto the pill (tkdnd). Optional: if the package or its
@@ -73,6 +74,11 @@ def app_dir():
 APP_DIR = app_dir()
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 NOTES_DIR = os.path.join(APP_DIR, "notes")
+
+# What this build calls itself. updater.py asks GitHub whether a higher one has
+# been published, so this has to be bumped by hand every time a new zip goes
+# out — otherwise the app keeps believing it is current and never says a word.
+APP_VERSION = "1.0"
 
 _DEBUG = bool(os.environ.get("DICTMIC_DEBUG"))
 
@@ -142,6 +148,13 @@ DEFAULT_SETTINGS = {
     "brain_model": "",         # override; empty = brain.py's default list
     "notes_badge": True,       # recent-notes disc on the pill's bottom corner
     "remote_commands": False,  # phone web app can drive this PC (remotecmd.py)
+    # A newer build on GitHub (updater.py). The finding outlives the process so
+    # a restart re-offers it at once; the last check only paces the network
+    # call. "skipped" is the one Steve waved away — it never pops up again.
+    "update_last_check": 0,
+    "update_pending_version": "",
+    "update_pending_url": "",
+    "update_skipped_version": "",
 }
 
 def load_settings():
@@ -2708,6 +2721,9 @@ class DictationApp:
         self.local_server = None
         self.cloud = None
         self._menu = None
+        self._update_ready = None      # newer build on GitHub, once one is found
+        self._update_offered = ""      # already shown the card this run
+        self._update_job = None        # waiting for a dictation to finish
         # the reverse of shots_to_notes: an image note arriving from the
         # phone is pinned to the shelf like a local screenshot
         get_store().subscribe(self._on_remote_note)
@@ -2733,6 +2749,11 @@ class DictationApp:
                                          self.events, self.voicecmds,
                                          self.brain, dbg=dbg)
         self.remotecmds.start()
+        # nothing else on Windows will ever tell Steve a newer build exists, so
+        # the pill asks GitHub itself. Its own daemon thread because it is a
+        # network call, and nothing the pill does may wait on one of those.
+        threading.Thread(target=self._update_loop,
+                         name="update-check", daemon=True).start()
 
         self.root.update_idletasks()
         make_non_activating(self.root)
@@ -3114,6 +3135,21 @@ class DictationApp:
              "text": "Tap = start / stop · hold + speak = push-to-talk"},
             {"kind": "item", "text": "Change the talk key…",
              "command": self.start_capture},
+        ]
+        # Only here once there's actually something to get. This row is how a
+        # dismissed update stays reachable: waving the card away silences the
+        # card, not the offer.
+        if self._update_ready:
+            items += [
+                {"kind": "sep"},
+                {"kind": "header", "text": "Update"},
+                {"kind": "item",
+                 "text": f"DictationMic {self._update_ready['version']} is out",
+                 "hint": f"you're on {APP_VERSION}",
+                 "bullet": MENU_GREEN,
+                 "command": self.update_dialog},
+            ]
+        items += [
             {"kind": "sep"},
             {"kind": "item", "text": "Exit DictationMic", "danger": True,
              "command": self.quit},
@@ -3364,6 +3400,10 @@ class DictationApp:
                                 detail=payload.get("detail"))
             else:
                 self.show_toast(payload, 3500)
+        elif name == "update":
+            self._update_ready = payload      # the menu row reads this
+            if self._update_job is None:      # not already waiting on a pause
+                self._offer_update()
         elif name == "sync_status":
             if payload.get("sync") == "needs-signin":
                 self.show_toast("Phone sync needs a fresh sign-in — "
@@ -4422,6 +4462,127 @@ class DictationApp:
         win.bind("<Escape>", lambda e: win.destroy())
         win.lift()
         win.focus_force()
+
+    # ---------------- updates (updater.py) ----------------
+
+    UPDATE_POLL_S = 6 * 3600           # ask GitHub about a new build 4x a day
+
+    def _update_loop(self):
+        """Ask GitHub whether a newer Windows build has gone out.
+
+        The first pass is almost immediate, and it is the important one: it
+        answers out of the cache the last run left behind, so a release found
+        yesterday is back in front of Steve seconds after the pill appears
+        rather than after the first poll. After that it just ticks over slowly
+        — this app gets left running for days, so "check at startup" on its own
+        would find a release once and then never look again.
+        """
+        time.sleep(6)                  # let the pill get on screen first
+        while True:
+            try:
+                found = updater.pending_update(self.settings, save_settings,
+                                               APP_VERSION)
+                if found is not None:
+                    self.events.put(("update", found))
+            except Exception as ex:
+                dbg(f"update check: {ex!r}")
+            time.sleep(self.UPDATE_POLL_S)
+
+    def _offer_update(self):
+        """Put the update card up — but not over a live dictation, and not for
+        a version already waved away or already shown this run. Mid-dictation
+        it simply waits and asks again in a minute; the menu row is sitting
+        there the whole time either way."""
+        self._update_job = None
+        found = self._update_ready
+        if found is None:
+            return
+        if found["version"] in (self.settings.get("update_skipped_version"),
+                                self._update_offered):
+            return
+        if self.state != IDLE:
+            self._update_job = self.root.after(60000, self._offer_update)
+            return
+        self._update_offered = found["version"]
+        self.update_dialog(found)
+
+    def update_dialog(self, found=None):
+        """A newer Windows build exists — this is the card that says so and the
+        button that goes and gets it.
+
+        The button opens the release page rather than installing anything. The
+        desktop app isn't an installer, it's a zip you extract, so there is
+        nothing here to hand an install off to the way the phone hands an APK
+        to Android; and a running .exe can't be overwritten in place on
+        Windows, so anything cleverer would mean leaving a helper process
+        behind to do it after we've quit. The browser gives him a progress bar
+        and the install steps in the release notes, which is the whole job.
+
+        Closing the card counts as "not this one" and is remembered, so that
+        version never appears unasked again. It stays in the right-click menu,
+        which is there when he wants it and silent when he doesn't. Taking the
+        button is not a dismissal — if he never gets round to extracting the
+        zip, being reminded next launch is right.
+        """
+        found = found or self._update_ready
+        if found is None:
+            return
+        win = tk.Toplevel(self.root, bg="#131512")
+        win.title("DictationMic — update")
+        win.resizable(False, False)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"420x250+{(sw - 420) // 2}+{max(0, (sh - 250) // 3)}")
+        try:
+            win.iconbitmap(os.path.join(APP_DIR, "icon.ico"))
+        except Exception:
+            pass
+        make_titlebar_dark(win)
+
+        FG, SUB, LIME = "#eceee7", "#8a919c", "#b6ee3f"
+        tk.Label(win, text=f"DictationMic {found['version']} is out",
+                 bg="#131512", fg=FG, font=("Segoe UI Semibold", 12)
+                 ).pack(pady=(18, 2))
+        tk.Label(win, text=f"You're on {APP_VERSION}. The download is a zip:\n"
+                           "exit DictationMic, extract it over your\n"
+                           "DictationMic folder, and start it again.\n"
+                           "Your notes and settings stay where they are.",
+                 bg="#131512", fg=SUB, font=("Segoe UI", 9),
+                 justify="center").pack(pady=(0, 4))
+
+        def dismiss(_e=None):
+            self.settings["update_skipped_version"] = found["version"]
+            save_settings(self.settings)
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        def get_it():
+            webbrowser.open(found["url"] or updater.RELEASES_PAGE)
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            self.show_toast("Opening the download page",
+                            3000, detail="the zip is about 110 MB")
+
+        tk.Button(win, text="Get the update", command=get_it,
+                  bg=LIME, fg="#0b0c0a", activebackground="#c9f56a",
+                  relief="flat", font=("Segoe UI Semibold", 10),
+                  cursor="hand2").pack(pady=(8, 2), ipadx=26, ipady=3)
+        later = tk.Label(win, text="Not now", bg="#131512", fg=SUB,
+                         cursor="hand2", font=("Segoe UI", 9, "underline"))
+        later.pack()
+        later.bind("<ButtonRelease-1>", dismiss)
+
+        win.protocol("WM_DELETE_WINDOW", dismiss)
+        win.bind("<Escape>", dismiss)
+        # No focus_force here, unlike the dialogs Steve opens himself: this one
+        # arrives uninvited and could land while he's typing into something
+        # else, and stealing the focus would eat his keystrokes. Topmost keeps
+        # it visible without taking anything away from him.
+        win.attributes("-topmost", True)
+        win.lift()
 
     def _sync_status(self):
         cloud = getattr(self, "cloud", None)
